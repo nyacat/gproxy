@@ -1,11 +1,12 @@
 use bytes::Bytes;
+use gproxy_channel_api::StreamDecodeError;
 use gproxy_channel_api::{ChannelError, Frame, StreamCtx, StreamDecoder, StreamEnd, StreamTail};
 use gproxy_protocol::{ContentGenerationKind, OperationKind, WireFamily};
 
 pub(super) fn decoder(ctx: StreamCtx<'_>) -> Option<Box<dyn StreamDecoder>> {
     match ctx.key.kind() {
         OperationKind::ContentGeneration(ContentGenerationKind::OpenAiChat) => {
-            Some(Box::new(ChatDecoder::new()))
+            Some(Box::new(ChatDecoder::new(ctx.response_headers)))
         }
         OperationKind::ContentGeneration(ContentGenerationKind::OpenAiResponses) => {
             crate::shared::openai::OpenAiSseDecoder::for_operation(ctx)
@@ -26,13 +27,15 @@ pub(super) fn decoder(ctx: StreamCtx<'_>) -> Option<Box<dyn StreamDecoder>> {
 }
 
 struct ChatDecoder {
+    failure: gproxy_channel_api::FailureState,
     buffer: Vec<u8>,
     usage: Option<gproxy_channel_api::NormalizedUsage>,
 }
 
 impl ChatDecoder {
-    fn new() -> Self {
+    fn new(headers: &http::HeaderMap) -> Self {
         Self {
+            failure: gproxy_channel_api::FailureState::new("deepseek", headers),
             buffer: Vec::new(),
             usage: None,
         }
@@ -54,6 +57,7 @@ impl ChatDecoder {
         let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&raw[range.clone()]) else {
             return Frame(Bytes::from(raw));
         };
+        self.failure.observe(None, &value);
         if let Some(usage) = value.get("usage").and_then(super::usage::from_chat_usage) {
             self.usage = Some(usage);
         }
@@ -72,18 +76,22 @@ impl ChatDecoder {
 }
 
 impl StreamDecoder for ChatDecoder {
-    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
+    fn terminal_failure(&self) -> Option<&gproxy_channel_api::UpstreamFailure> {
+        self.failure.failure()
+    }
+
+    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
         self.buffer.extend_from_slice(&chunk);
         let frames = self.drain();
         if self.buffer.len() > 100 * 1024 * 1024 {
-            return Err(ChannelError::Decode(
-                "DeepSeek Chat SSE event exceeds 100 MiB".into(),
-            ));
+            return Err(
+                ChannelError::Decode("DeepSeek Chat SSE event exceeds 100 MiB".into()).into(),
+            );
         }
         Ok(frames)
     }
 
-    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, ChannelError> {
+    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
         let frames = if end == StreamEnd::Complete && !self.buffer.is_empty() {
             let raw = std::mem::take(&mut self.buffer);
             let end = raw.len();
@@ -93,6 +101,7 @@ impl StreamDecoder for ChatDecoder {
             Vec::new()
         };
         Ok(StreamTail {
+            estimated_output_chars: None,
             frames,
             usage: self.usage.take(),
             actual_service_tier: None,

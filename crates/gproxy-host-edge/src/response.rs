@@ -1,7 +1,7 @@
 mod headers;
 
 use bytes::Bytes;
-use gproxy_core::{CoreError, ExecOutcome, ResponseBody};
+use gproxy_core::{CoreError, ExecOutcome, ResponseBody, StreamCancellation};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use js_sys::Uint8Array;
 use wasm_bindgen::JsValue;
@@ -56,12 +56,13 @@ pub(crate) async fn outcome(
         status,
         headers,
         body,
+        stream_cancellation,
         ..
     } = outcome;
     if upgrade.is_some() && !matches!(&body, ResponseBody::WebSocket(_)) {
         upgrade.take().expect("checked above").close(None);
         if status.is_success() {
-            dispose(body).await;
+            dispose(body, stream_cancellation).await;
             return local_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "websocket request returned a non-websocket response",
@@ -73,7 +74,7 @@ pub(crate) async fn outcome(
     let headers = match headers::sanitize(headers, request_id) {
         Ok(headers) => headers,
         Err(error) => {
-            dispose(body).await;
+            dispose(body, stream_cancellation).await;
             if let Some(upgrade) = upgrade {
                 upgrade.close(None);
             }
@@ -91,15 +92,21 @@ pub(crate) async fn outcome(
         .map(EdgeReply::from),
         ResponseBody::Stream(stream) => {
             if headers::omit_body(&method, status) {
-                crate::stream::drain_stream(stream).await;
+                crate::stream::cancel_stream(stream, stream_cancellation).await;
                 return empty(status, headers).map(EdgeReply::from);
             }
-            let body = crate::stream::StreamBody::new(stream).await?;
-            let init = headers::init(status, &headers)?;
+            let init = match headers::init(status, &headers) {
+                Ok(init) => init,
+                Err(error) => {
+                    crate::stream::cancel_stream(stream, stream_cancellation).await;
+                    return Err(error);
+                }
+            };
+            let body = crate::stream::StreamBody::new(stream, stream_cancellation).await?;
             match Response::new_with_opt_readable_stream_and_init(Some(&body.readable()), &init) {
                 Ok(response) => Ok(EdgeReply::from(response)),
                 Err(error) => {
-                    body.drain().await;
+                    body.cancel().await;
                     Err(error)
                 }
             }
@@ -121,10 +128,10 @@ pub(crate) async fn outcome(
     }
 }
 
-async fn dispose(body: ResponseBody) {
+async fn dispose(body: ResponseBody, cancellation: Option<StreamCancellation>) {
     match body {
         ResponseBody::Full(_) => {}
-        ResponseBody::Stream(stream) => crate::stream::drain_stream(stream).await,
+        ResponseBody::Stream(stream) => crate::stream::cancel_stream(stream, cancellation).await,
         ResponseBody::WebSocket(mut socket) => {
             let _ = socket.send(gproxy_channel_api::WsFrame::Close(None)).await;
         }

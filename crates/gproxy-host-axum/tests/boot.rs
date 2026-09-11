@@ -75,20 +75,11 @@ async fn boots_relays_settles_and_reconciles_quota() {
             .expect("gateway response json");
     assert_eq!(body["choices"][0]["message"]["content"], "booted");
 
-    // Native hosts settle after the response leaves; wait for the row to land.
-    for _ in 0..200 {
-        if !fixture
-            .app
-            .admission_pending(&request_id)
-            .await
-            .expect("read admission")
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    let usage = fixture
-        .app
+    // Shutdown must finish the detached settlement even if the response arrived
+    // before its usage row. Keep the database directory alive for verification.
+    let quota_id = fixture.quota_id;
+    let (app, _directory) = fixture.shutdown().await;
+    let usage = app
         .usage_by_request(&request_id)
         .await
         .expect("read usage")
@@ -96,27 +87,23 @@ async fn boots_relays_settles_and_reconciles_quota() {
     assert_eq!(usage.usage.input_tokens, 10);
     assert_eq!(usage.usage.output_tokens, 5);
     assert!(usage.usage.cost > Decimal::ZERO);
-    let quota = fixture
-        .app
+    let quota = app
         .quota_windows()
         .await
         .expect("read quota windows")
         .into_iter()
         .find(|window| {
-            window.quota_id == fixture.quota_id
+            window.quota_id == quota_id
                 && window.window_kind == gproxy_store::records::QuotaWindowKind::Daily
         })
         .expect("daily quota window");
     assert_eq!(quota.cost_used, rust_decimal::Decimal::new(2, 5));
     assert!(quota.reset_at.is_some());
     assert!(
-        !fixture
-            .app
-            .admission_pending(&request_id)
+        !app.admission_pending(&request_id)
             .await
             .expect("read admission")
     );
-    fixture.shutdown().await;
 }
 
 #[tokio::test]

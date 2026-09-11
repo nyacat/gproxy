@@ -186,7 +186,7 @@ pub(super) async fn delete(
     util::updated(state, applied).await
 }
 
-fn rule(request: PriceRuleWriteRequest) -> Result<PriceRuleInput, AdminError> {
+pub(super) fn rule(request: PriceRuleWriteRequest) -> Result<PriceRuleInput, AdminError> {
     if request.model_pattern.trim().is_empty() {
         return Err(AdminError::BadRequest(
             "price rule model_pattern must not be blank".into(),
@@ -201,7 +201,7 @@ fn rule(request: PriceRuleWriteRequest) -> Result<PriceRuleInput, AdminError> {
     })
 }
 
-fn rate(request: PriceRateWriteRequest) -> Result<PriceRateInput, AdminError> {
+pub(super) fn rate(request: PriceRateWriteRequest) -> Result<PriceRateInput, AdminError> {
     if request.metric.trim().is_empty() || request.unit_size == 0 {
         return Err(AdminError::BadRequest(
             "price rate metric must not be blank and unit_size must be positive".into(),
@@ -213,6 +213,33 @@ fn rate(request: PriceRateWriteRequest) -> Result<PriceRateInput, AdminError> {
         .map_err(|_| AdminError::BadRequest("price must be a decimal".into()))?;
     if price < rust_decimal::Decimal::ZERO {
         return Err(AdminError::BadRequest("price must not be negative".into()));
+    }
+    if let Some(conditions) = &request.conditions {
+        let object = conditions.as_object().ok_or_else(|| {
+            AdminError::BadRequest("price rate conditions must be an object".into())
+        })?;
+        if object.values().any(|value| {
+            !matches!(
+                value,
+                serde_json::Value::String(_)
+                    | serde_json::Value::Number(_)
+                    | serde_json::Value::Bool(_)
+            )
+        }) {
+            return Err(AdminError::BadRequest(
+                "price rate conditions must contain scalar values".into(),
+            ));
+        }
+    } else if matches!(
+        request.metric.as_str(),
+        "input_tokens" | "output_tokens" | "cached_input_tokens"
+    ) && price
+        .checked_mul(rust_decimal::Decimal::from(MILLION))
+        .is_none()
+    {
+        return Err(AdminError::BadRequest(
+            "price exceeds the supported per-million range".into(),
+        ));
     }
     Ok(PriceRateInput {
         rule_id: request.rule_id,
@@ -227,6 +254,55 @@ fn rate(request: PriceRateWriteRequest) -> Result<PriceRateInput, AdminError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn price_rate_request() -> PriceRateWriteRequest {
+        PriceRateWriteRequest {
+            rule_id: 1,
+            metric: "input_tokens".into(),
+            unit_size: MILLION,
+            price: "1".into(),
+            conditions: None,
+            priority: 0,
+        }
+    }
+
+    #[test]
+    fn price_rate_rejects_conditions_that_snapshot_compilation_cannot_read() {
+        for conditions in [
+            serde_json::json!([]),
+            serde_json::json!("fast"),
+            serde_json::json!({"tier": null}),
+            serde_json::json!({"tier": []}),
+            serde_json::json!({"tier": {"name": "fast"}}),
+        ] {
+            let mut request = price_rate_request();
+            request.conditions = Some(conditions);
+            assert!(matches!(rate(request), Err(AdminError::BadRequest(_))));
+        }
+        let mut request = price_rate_request();
+        let conditions = serde_json::json!({"tier": "fast", "cached": true, "tokens": 10});
+        request.conditions = Some(conditions.clone());
+        assert_eq!(rate(request).unwrap().conditions, Some(conditions));
+    }
+
+    #[test]
+    fn price_rate_rejects_per_million_overflow_before_a_write() {
+        for metric in ["input_tokens", "output_tokens", "cached_input_tokens"] {
+            let mut request = price_rate_request();
+            request.metric = metric.into();
+            request.price = rust_decimal::Decimal::MAX.to_string();
+            assert!(matches!(rate(request), Err(AdminError::BadRequest(_))));
+        }
+        let request = price_rate_request();
+        assert_eq!(rate(request).unwrap().price, rust_decimal::Decimal::ONE);
+
+        // Conditional rates are compiled directly per unit, without the
+        // per-million multiplication used by the three unconditional metrics.
+        let mut request = price_rate_request();
+        request.price = rust_decimal::Decimal::MAX.to_string();
+        request.conditions = Some(serde_json::json!({"tier": "fast"}));
+        assert_eq!(rate(request).unwrap().price, rust_decimal::Decimal::MAX);
+    }
 
     #[test]
     fn price_catalog_covers_model_and_hosted_tool_usage_shapes() {

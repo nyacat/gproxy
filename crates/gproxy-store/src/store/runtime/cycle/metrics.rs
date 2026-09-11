@@ -2,23 +2,21 @@ use crate::records::{
     CredentialQuotaCycleModelRecord, CredentialQuotaCycleRecord, CycleEstimate,
     CycleObservationRecord, UsageTotals,
 };
-use crate::{Store, StoreError};
 use rust_decimal::Decimal;
 use serde_json::Value;
 
-pub(super) async fn hydrate(
-    store: &Store,
+pub(super) fn hydrate(
     cycle: &mut CredentialQuotaCycleRecord,
-) -> Result<(), StoreError> {
+    calculate: bool,
+    samples: &[CycleObservationRecord],
+) {
     let tracking = &cycle.tracking;
     if tracking.scope == gproxy_core::QuotaScope::Unknown {
         cycle.metrics = serde_json::json!({});
         cycle.models.clear();
-        cycle.estimate = Some(unavailable(
-            "unknown_scope",
-            &CycleObservationRecord::from(&*cycle),
-        ));
-        return Ok(());
+        cycle.estimate =
+            calculate.then(|| unavailable("unknown_scope", &CycleObservationRecord::from(&*cycle)));
+        return;
     }
     cycle.models = tracking
         .models
@@ -28,14 +26,28 @@ pub(super) async fn hydrate(
             metrics: metrics.clone(),
         })
         .collect();
-    let samples = store.credential_quota_observations(cycle, true).await?;
     cycle.estimate = samples.last().and_then(|sample| sample.estimate.clone());
-    Ok(())
 }
 
 pub(super) fn calculate(
     sample: &CycleObservationRecord,
     delta: &UsageTotals,
+    incomplete: bool,
+) -> CycleEstimate {
+    calculate_totals(
+        sample,
+        delta.requests,
+        delta.total_tokens(),
+        delta.cost,
+        incomplete,
+    )
+}
+
+pub(super) fn calculate_totals(
+    sample: &CycleObservationRecord,
+    requests: u64,
+    tokens: Decimal,
+    cost: Decimal,
     incomplete: bool,
 ) -> CycleEstimate {
     let current = super::state::percent(
@@ -52,13 +64,13 @@ pub(super) fn calculate(
         unavailable("unordered_observations", sample)
     } else if incomplete {
         unavailable("incomplete_usage", sample)
-    } else if delta.requests == 0 || growth.is_none_or(|growth| growth < Decimal::ONE) {
+    } else if requests == 0 || growth.is_none_or(|growth| growth < Decimal::ONE) {
         unavailable("insufficient_samples", sample)
     } else {
         let factor = Decimal::ONE_HUNDRED / growth.expect("positive growth");
         CycleEstimate {
-            tokens: Some(delta.total_tokens() * factor),
-            cost: Some(delta.cost * factor),
+            tokens: Some(tokens * factor),
+            cost: Some(cost * factor),
             reason: None,
             from_ms: Some(sample.baseline_at_ms),
             to_ms: Some(sample.observed_at_ms),

@@ -9,9 +9,11 @@ mod oauth;
 mod oauth_clients;
 mod oauth_sessions;
 mod process;
+mod quota_locks;
 mod recent_usage;
 mod runtime;
 mod secrets;
+mod settlement_recovery;
 mod snapshot;
 mod tokenizers;
 mod usage;
@@ -27,6 +29,7 @@ use crate::{StoreError, migration};
 pub struct Store {
     pub(crate) executor: SharedExecutor,
     pub(crate) dialect: Dialect,
+    pub(crate) quota_window_locks: quota_locks::QuotaWindowLocks,
 }
 
 impl Store {
@@ -42,7 +45,11 @@ impl Store {
         };
         let executor = backend::open(config).await?;
         migration::migrate(executor.as_ref(), dialect).await?;
-        Ok(Self { executor, dialect })
+        Ok(Self {
+            executor,
+            dialect,
+            quota_window_locks: Default::default(),
+        })
     }
 
     pub(crate) fn backend(&self) -> &dyn Executor {

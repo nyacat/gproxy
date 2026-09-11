@@ -34,6 +34,7 @@ export * from "./ConnectivityScopeDto";
 export * from "./ConnectivityTestRequest";
 export * from "./ConnectivityTestResponse";
 export * from "./CookieExchangeRequest";
+export * from "./CredentialCycleReadRequest";
 export * from "./CredentialDto";
 export * from "./CredentialEnvelopeDto";
 export * from "./CredentialHealthDto";

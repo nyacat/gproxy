@@ -4,13 +4,21 @@ use serde::{Deserialize, Serialize};
 
 use super::super::AppHost;
 use super::auth::unix_now;
-use super::types::CounterCharge;
 
 /// Room taken in one budget window for a request that has not settled yet.
 /// The pending counter is the same one user quotas use, so a window's
 /// in-flight spend is one number whoever reserved it.
 #[derive(Serialize, Deserialize)]
 struct Reservation {
+    #[serde(default)]
+    window_id: i64,
+    #[serde(default)]
+    quota_id: i64,
+    #[serde(default)]
+    slot: u32,
+    credential_id: i64,
+    #[serde(default)]
+    released: bool,
     cache_key: String,
     estimated_cost_micros: i64,
 }
@@ -40,13 +48,7 @@ pub(super) async fn reserve(
     if quota.limits().next().is_none() {
         return Ok(());
     }
-    if host
-        .services
-        .cache
-        .get(&failure_key(quota.id))
-        .await?
-        .is_some()
-    {
+    if failed(host, quota.id).await? {
         return Err(CoreError::Store(gproxy_core::error::StoreError(
             "credential budget settlement failed; repair accounting before retrying".into(),
         )));
@@ -61,156 +63,247 @@ pub(super) async fn reserve(
             "credential cost limit requires model pricing".into(),
         ));
     }
-    let estimate = super::quota::estimated_target_cost_micros(host, body, target).await?;
+    let estimate =
+        super::quota::estimated_target_cost_micros(host, request_id, body, target).await?;
     let now = unix_now();
-    let mut charged = Vec::new();
-    let mut reservations = Vec::new();
-    for (kind, limit) in quota.limits() {
-        let window = host
-            .services
-            .store
-            .ensure_quota_window(quota.id, kind, now)
-            .await
-            .map_err(store_error)?;
-        let cache_key = pending_key(window.id);
-        let pending = match host.services.cache.incr(&cache_key, estimate, None).await {
-            Ok(pending) => pending,
-            Err(error) => return super::reserve::rollback_error(host, charged, error.into()).await,
-        };
-        charged.push(CounterCharge {
-            key: cache_key.clone(),
-            amount: estimate,
-        });
-        let before = pending.saturating_sub(estimate).max(0);
-        let projected = pending.max(0);
-        let exhausted = window.cost_used + gproxy_core::usage::micros_to_cost(before) >= limit;
-        let exceeds = window.cost_used + gproxy_core::usage::micros_to_cost(projected) > limit;
-        if exhausted || exceeds {
-            return super::reserve::rollback_error(host, charged, CoreError::QuotaExceeded).await;
-        }
-        reservations.push(Reservation {
-            cache_key,
-            estimated_cost_micros: estimate,
-        });
-    }
     let key = reservation_key(request_id);
-    let mut held = load(host, request_id).await.unwrap_or_default();
-    held.extend(reservations);
-    let bytes = serde_json::to_vec(&held).map_err(|error| {
-        CoreError::Internal(format!("serialize credential reservation: {error}"))
-    })?;
-    if let Err(error) = host.services.cache.set(&key, bytes, None).await {
-        return super::reserve::rollback_error(host, charged, error.into()).await;
+    let mut reservations = load(host, request_id).await?;
+    if reservations.is_empty() {
+        let bytes = serde_json::to_vec(&reservations).expect("credential reservations serialize");
+        super::reserve::initialize_state(host, &key, bytes).await?;
+    }
+    let start = reservations.len();
+    for (kind, limit) in quota.limits() {
+        let result = super::window::reserve(
+            host,
+            quota.id,
+            kind,
+            limit,
+            estimate,
+            now,
+            &key,
+            |window_id| {
+                let expected =
+                    serde_json::to_vec(&reservations).expect("credential reservations serialize");
+                reservations.push(Reservation {
+                    window_id,
+                    quota_id: quota.id,
+                    credential_id: target.credential.0,
+                    released: false,
+                    slot: reservations.len() as u32,
+                    cache_key: super::window::pending_key(window_id),
+                    estimated_cost_micros: estimate,
+                });
+                let updated =
+                    serde_json::to_vec(&reservations).expect("credential reservations serialize");
+                (expected, updated)
+            },
+        )
+        .await;
+        if let Err(error) = result {
+            if let Err(rollback) = super::super::settlement_retry::run(host, || {
+                release_from(host, request_id, None, start)
+            })
+            .await
+            {
+                tracing::error!(request_id, error = %rollback, "credential reservation rollback requires replay");
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
 
 /// Give back every reservation the request holds. Failover may have
 /// reserved against more than one credential; all of them are released.
-pub(super) async fn release(host: &AppHost, request_id: &str) {
-    let held = match load(host, request_id).await {
-        Ok(held) => held,
-        Err(error) => {
-            tracing::error!(request_id, error = %error, "load credential reservation failed");
-            return;
-        }
-    };
-    if held.is_empty() {
-        return;
-    }
-    for reservation in &held {
-        if let Err(error) = host
-            .services
-            .cache
-            .incr(
-                &reservation.cache_key,
-                -reservation.estimated_cost_micros,
-                None,
-            )
-            .await
-        {
-            tracing::error!(request_id, error = %error, "release credential reservation failed");
-        }
-    }
-    if let Err(error) = host
-        .services
-        .cache
-        .delete(&reservation_key(request_id))
-        .await
-    {
-        tracing::error!(request_id, error = %error, "delete credential reservation failed");
-    }
+pub(super) async fn release(
+    host: &AppHost,
+    request_id: &str,
+    settlement: Option<&Settlement>,
+) -> Result<(), CoreError> {
+    release_from(host, request_id, settlement, 0).await
 }
 
-pub(in crate::host) async fn record(host: &AppHost, settlement: &Settlement) {
+async fn release_from(
+    host: &AppHost,
+    request_id: &str,
+    settlement: Option<&Settlement>,
+    start: usize,
+) -> Result<(), CoreError> {
+    let key = reservation_key(request_id);
+    let mut conflicts = 0;
+    while conflicts < 8 {
+        let Some(expected) = host.services.cache.get(&key).await? else {
+            return Ok(());
+        };
+        let mut held = decode(Some(&expected))?;
+        let Some(reservation) = held
+            .iter_mut()
+            .skip(start)
+            .find(|reservation| !reservation.released)
+        else {
+            if start > 0 {
+                return Ok(());
+            }
+            if host
+                .services
+                .cache
+                .compare_and_swap(&key, Some(expected), None, None)
+                .await?
+            {
+                return Ok(());
+            }
+            conflicts += 1;
+            continue;
+        };
+        if let Some(settlement) =
+            settlement.filter(|settlement| settlement.credential_id.0 == reservation.credential_id)
+        {
+            super::window::commit(
+                host,
+                request_id,
+                reservation.window_id,
+                reservation.quota_id,
+                settlement.cost,
+            )
+            .await?;
+        }
+        reservation.released = true;
+        let pending = reservation.cache_key.clone();
+        let refund = -reservation.estimated_cost_micros;
+        let updated = serde_json::to_vec(&held).expect("credential reservations serialize");
+        if host
+            .services
+            .cache
+            .compare_incr_and_set(&pending, refund, &key, expected, updated)
+            .await?
+            .is_some()
+        {
+            conflicts = 0;
+        } else {
+            conflicts += 1;
+        }
+    }
+    Err(CoreError::Store(gproxy_core::error::StoreError(
+        "credential settlement has remaining reservations".into(),
+    )))
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(in crate::host) struct CredentialCharge {
+    pub window_id: i64,
+    pub quota_id: i64,
+}
+
+// Freeze attribution before any durable charge. Recovery must not select a new
+// window after a failed usage write crosses a period boundary.
+pub(in crate::host) async fn prepare_record(
+    host: &AppHost,
+    settlement: &Settlement,
+) -> Result<Vec<CredentialCharge>, CoreError> {
+    let held = load(host, &settlement.request_id).await?;
+    let mut seen = std::collections::BTreeSet::new();
+    let matching: Vec<_> = held
+        .iter()
+        .filter(|reservation| {
+            !reservation.released && reservation.credential_id == settlement.credential_id.0
+        })
+        .filter(|reservation| seen.insert(reservation.window_id))
+        .map(|reservation| CredentialCharge {
+            window_id: reservation.window_id,
+            quota_id: reservation.quota_id,
+        })
+        .collect();
+    if !matching.is_empty() {
+        return Ok(matching);
+    }
     let snapshot = host.services.control.current();
-    // A disabled limit still accumulates spend, so re-enabling it cannot reset usage.
+    let mut targets = Vec::new();
+    let now = unix_now();
+    // Disabled limits still accumulate spend; deleting a quota retires it.
     for quota in snapshot.quotas.iter().filter(|quota| {
         quota.subject_kind == "credential" && quota.subject_id == settlement.credential_id.0
     }) {
-        let now = unix_now();
+        if !host
+            .services
+            .store
+            .quota_exists(quota.id)
+            .await
+            .map_err(|error| CoreError::Store(gproxy_core::error::StoreError(error.to_string())))?
+        {
+            continue;
+        }
         for (kind, _) in quota.limits() {
-            let mut persisted = false;
-            for _ in 0..3 {
-                let result = async {
-                    let window = host
-                        .services
-                        .store
-                        .ensure_quota_window(quota.id, kind, now)
-                        .await?;
-                    host.services
-                        .store
-                        .add_quota_cost(&settlement.request_id, window.id, settlement.cost)
-                        .await
-                }
-                .await;
-                match result {
-                    Ok(_) => {
-                        persisted = true;
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::error!(request_id = %settlement.request_id, quota_id = quota.id, error = %error, "persist credential budget failed")
-                    }
-                }
-            }
-            if !persisted
-                && let Err(error) = host
-                    .services
-                    .cache
-                    .set(&failure_key(quota.id), vec![1], None)
-                    .await
-            {
-                tracing::error!(quota_id = quota.id, error = %error, "trip credential budget accounting failure failed");
+            let window = host
+                .services
+                .store
+                .ensure_quota_window(quota.id, kind, now)
+                .await
+                .map_err(|error| {
+                    CoreError::Store(gproxy_core::error::StoreError(error.to_string()))
+                })?;
+            if seen.insert(window.id) {
+                targets.push(CredentialCharge {
+                    window_id: window.id,
+                    quota_id: quota.id,
+                });
             }
         }
     }
+    Ok(targets)
+}
+
+pub(in crate::host) async fn record_prepared(
+    host: &AppHost,
+    settlement: &Settlement,
+    targets: &[CredentialCharge],
+) -> Result<(), CoreError> {
+    for target in targets {
+        super::window::commit(
+            host,
+            &settlement.request_id,
+            target.window_id,
+            target.quota_id,
+            settlement.cost,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn load(host: &AppHost, request_id: &str) -> Result<Vec<Reservation>, CoreError> {
-    Ok(host
-        .services
-        .cache
-        .get(&reservation_key(request_id))
-        .await?
-        .map(|bytes| serde_json::from_slice(&bytes))
+    decode(
+        host.services
+            .cache
+            .get(&reservation_key(request_id))
+            .await?
+            .as_deref(),
+    )
+}
+
+fn decode(bytes: Option<&[u8]>) -> Result<Vec<Reservation>, CoreError> {
+    bytes
+        .map(serde_json::from_slice)
         .transpose()
-        .map_err(|error| CoreError::Internal(format!("decode credential reservation: {error}")))?
-        .unwrap_or_default())
+        .map_err(|error| CoreError::Internal(format!("decode credential reservation: {error}")))
+        .map(Option::unwrap_or_default)
 }
 
 fn reservation_key(request_id: &str) -> String {
     format!("gproxy:credential-admission:{request_id}")
 }
 
-fn pending_key(window_id: i64) -> String {
-    format!("gproxy:quota-pending:{window_id}")
-}
-
-fn failure_key(quota_id: i64) -> String {
-    format!("gproxy:credential-budget-failed:{quota_id}")
-}
-
-fn store_error(error: gproxy_store::StoreError) -> CoreError {
-    CoreError::Store(gproxy_core::error::StoreError(error.to_string()))
+async fn failed(host: &AppHost, quota_id: i64) -> Result<bool, CoreError> {
+    Ok(host
+        .services
+        .cache
+        .get(&super::window::failure_key(quota_id))
+        .await?
+        .is_some()
+        || host
+            .services
+            .cache
+            .get(&format!("gproxy:credential-budget-failed:{quota_id}"))
+            .await?
+            .is_some())
 }

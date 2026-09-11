@@ -8,7 +8,7 @@ use crate::dto::{
     TeamWriteRequest, UserWriteRequest,
 };
 
-pub(super) fn user(request: UserWriteRequest) -> Result<UserInput, AdminError> {
+pub(in crate::handlers) fn user(request: UserWriteRequest) -> Result<UserInput, AdminError> {
     if request.name.trim().is_empty() {
         return Err(AdminError::BadRequest("user name must not be blank".into()));
     }
@@ -28,7 +28,7 @@ pub(super) fn user(request: UserWriteRequest) -> Result<UserInput, AdminError> {
     })
 }
 
-pub(super) fn organization(
+pub(in crate::handlers) fn organization(
     request: OrganizationWriteRequest,
 ) -> Result<OrganizationInput, AdminError> {
     if request.name.trim().is_empty() {
@@ -42,7 +42,7 @@ pub(super) fn organization(
     })
 }
 
-pub(super) fn team(request: TeamWriteRequest) -> Result<TeamInput, AdminError> {
+pub(in crate::handlers) fn team(request: TeamWriteRequest) -> Result<TeamInput, AdminError> {
     if request.name.trim().is_empty() {
         return Err(AdminError::BadRequest("team name must not be blank".into()));
     }
@@ -89,7 +89,7 @@ pub(super) fn rate_limit(request: RateLimitWriteRequest) -> Result<RateLimitInpu
     })
 }
 
-pub(super) fn quota(request: QuotaWriteRequest) -> Result<QuotaInput, AdminError> {
+pub(in crate::handlers) fn quota(request: QuotaWriteRequest) -> Result<QuotaInput, AdminError> {
     if request.subject_kind != "credential" {
         validate_subject(&request.subject_kind)?;
     }

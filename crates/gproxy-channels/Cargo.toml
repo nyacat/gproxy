@@ -3,6 +3,7 @@ name = "gproxy-channels"
 description = "GPROXY v3 built-in provider channel adapters"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

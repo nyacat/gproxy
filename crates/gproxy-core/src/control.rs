@@ -124,7 +124,8 @@ pub struct TargetRules {
     pub routing: std::sync::Arc<[crate::routing::CompiledRoutingRule]>,
     pub process: std::sync::Arc<[crate::process::CompiledRule]>,
     /// Session hints may select a credential within this provider/model pool.
-    /// Hosts disable this for round-robin credential pools.
+    /// Hosts disable this for round-robin pools and unhealthy fallbacks so a
+    /// previous session pin cannot override health-based candidate ordering.
     pub session_affinity: bool,
 }
 

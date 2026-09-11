@@ -9,6 +9,7 @@ use crate::api::Core;
 use crate::boundary::{ExecOutcome, RequestCtx};
 use crate::control::{ControlPlane, Plan};
 use crate::error::CoreError;
+use crate::funnel::inline::InlineCompletion;
 use crate::funnel::{self, FunnelCtx};
 use crate::host::Host;
 
@@ -33,7 +34,7 @@ pub(crate) async fn run<H: Host>(
             ));
         }
     };
-    let reply = {
+    let (reply, completions) = {
         let caller = upstream.then(|| {
             SurfaceCaller::new(
                 core,
@@ -62,7 +63,7 @@ pub(crate) async fn run<H: Host>(
             .filter(|target| target.provider.id == selected.target.provider.id)
             .filter_map(|target| seen.insert(target.credential).then_some(target.credential))
             .collect::<Vec<_>>();
-        handler
+        let reply = handler
             .respond(
                 SynthCtx {
                     method: &ctx.method,
@@ -93,13 +94,26 @@ pub(crate) async fn run<H: Host>(
                     oauth: core.host.oauth(),
                 },
             )
-            .await?
+            .await;
+        let completions = caller
+            .map(SurfaceCaller::into_completions)
+            .unwrap_or_default();
+        (reply, completions)
+    };
+    let completions = if reply
+        .as_ref()
+        .is_ok_and(|reply| matches!(&reply.body, SurfaceBody::Stream(_)))
+    {
+        completions
+    } else {
+        InlineCompletion::finish_all(completions).await;
+        Vec::new()
     };
     finish(
         core,
         ctx,
         selected,
-        reply,
+        (reply?, completions),
         identity.user_id,
         started,
         sensitive,
@@ -111,7 +125,7 @@ async fn finish<H: Host>(
     core: &Core<H>,
     request: &RequestCtx,
     selected: Selected,
-    reply: gproxy_channel_api::SurfaceReply,
+    (reply, completions): (gproxy_channel_api::SurfaceReply, Vec<InlineCompletion>),
     owner_user_id: i64,
     started: Instant,
     sensitive: bool,
@@ -122,6 +136,7 @@ async fn finish<H: Host>(
         Disposition::Terminal
     };
     let ctx = FunnelCtx {
+        activity: None,
         upstream_started_at_ms: None,
         request_id: request.request_id.clone(),
         target: selected.target,
@@ -182,18 +197,20 @@ async fn finish<H: Host>(
             .await
         }
         SurfaceBody::Stream(_) if sensitive => {
+            InlineCompletion::finish_all(completions).await;
             return Err(CoreError::Internal(
                 "sensitive public surfaces cannot stream".into(),
             ));
         }
         SurfaceBody::Stream(body) => {
-            funnel::free_streaming(
+            funnel::free_streaming_with_completions(
                 core.host.clone(),
                 ctx,
                 reply.status,
                 reply.headers,
                 body,
                 disposition,
+                completions,
             )
             .await
         }

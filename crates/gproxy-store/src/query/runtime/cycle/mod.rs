@@ -1,10 +1,12 @@
 mod activity;
+mod estimate;
 mod links;
 mod observations;
 mod read;
 mod write;
 
 pub(crate) use activity::*;
+pub(crate) use estimate::*;
 pub(crate) use links::*;
 pub(crate) use observations::*;
 pub(crate) use read::*;
@@ -32,4 +34,5 @@ const COLUMNS: &[&str] = &[
     "accounting_start_ms",
     "accounting_end_ms",
     "tracking_json",
+    "needs_rebuild",
 ];

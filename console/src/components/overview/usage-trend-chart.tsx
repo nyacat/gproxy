@@ -6,7 +6,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart"
 import { Skeleton } from "@/components/ui/skeleton"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import { formatCost, formatCount } from "@/lib/format"
+import { dateFormat, formatCost, formatCount } from "@/lib/format"
 
 type Metric = "requests" | "input_tokens" | "output_tokens" | "cached_input_tokens" | "cost"
 type ChartPoint = Omit<UsageTrendPointDto, "cost"> & { cost: number }
@@ -64,9 +64,9 @@ function fillHours(rows: Array<UsageTrendPointDto>, from: number, to: number): A
 }
 
 function formatTick(value: number, locale: string) {
-  return new Intl.DateTimeFormat(locale, { month: "numeric", day: "numeric" }).format(new Date(value * 1_000))
+  return dateFormat(locale, { month: "numeric", day: "numeric" }).format(new Date(value * 1_000))
 }
 
 function formatTooltip(value: number, locale: string) {
-  return new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value * 1_000))
+  return dateFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value * 1_000))
 }

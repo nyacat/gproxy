@@ -60,6 +60,9 @@ pub(super) const TABLES: &[TableSpec] = &[
             Col::required("accounting_start_ms", Integer),
             Col::optional("accounting_end_ms", Integer),
             Col::required("tracking_json", Text),
+            Col::required("needs_rebuild", Integer)
+                .default("0")
+                .since(SchemaVersion::QuotaRebuildIndex),
             Col::required("version", Integer),
             Col::required("credential_id", Integer),
             Col::required("window_key", Text),
@@ -100,6 +103,18 @@ pub(super) const TABLES: &[TableSpec] = &[
                 columns: &["credential_id", "window_key", "period_start", "id"],
                 unique: false,
                 added_in: None,
+            },
+            IndexSpec {
+                name: "ix_credential_quota_cycles_rebuild",
+                columns: &["needs_rebuild", "id"],
+                unique: false,
+                added_in: Some(SchemaVersion::QuotaRebuildIndex),
+            },
+            IndexSpec {
+                name: "ix_credential_quota_cycles_credential_rebuild",
+                columns: &["credential_id", "needs_rebuild", "id"],
+                unique: false,
+                added_in: Some(SchemaVersion::QuotaRebuildIndex),
             },
         ],
     },

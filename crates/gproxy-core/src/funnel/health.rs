@@ -11,6 +11,32 @@ pub(crate) async fn response(
     status: http::StatusCode,
     headers: &http::HeaderMap,
 ) {
+    observe_quota(host, channel, facts, headers).await;
+    record_response(host, facts, disposition, status).await;
+}
+
+/// A successful status opens a stream; it does not establish that the
+/// response completed. Quota headers are still useful immediately.
+pub(crate) async fn stream_response(
+    host: &impl Host,
+    channel: &dyn Channel,
+    facts: &super::FunnelCtx,
+    disposition: Disposition,
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+) {
+    observe_quota(host, channel, facts, headers).await;
+    if disposition != Disposition::Success {
+        record_response(host, facts, disposition, status).await;
+    }
+}
+
+pub(crate) async fn observe_quota(
+    host: &impl Host,
+    channel: &dyn Channel,
+    facts: &super::FunnelCtx,
+    headers: &http::HeaderMap,
+) {
     let target = &facts.target;
     let mut observations = channel.observe_quota(headers);
     let received_at_ms = crate::quota::now_ms();
@@ -43,6 +69,15 @@ pub(crate) async fn response(
         host.observe_credential_quota_entries(target.credential, version, entries)
             .await;
     }
+}
+
+pub(crate) async fn record_response(
+    host: &impl Host,
+    facts: &super::FunnelCtx,
+    disposition: Disposition,
+    status: http::StatusCode,
+) {
+    let target = &facts.target;
     let Some(credential_version) = facts.credential_version else {
         return;
     };
@@ -55,7 +90,7 @@ pub(crate) async fn response(
             crate::CredentialHealth::Degraded,
             "retryable upstream response",
         ),
-        Disposition::Terminal => (crate::CredentialHealth::Healthy, "terminal client response"),
+        Disposition::Terminal => return,
         Disposition::CredentialDead => (
             crate::CredentialHealth::Dead,
             "credential rejected upstream",
@@ -68,6 +103,31 @@ pub(crate) async fn response(
         health,
         Some(status),
         detail,
+    )
+    .await;
+}
+
+pub(crate) async fn record_failure(
+    host: &impl Host,
+    facts: &super::FunnelCtx,
+    status: http::StatusCode,
+    failure: &gproxy_channel_api::UpstreamFailure,
+) {
+    let Some(version) = facts.credential_version else {
+        return;
+    };
+    let health = match failure.disposition {
+        Disposition::Retryable => crate::CredentialHealth::Degraded,
+        Disposition::CredentialDead => crate::CredentialHealth::Dead,
+        Disposition::Success | Disposition::Terminal => return,
+    };
+    host.record_credential_health(
+        facts.target.credential,
+        &facts.target.upstream_model,
+        version,
+        health,
+        Some(status),
+        &failure.health_detail(),
     )
     .await;
 }

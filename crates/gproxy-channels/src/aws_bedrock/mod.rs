@@ -129,8 +129,10 @@ impl Channel for AwsBedrockChannel {
         if messages::native(ctx.request_body) {
             return Some(Box::new(sse::invoke::InvokeDecoder::new(ctx)));
         }
-        (ctx.key == claude(Operation::StreamGenerateContent))
-            .then(|| Box::new(sse::BedrockStreamDecoder::new()) as Box<dyn StreamDecoder>)
+        (ctx.key == claude(Operation::StreamGenerateContent)).then(|| {
+            Box::new(sse::BedrockStreamDecoder::new().with_headers(ctx.response_headers))
+                as Box<dyn StreamDecoder>
+        })
     }
 
     fn extract_usage(&self, ctx: UsageCtx<'_>) -> Option<NormalizedUsage> {

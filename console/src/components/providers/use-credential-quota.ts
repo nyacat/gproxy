@@ -11,7 +11,7 @@ export function useCredentialQuota(credential: CredentialDto) {
   const probeKey = ["credential-quota-probe", credential.id, credential.version]
   const saved = useQuery({
     queryKey: snapshotKey,
-    queryFn: () => credentialQuota(credential.id),
+    queryFn: ({ signal }) => credentialQuota(credential.id, signal),
     retry: false,
     staleTime: 30_000,
   })
@@ -19,12 +19,22 @@ export function useCredentialQuota(credential: CredentialDto) {
   const canProbe = sources.some(({ capability }) => capability.mode === "probe" && capability.support === "ready")
   const storeResult = (result: QuotaProbeResponse) => {
     client.setQueryData(snapshotKey, result.snapshot)
-    void client.invalidateQueries({ queryKey: ["credential-cycles"] })
+    void client.invalidateQueries({
+      queryKey: ["credential-cycles"],
+      predicate: ({ queryKey }) => {
+        const scope = queryKey[2]
+        if (queryKey[1] === "providers") return scope === credential.provider_id
+        if (scope == null || typeof scope !== "object") return true
+        const filter = scope as { credential_id?: number | null; provider_id?: number | null }
+        return (filter.credential_id == null || filter.credential_id === credential.id)
+          && (filter.provider_id == null || filter.provider_id === credential.provider_id)
+      },
+    })
   }
   const probe = useQuery({
     queryKey: probeKey,
-    queryFn: async () => {
-      const result = await probeCredentialQuota(credential.id)
+    queryFn: async ({ signal }) => {
+      const result = await probeCredentialQuota(credential.id, false, true, signal)
       storeResult(result)
       return result
     },
@@ -37,7 +47,7 @@ export function useCredentialQuota(credential: CredentialDto) {
     gcTime: Infinity,
   })
   const manual = useMutation({
-    mutationFn: () => probeCredentialQuota(credential.id, true),
+    mutationFn: () => probeCredentialQuota(credential.id, true, true),
     onSuccess: (result) => {
       storeResult(result)
       client.setQueryData(probeKey, result)

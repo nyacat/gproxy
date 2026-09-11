@@ -1,4 +1,4 @@
-mod inputs;
+pub(in crate::handlers) mod inputs;
 mod keys;
 pub(super) mod map;
 mod validators;

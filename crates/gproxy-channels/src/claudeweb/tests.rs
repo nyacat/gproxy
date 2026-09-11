@@ -227,6 +227,76 @@ fn modern_web_stream_without_message_start_gets_a_canonical_start() {
     assert!(text.contains("hello"));
 }
 
+#[test]
+fn web_codec_keeps_completed_frames_when_a_later_event_is_malformed() {
+    let codec = || {
+        Codec::new(
+            SessionState {
+                conversation: "conversation-1".into(),
+                model: "claude-opus-4-8".into(),
+                message_id: "msg-1".into(),
+                input_tokens: 8,
+            },
+            false,
+        )
+    };
+    let valid = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"visible\"}}\n\n";
+    let wire = [valid.as_slice(), b"data: {\n\n"].concat();
+    let expected = codec()
+        .push(Bytes::copy_from_slice(valid))
+        .unwrap()
+        .frames
+        .into_iter()
+        .map(|frame| frame.0)
+        .collect::<Vec<_>>();
+    assert!(!expected.is_empty());
+    for split in 0..=wire.len() {
+        let mut codec = codec();
+        let mut delivered = Vec::new();
+        let mut failed = false;
+        for chunk in [&wire[..split], &wire[split..]] {
+            let frames = match codec.push(Bytes::copy_from_slice(chunk)) {
+                Ok(output) => output.frames,
+                Err(error) => {
+                    failed = true;
+                    error.frames
+                }
+            };
+            delivered.extend(frames.into_iter().map(|frame| frame.0));
+            if failed {
+                break;
+            }
+        }
+        assert!(failed, "split={split}");
+        assert_eq!(delivered, expected, "split={split}");
+    }
+}
+
+#[test]
+fn tool_pause_retains_the_unparsed_suffix_for_the_resumed_codec() {
+    let mut codec = Codec::new(
+        SessionState {
+            conversation: "conversation-1".into(),
+            model: "claude-opus-4-8".into(),
+            message_id: "msg-1".into(),
+            input_tokens: 8,
+        },
+        false,
+    );
+    let invalid = b"data: {\n\n";
+    let wire = [
+        b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool-1\",\"name\":\"tool\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".as_slice(),
+        invalid,
+    ].concat();
+    let output = codec.push(Bytes::from(wire)).unwrap();
+    let pause = output.pause.unwrap();
+    assert_eq!(pause.id, "tool-1");
+    assert_eq!(pause.pending.concat(), invalid);
+    let state = serde_json::from_value(pause.state).unwrap();
+    let mut resumed = Codec::new(state, true);
+    assert!(resumed.push(pause.pending[0].clone()).is_err());
+}
+
 #[derive(Default)]
 struct LoginHttp {
     request: Mutex<Option<http::Request<Bytes>>>,

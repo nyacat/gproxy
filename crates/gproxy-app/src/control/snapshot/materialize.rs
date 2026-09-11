@@ -25,6 +25,11 @@ impl CompiledSnapshot {
             .into_iter()
             .filter_map(|seed| {
                 self.providers.get(&seed.provider_id).map(|stored| {
+                    // A degraded fallback must not be promoted over healthy
+                    // candidates by the core's later session-affinity pass.
+                    let session_affinity = seed.credential_strategy
+                        == super::types::CredentialStrategy::Sticky
+                        && balance::health_rank(&seed, health) == 0;
                     let mut provider = stored.clone();
                     if seed.fingerprint.is_some() {
                         provider.fingerprint = seed.fingerprint;
@@ -40,8 +45,7 @@ impl CompiledSnapshot {
                         upstream_model: seed.upstream_model,
                         tier: seed.tier,
                         rules: gproxy_core::TargetRules {
-                            session_affinity: seed.credential_strategy
-                                == super::types::CredentialStrategy::Sticky,
+                            session_affinity,
                             routing: self
                                 .routing_rules
                                 .get(&seed.provider_id)

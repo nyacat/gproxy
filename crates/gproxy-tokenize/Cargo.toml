@@ -3,6 +3,7 @@ name = "gproxy-tokenize"
 description = "Offline token counting for provider-native LLM request bodies"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

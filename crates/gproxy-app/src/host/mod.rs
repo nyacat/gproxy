@@ -1,9 +1,17 @@
+mod activity;
 mod admission;
 mod bindings;
 mod continuations;
 mod credentials;
 pub(crate) mod oauth;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod quota_observe;
+pub(crate) mod settlement_recovery;
+mod settlement_retry;
 mod sinks;
+#[cfg(not(target_arch = "wasm32"))]
+mod tasks;
+mod token_counts;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod tokenizers;
 mod usage_view;
@@ -25,6 +33,8 @@ pub(crate) use admission::authenticate_headers;
 #[cfg(test)]
 pub(crate) use admission::authorize;
 pub(crate) use admission::{catalogue_permitted, provider_permitted};
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use tasks::TokioSpawner;
 
 pub(crate) struct Services {
     pub store: gproxy_store::Store,
@@ -39,6 +49,10 @@ pub(crate) struct Services {
     pub spawner: TokioSpawner,
     #[cfg(not(target_arch = "wasm32"))]
     pub continuations: continuations::LocalContinuations,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) quota_observe: quota_observe::QuotaObserveQueue,
+    pub(crate) token_counts: token_counts::TokenCountCache,
+    pub(crate) settlement_recovery: settlement_recovery::RecoveryState,
 }
 
 #[derive(Clone)]
@@ -71,6 +85,19 @@ impl Host for AppHost {
                 .await
                 .map_err(|error| gproxy_core::CoreError::Internal(error.to_string()))
         })
+    }
+
+    fn track_credential_usage<'a>(
+        &'a self,
+        parent: &'a str,
+        request: &'a str,
+        target: &'a gproxy_core::Target,
+        started: i64,
+    ) -> BoxFuture<
+        'a,
+        Result<Option<gproxy_core::host::CredentialUsageLease>, gproxy_core::CoreError>,
+    > {
+        Box::pin(activity::begin(self, parent, request, target, started))
     }
 
     fn credentials(&self) -> &Self::Credentials {
@@ -122,18 +149,17 @@ impl Host for AppHost {
             let request_id = request_id.to_owned();
             let settlement = settlement.cloned();
             Box::pin(async move {
-                let task = tokio::spawn(async move {
-                    admission::finish(&host, &request_id, settlement.as_ref()).await;
+                let task_host = host.clone();
+                let task = host.services.spawner.spawn_tracked(async move {
+                    sinks::finish_settlement(&task_host, &request_id, settlement.as_ref()).await;
                 });
                 if let Err(error) = task.await {
-                    tracing::error!(error = %error, "quota reconciliation task failed");
+                    tracing::error!(error = %error, "admission settlement task failed");
                 }
             })
         }
         #[cfg(target_arch = "wasm32")]
-        {
-            admission::finish(self, request_id, settlement)
-        }
+        Box::pin(sinks::finish_settlement(self, request_id, settlement))
     }
 
     fn admit_credential<'a>(
@@ -258,6 +284,11 @@ impl Host for AppHost {
         entries: Vec<gproxy_channel_api::QuotaEntry>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.spawner().is_some() {
+                quota_observe::enqueue_entries(self, credential.0, credential_version, entries);
+                return;
+            }
             if let Err(error) = self
                 .services
                 .store
@@ -276,10 +307,6 @@ impl Host for AppHost {
         observations: Vec<gproxy_channel_api::QuotaObservation>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let current = self.services.store.credential(credential.0).await;
-            if !matches!(current, Ok(Some(ref record)) if record.version == credential_version) {
-                return;
-            }
             let observed_at = admission::unix_now();
             for value in observations {
                 // The channel reported only wire facts: an upstream-declared
@@ -299,13 +326,14 @@ impl Host for AppHost {
                         gproxy_store::records::QuotaBoundaryConfidence::Unknown,
                     ),
                 };
+                let sample = value
+                    .sample
+                    .expect("upstream quota carries its sampling interval");
                 let observation = gproxy_store::records::CredentialQuotaObservation {
                     unit: value.unit,
                     reset_behavior: value.reset_behavior,
                     scope: value.scope,
-                    sample: value
-                        .sample
-                        .expect("upstream quota carries its sampling interval"),
+                    sample,
                     credential_id: credential.0,
                     window_key: value.window_key,
                     label: value.label,
@@ -313,20 +341,53 @@ impl Host for AppHost {
                     period_end: value.period_end,
                     boundary_source: source,
                     boundary_confidence: confidence,
-                    observed_at: value
-                        .sample
-                        .map_or(observed_at, |sample| sample.received_at_ms / 1000),
+                    observed_at: sample.received_at_ms / 1000,
                     upstream_used: value.upstream_used,
                     upstream_limit: value.upstream_limit,
                     used_percent: value.used_percent,
                 };
-                if let Err(error) = self
+                match sample.source {
+                    gproxy_channel_api::QuotaSampleSource::Response => {
+                        if self.services.control.known_credential_version(credential.0)
+                            == Some(credential_version)
+                        {
+                            self.services.control.apply_live_pressure(&observation);
+                        }
+                        if !self.services.control.probe_persist_due(
+                            credential.0,
+                            credential_version,
+                            observed_at,
+                        ) {
+                            continue;
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if self.spawner().is_some() {
+                            quota_observe::enqueue(self, credential_version, observation);
+                            continue;
+                        }
+                    }
+                    gproxy_channel_api::QuotaSampleSource::Probe => {}
+                    gproxy_channel_api::QuotaSampleSource::Unknown => {}
+                }
+                match self
                     .services
                     .control
-                    .observe_credential_quota_cycle(&observation)
+                    .observe_credential_quota_cycle_for_version(&observation, credential_version)
                     .await
                 {
-                    tracing::warn!(error = %error, "credential quota observation failed");
+                    Ok(Some(_)) => {
+                        if sample.source == gproxy_channel_api::QuotaSampleSource::Probe {
+                            self.services.control.note_probe_ok(
+                                credential.0,
+                                credential_version,
+                                observation.observed_at,
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(error = %error, "credential quota observation failed");
+                    }
                 }
             }
         })
@@ -391,35 +452,6 @@ fn health_version(sequence: &std::sync::atomic::AtomicU64) -> Option<i64> {
     )
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) struct TokioSpawner {
-    settlements: Arc<crate::ConcurrencyLimit>,
-}
-
-/// Queued settlements beyond the in-flight cap before the response path
-/// starts waiting. Each one holds its request and response bodies, so this
-/// is a memory bound as much as a queue bound. Streams reserve their slot
-/// while still open, which is why the pool also covers every in-flight
-/// request: a full house of streams must not starve buffered settlement.
-#[cfg(not(target_arch = "wasm32"))]
-const SETTLEMENT_BACKLOG: usize = 2048;
-
-#[cfg(not(target_arch = "wasm32"))]
-impl TokioSpawner {
-    pub(crate) fn set_max_in_flight(&self, limit: usize) {
-        self.settlements
-            .set_limit(limit.saturating_add(SETTLEMENT_BACKLOG));
-    }
-
-    pub(crate) fn new(max_in_flight: usize) -> Self {
-        Self {
-            settlements: crate::ConcurrencyLimit::new(
-                max_in_flight.saturating_add(SETTLEMENT_BACKLOG),
-            ),
-        }
-    }
-}
-
 async fn persist_credential_health(
     host: &AppHost,
     input: &gproxy_store::records::CredentialHealthInput,
@@ -428,19 +460,5 @@ async fn persist_credential_health(
         tracing::error!(error = %error, "credential health persistence failed");
     } else {
         host.services.control.observe_credential_health(input);
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Spawner for TokioSpawner {
-    fn spawn(&self, task: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>) {
-        tokio::spawn(task);
-    }
-
-    fn reserve_settlement(&self) -> BoxFuture<'_, gproxy_core::SettlementPermit> {
-        Box::pin(async move {
-            let permit = self.settlements.acquire().await;
-            Box::new(permit) as gproxy_core::SettlementPermit
-        })
     }
 }

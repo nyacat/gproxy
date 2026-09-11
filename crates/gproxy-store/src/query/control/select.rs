@@ -1,6 +1,7 @@
 use crate::StoreError;
 use crate::backend::Statement;
 use crate::query::common::select_all;
+use sea_query::{Alias, Expr, ExprTrait, Query};
 
 pub(crate) fn select_providers() -> Result<Statement, StoreError> {
     select_all(
@@ -241,4 +242,14 @@ pub(crate) fn select_price_rates() -> Result<Statement, StoreError> {
 
 pub(crate) fn select_settings() -> Result<Statement, StoreError> {
     select_all("settings", &["key", "value_json"])
+}
+
+pub(crate) fn select_setting(key: &str) -> Result<Statement, StoreError> {
+    Statement::query(
+        Query::select()
+            .column(Alias::new("value_json"))
+            .from(Alias::new("settings"))
+            .and_where(Expr::col(Alias::new("key")).eq(key))
+            .limit(1),
+    )
 }

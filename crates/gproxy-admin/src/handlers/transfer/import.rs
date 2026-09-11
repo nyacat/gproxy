@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use http::{Response, StatusCode};
 
+use super::import_prepare::prepare;
+use super::import_records::convert;
 use super::import_support::*;
 use crate::dto::*;
 use crate::handlers::util;
@@ -29,17 +31,23 @@ pub(super) async fn run(state: &impl State, body: &Bytes) -> Result<Response<Byt
             ));
         }
     };
-    let mut maps = IdMaps::default();
     let mut imported = 0_u64;
     let existing = state.store().control_snapshot().await?;
     let data = request.export.data;
+    // Content and secret failures must be found before the first write. The
+    // storage API still commits individual inserts: database failures are not
+    // covered by a cross-entity transaction.
+    let mut prepared = prepare(
+        state,
+        &data,
+        source,
+        request.source_master_key.as_deref(),
+        &existing,
+    )?;
+    drop(existing);
+    let mut maps = std::mem::take(&mut prepared.reused);
     for value in data.organizations {
-        if let Some(current) = existing
-            .organizations
-            .iter()
-            .find(|current| current.name == value.name)
-        {
-            maps.organizations.insert(value.id, current.id);
+        if maps.organizations.contains_key(&value.id) {
             continue;
         }
         map_create(
@@ -54,10 +62,7 @@ pub(super) async fn run(state: &impl State, body: &Bytes) -> Result<Response<Byt
     }
     for mut value in data.teams {
         value.organization_id = mapped(&maps.organizations, value.organization_id)?;
-        if let Some(current) = existing.teams.iter().find(|current| {
-            current.organization_id == value.organization_id && current.name == value.name
-        }) {
-            maps.teams.insert(value.id, current.id);
+        if maps.teams.contains_key(&value.id) {
             continue;
         }
         map_create(state, Entity::Teams, value.id, &value, &mut maps.teams).await?;
@@ -66,17 +71,14 @@ pub(super) async fn run(state: &impl State, body: &Bytes) -> Result<Response<Byt
     for mut value in data.users {
         value.organization_id = optional(&maps.organizations, value.organization_id)?;
         value.team_id = optional(&maps.teams, value.team_id)?;
-        if let Some(current) = existing
-            .users
-            .iter()
-            .find(|current| current.name == value.name && current.is_admin == value.is_admin)
-        {
-            maps.users.insert(value.id, current.id);
+        if maps.users.contains_key(&value.id) {
             continue;
         }
         map_create(state, Entity::Users, value.id, &value, &mut maps.users).await?;
         imported += 1;
     }
+    let channels = state.channel_catalogue();
+    let mut provider_defaults = Vec::new();
     for value in data.providers {
         map_create(
             state,
@@ -86,13 +88,17 @@ pub(super) async fn run(state: &impl State, body: &Bytes) -> Result<Response<Byt
             &mut maps.providers,
         )
         .await?;
+        let channel = channels
+            .iter()
+            .find(|channel| channel.id == value.channel)
+            .ok_or_else(|| AdminError::BadRequest("unknown runtime channel".into()))?;
+        provider_defaults.push((mapped(&maps.providers, value.id)?, value.name, channel));
         imported += 1;
     }
     let (credential_count, skipped_credentials) = import_credentials(
         state,
         data.credentials,
-        source,
-        request.source_master_key.as_deref(),
+        &mut prepared.credentials,
         &mut maps,
     )
     .await?;
@@ -117,14 +123,8 @@ pub(super) async fn run(state: &impl State, body: &Bytes) -> Result<Response<Byt
         create(state, Entity::ModelAliases, &value).await?;
         imported += 1;
     }
-    let (user_key_count, skipped_user_keys) = import_user_keys(
-        state,
-        data.user_keys,
-        source,
-        request.source_master_key.as_deref(),
-        &mut maps,
-    )
-    .await?;
+    let (user_key_count, skipped_user_keys) =
+        import_user_keys(state, data.user_keys, &mut prepared.user_keys, &mut maps).await?;
     imported += user_key_count;
     for mut value in data.quotas {
         let Some(id) = subject(&maps, &value.subject_kind, value.subject_id)? else {
@@ -153,22 +153,18 @@ pub(super) async fn run(state: &impl State, body: &Bytes) -> Result<Response<Byt
     }
     for mut value in data.routing_rules {
         value.provider_id = mapped(&maps.providers, value.provider_id)?;
-        create(state, Entity::RoutingRules, &value).await?;
+        if value.inherited {
+            let input = crate::handlers::rules::routing_record(convert(&value)?)?;
+            state.store().insert_routing_default(&input).await?;
+        } else {
+            create(state, Entity::RoutingRules, &value).await?;
+        }
         imported += 1;
     }
-    let provider_defaults = state.store().control_snapshot().await?.rule_sets;
-    for value in data.rule_sets {
-        if let Some(source_provider_id) = provider_default_owner(&value)
-            && let Some(provider_id) = maps.providers.get(&source_provider_id)
-        {
-            let sentinel = format!("gproxy:provider-default:{provider_id}");
-            if let Some(current) = provider_defaults
-                .iter()
-                .find(|set| set.description.as_deref() == Some(sentinel.as_str()))
-            {
-                maps.rule_sets.insert(value.id, current.id);
-                continue;
-            }
+    for mut value in data.rule_sets {
+        if let Some(source_provider_id) = provider_default_owner(&value) {
+            let provider_id = mapped(&maps.providers, source_provider_id)?;
+            value.description = Some(format!("gproxy:provider-default:{provider_id}"));
         }
         map_create(
             state,
@@ -185,18 +181,16 @@ pub(super) async fn run(state: &impl State, body: &Bytes) -> Result<Response<Byt
         create(state, Entity::Rules, &value).await?;
         imported += 1;
     }
-    let existing_attachments = state.store().control_snapshot().await?.provider_rule_sets;
     for mut value in data.provider_rule_sets {
         value.provider_id = mapped(&maps.providers, value.provider_id)?;
         value.rule_set_id = mapped(&maps.rule_sets, value.rule_set_id)?;
-        if existing_attachments.iter().any(|attachment| {
-            attachment.provider_id == value.provider_id
-                && attachment.rule_set_id == value.rule_set_id
-        }) {
-            continue;
-        }
         create(state, Entity::ProviderRuleSets, &value).await?;
         imported += 1;
+    }
+    // Populate defaults after source rules and attachments are present. Default
+    // inserts preserve operator overrides and cannot claim their unique keys.
+    for (provider_id, name, channel) in provider_defaults {
+        crate::seed_provider_defaults(state.store(), provider_id, &name, channel).await?;
     }
     state.reload().await?;
     response::json(
@@ -209,7 +203,7 @@ pub(super) async fn run(state: &impl State, body: &Bytes) -> Result<Response<Byt
     )
 }
 
-fn provider_default_owner(rule_set: &RuleSetDto) -> Option<i64> {
+pub(super) fn provider_default_owner(rule_set: &RuleSetDto) -> Option<i64> {
     rule_set
         .description
         .as_deref()?

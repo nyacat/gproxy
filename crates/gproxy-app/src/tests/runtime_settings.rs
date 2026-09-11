@@ -40,6 +40,10 @@ async fn runtime_settings_persist_normalize_and_report_startup_overrides() {
     );
     assert_eq!(saved["runtime_status"]["effective"]["max_attempts"], 2);
     assert_eq!(
+        saved["runtime_status"]["log_filter"],
+        "debug,tokio_postgres=info"
+    );
+    assert_eq!(
         saved["runtime_status"]["overrides"]
             .as_array()
             .unwrap()

@@ -100,7 +100,11 @@
       "status": "响应状态码",
       "copy": "复制{{label}}",
       "copied": "已复制{{label}}。",
-      "copyError": "无法复制{{label}}。"
+      "copyError": "无法复制{{label}}。",
+      "segmentHint": "大内容按片段显示。复制或下载可获取完整内容；大正文保留原始格式。",
+      "segments": "内容分段",
+      "segment": "第 {{page}} / {{pages}} 段",
+      "download": "下载原文"
     }
   },
   "usage": {
@@ -151,7 +155,9 @@
         "percent": "剩余比例",
         "tokens": "折算剩余令牌",
         "cost": "折算剩余 USD"
-      }
+      },
+      "pageHint": "当前显示 {{count}} / {{total}} 个周期，图表和明细随页面切换。",
+      "sampleHint": "密集曲线按桶显示首尾和极值；范围统计包含全部观测。"
     },
     "cycleUsage": {
       "used": "本周期已用（本机）",
@@ -170,7 +176,9 @@
         "unordered_observations": "观测顺序不确定，等待复查",
         "incomplete_usage": "样本用量未完整结算或缺失",
         "usage_disabled": "用量记录已关闭"
-      }
+      },
+      "estimateDetails": "查看估算详情",
+      "loadHistory": "查看最近一年的历史周期"
     },
     "cycleStates": {
       "empty": "该时段未观测到上游凭证配额窗口。"

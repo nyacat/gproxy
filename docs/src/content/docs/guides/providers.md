@@ -45,6 +45,17 @@ Two v2 id pairs are canonicalized on import: `kimiapi` and `kimicode` become
 | Forwarded metadata | Which caller headers and query parameters pass upstream, and which response headers return. Defaults come from the channel. |
 | Enabled | Disabled providers leave routing. |
 
+Leaving the client fingerprint unset uses the channel's built-in defaults.
+The Codex, Claude Code, Gemini CLI, Antigravity, Kiro, and Copilot presets are
+generated from those same defaults, including their complete TLS and HTTP/2
+settings. Selecting a preset saves a copy in the provider or credential:
+after upgrading GPROXY, select the preset again to refresh a saved copy, or
+clear the override to follow the channel defaults automatically.
+
+These are transport compatibility profiles. An upstream client's exact TLS
+handshake can vary with its operating system, TLS library, and installation
+method.
+
 ### Channel Settings
 
 Settings are stored as one JSON object. The channel declares typed fields for

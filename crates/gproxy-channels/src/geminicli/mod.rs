@@ -56,6 +56,19 @@ static LOGIN: LoginDescriptor = LoginDescriptor {
 };
 
 impl Channel for GeminiCliChannel {
+    fn client_fingerprint(&self) -> Option<gproxy_channel_api::ClientFingerprint> {
+        Some(gproxy_channel_api::ClientFingerprint {
+            id: "gemini",
+            label: "Gemini CLI",
+            headers: http::HeaderMap::from_iter([(
+                http::header::USER_AGENT,
+                http::HeaderValue::from_str(&prepare::user_agent(""))
+                    .expect("built-in user-agent is valid"),
+            )]),
+            profile: &profile::PROFILE,
+        })
+    }
+
     fn login(&self) -> Option<ChannelLoginRef<'_>> {
         Some(ChannelLoginRef {
             adapter: self,

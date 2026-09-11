@@ -10,7 +10,7 @@ export function PricingPage() {
   const [ruleQuery, rateQuery, providerQuery] = useQueries({ queries: [
     { queryKey: ["price-rules"], queryFn: priceRules },
     { queryKey: ["price-rates"], queryFn: priceRates },
-    { queryKey: ["providers"], queryFn: providers },
+    { queryKey: ["providers"], queryFn: ({ signal }) => providers(signal) },
   ] })
   const queries = [ruleQuery, rateQuery, providerQuery]
   return (

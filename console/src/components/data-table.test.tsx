@@ -1,4 +1,5 @@
-import { render, screen } from "@testing-library/react"
+import { act, render, screen } from "@testing-library/react"
+import { useEffect } from "react"
 import userEvent from "@testing-library/user-event"
 import { describe, expect, it, vi } from "vitest"
 import { DataTable } from "@/components/data-table"
@@ -78,7 +79,7 @@ describe("DataTable", () => {
         pagination={{ page: 2, pageSize: 10, total: 21, onPage, onPageSize }}
       />,
     )
-    expect(screen.getAllByText("Server item 11")).toHaveLength(2)
+    expect(screen.getAllByText("Server item 11")).toHaveLength(1)
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument()
     await user.click(screen.getByRole("button", { name: "common.dataTable.next" }))
     expect(onPage).toHaveBeenCalledWith(3)
@@ -105,16 +106,55 @@ describe("DataTable", () => {
     expect(screen.queryByText("Item 11")).not.toBeInTheDocument()
     screen.getByRole("combobox", { name: "common.dataTable.itemsPerPage" }).focus()
     await user.keyboard("{Enter}{ArrowDown}{Enter}")
-    expect(screen.getAllByText("Item 20")).toHaveLength(2)
+    expect(screen.getAllByText("Item 20")).toHaveLength(1)
     expect(screen.queryByText("Item 21")).not.toBeInTheDocument()
 
     await user.click(screen.getByRole("button", { name: "common.dataTable.next" }))
-    expect(screen.getAllByText("Item 21")).toHaveLength(2)
+    expect(screen.getAllByText("Item 21")).toHaveLength(1)
 
     screen.getByRole("combobox", { name: "common.dataTable.itemsPerPage" }).focus()
     await user.keyboard("{Enter}{Home}{Enter}")
-    expect(screen.getAllByText("Item 1")).toHaveLength(2)
+    expect(screen.getAllByText("Item 1")).toHaveLength(1)
     expect(screen.queryByText("Item 11")).not.toBeInTheDocument()
+  })
+
+  it("mounts one expanded view and transfers it when the viewport changes", () => {
+    let active = 0
+    let mobile = false
+    const listeners = new Set<() => void>()
+    const media = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      media: query, get matches() { return mobile }, onchange: null,
+      addEventListener: (_event: string, listener: EventListenerOrEventListenerObject) => listeners.add(listener as () => void),
+      removeEventListener: (_event: string, listener: EventListenerOrEventListenerObject) => listeners.delete(listener as () => void),
+      addListener() {}, removeListener() {}, dispatchEvent: () => true,
+    }))
+    function Expanded() { useEffect(() => { active++; return () => { active-- } }, []); return <div>Details</div> }
+    const { unmount } = render(<DataTable rows={[{ id: 1 }]} columns={[]} rowKey={(row) => row.id}
+      searchText={() => ""} renderCard={() => "Mobile"} renderExpandedRow={() => <Expanded />}
+      activeRowKey={1} empty="" storageKey="single-expanded" />)
+    expect(active).toBe(1)
+    expect(screen.queryByText("Mobile")).not.toBeInTheDocument()
+    act(() => { mobile = true; listeners.forEach((listener) => listener()) })
+    expect(active).toBe(1)
+    expect(screen.getByText("Mobile")).toBeInTheDocument()
+    expect(screen.queryByRole("table")).not.toBeInTheDocument()
+    unmount()
+    expect(active).toBe(0)
+    expect(listeners.size).toBe(0)
+    media.mockRestore()
+  })
+
+  it("allows navigation before an exact total arrives and disables pending navigation visibly", async () => {
+    const user = userEvent.setup()
+    const onPage = vi.fn()
+    const table = (pending: boolean) => <DataTable rows={[{ id: 1 }]} columns={[]}
+      rowKey={(row) => row.id} searchText={() => ""} renderCard={() => ""} empty="" storageKey="unknown-count"
+      pagination={{ page: 1, pageSize: 10, total: null, hasMore: true, pending, onPage, onPageSize: vi.fn() }} />
+    const { rerender } = render(table(false))
+    await user.click(screen.getByRole("button", { name: "common.dataTable.next" }))
+    expect(onPage).toHaveBeenCalledWith(2)
+    rerender(table(true))
+    expect(screen.getByRole("button", { name: "common.dataTable.next" })).toBeDisabled()
   })
 })
 

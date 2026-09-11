@@ -23,6 +23,43 @@ impl Store {
         &self,
         observation: &CredentialQuotaObservation,
     ) -> Result<CredentialQuotaCycleRecord, StoreError> {
+        self.observe_quota_cycle(observation, None).await
+    }
+
+    /// Discard delayed responses from an earlier credential version at the
+    /// durable write boundary. Manual observations use the unversioned method.
+    pub async fn observe_credential_quota_cycle_for_version(
+        &self,
+        observation: &CredentialQuotaObservation,
+        expected_version: u64,
+    ) -> Result<Option<CredentialQuotaCycleRecord>, StoreError> {
+        if self
+            .backend()
+            .execute(runtime::quota_snapshot::check_credential_version(
+                observation.credential_id,
+                expected_version,
+            )?)
+            .await?
+            .rows
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        match self
+            .observe_quota_cycle(observation, Some(expected_version))
+            .await
+        {
+            Ok(cycle) => Ok(Some(cycle)),
+            Err(StoreError::VersionConflict) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn observe_quota_cycle(
+        &self,
+        observation: &CredentialQuotaObservation,
+        credential_version: Option<u64>,
+    ) -> Result<CredentialQuotaCycleRecord, StoreError> {
         let raw = observation;
         let observation = &state::settle(raw)?;
         for _ in 0..8 {
@@ -36,7 +73,10 @@ impl Store {
                 let same_sample = sample.started_at_ms == previous_sample.started_at_ms
                     && sample.received_at_ms == previous_sample.received_at_ms;
                 if sample.received_at_ms < previous_sample.received_at_ms {
-                    if self.record_rejected_quota(&mut open, raw).await? {
+                    if self
+                        .record_rejected_quota(&mut open, raw, credential_version)
+                        .await?
+                    {
                         return Ok(open);
                     }
                     continue;
@@ -63,11 +103,23 @@ impl Store {
                     let expected = open.version;
                     open.version += 1;
                     if self
-                        .backend()
-                        .batch(vec![
-                            runtime::update_tracked_cycle(&open, expected)?,
-                            runtime::insert_cycle_observation(&open, raw, true)?,
-                        ])
+                        .write_quota_observation(
+                            input.credential_id,
+                            credential_version,
+                            vec![
+                                runtime::update_tracked_cycle_for_version(
+                                    &open,
+                                    expected,
+                                    credential_version,
+                                )?,
+                                runtime::insert_cycle_observation(
+                                    &open,
+                                    raw,
+                                    true,
+                                    credential_version,
+                                )?,
+                            ],
+                        )
                         .await?[0]
                         .affected_rows
                         == 1
@@ -79,13 +131,24 @@ impl Store {
                 if same_sample {
                     return Ok(open);
                 }
+                if !changed
+                    && !decreased
+                    && !state::adjusted(&open, &input)
+                    && state::counters_unchanged(&open, &input)
+                    && !state::heartbeat_due(&open, &input)
+                {
+                    return Ok(open);
+                }
                 if open
                     .tracking
                     .pending_observation
                     .as_ref()
                     .is_some_and(|pending| sample.started_at_ms < pending.sample.received_at_ms)
                 {
-                    if self.record_rejected_quota(&mut open, raw).await? {
+                    if self
+                        .record_rejected_quota(&mut open, raw, credential_version)
+                        .await?
+                    {
                         return Ok(open);
                     }
                     continue;
@@ -97,6 +160,7 @@ impl Store {
                     open.status = QuotaCycleStatus::Closed;
                     open.accounting_end_ms = Some(at);
                     open.tracking.needs_rebuild = true;
+                    open.tracking.rebuild_after = None;
                     open.close_reason = Some(if changed {
                         QuotaCycleCloseReason::BoundaryCrossed
                     } else {
@@ -104,12 +168,28 @@ impl Store {
                     });
                     let next = new_cycle(&input, Some(at), local, Some(&open));
                     let result = self
-                        .backend()
-                        .batch(vec![
-                            runtime::update_tracked_cycle(&open, expected)?,
-                            runtime::insert_tracked_cycle(&next, Some(&open))?,
-                            runtime::insert_cycle_observation(&next, raw, false)?,
-                        ])
+                        .write_quota_observation(
+                            input.credential_id,
+                            credential_version,
+                            vec![
+                                runtime::update_tracked_cycle_for_version(
+                                    &open,
+                                    expected,
+                                    credential_version,
+                                )?,
+                                runtime::insert_tracked_cycle(
+                                    &next,
+                                    Some(&open),
+                                    credential_version,
+                                )?,
+                                runtime::insert_cycle_observation(
+                                    &next,
+                                    raw,
+                                    false,
+                                    credential_version,
+                                )?,
+                            ],
+                        )
                         .await;
                     match result {
                         Ok(results)
@@ -145,8 +225,10 @@ impl Store {
                 let end = open
                     .accounting_end_ms
                     .or(input.period_end.map(|end| end * 1000));
-                tracking.needs_rebuild |=
-                    open.accounting_start_ms != start || open.accounting_end_ms != end;
+                if open.accounting_start_ms != start || open.accounting_end_ms != end {
+                    tracking.needs_rebuild = true;
+                    tracking.rebuild_after = None;
+                }
                 open.accounting_start_ms = start;
                 open.accounting_end_ms = end;
                 open.tracking = tracking;
@@ -159,11 +241,23 @@ impl Store {
                 open.upstream_limit = input.upstream_limit;
                 open.used_percent = input.used_percent;
                 if self
-                    .backend()
-                    .batch(vec![
-                        runtime::update_tracked_cycle(&open, expected)?,
-                        runtime::insert_cycle_observation(&open, raw, false)?,
-                    ])
+                    .write_quota_observation(
+                        input.credential_id,
+                        credential_version,
+                        vec![
+                            runtime::update_tracked_cycle_for_version(
+                                &open,
+                                expected,
+                                credential_version,
+                            )?,
+                            runtime::insert_cycle_observation(
+                                &open,
+                                raw,
+                                false,
+                                credential_version,
+                            )?,
+                        ],
+                    )
                     .await?[0]
                     .affected_rows
                     == 1
@@ -190,7 +284,10 @@ impl Store {
                         || sample.received_at_ms < cutoff
                         || sample.started_at_ms < latest.tracking.sample.started_at_ms
                     {
-                        if self.record_rejected_quota(&mut latest, raw).await? {
+                        if self
+                            .record_rejected_quota(&mut latest, raw, credential_version)
+                            .await?
+                        {
                             return Ok(latest);
                         }
                         continue;
@@ -199,7 +296,10 @@ impl Store {
                         && !state::decreased(&latest, &input)
                         && !state::changed(&latest, &input)
                     {
-                        if self.record_rejected_quota(&mut latest, raw).await? {
+                        if self
+                            .record_rejected_quota(&mut latest, raw, credential_version)
+                            .await?
+                        {
                             return Ok(latest);
                         }
                         continue;
@@ -217,11 +317,23 @@ impl Store {
                     });
                 let next = new_cycle(&input, start, false, latest.as_ref());
                 match self
-                    .backend()
-                    .batch(vec![
-                        runtime::insert_tracked_cycle(&next, latest.as_ref())?,
-                        runtime::insert_cycle_observation(&next, raw, false)?,
-                    ])
+                    .write_quota_observation(
+                        input.credential_id,
+                        credential_version,
+                        vec![
+                            runtime::insert_tracked_cycle(
+                                &next,
+                                latest.as_ref(),
+                                credential_version,
+                            )?,
+                            runtime::insert_cycle_observation(
+                                &next,
+                                raw,
+                                false,
+                                credential_version,
+                            )?,
+                        ],
+                    )
                     .await
                 {
                     Ok(result) if result[0].affected_rows == 1 => {
@@ -249,6 +361,36 @@ impl Store {
         self.latest_credential_quota_cycle(credential, window)
             .await?
             .ok_or_else(|| StoreError::Database("quota cycle disappeared".into()))
+    }
+
+    async fn write_quota_observation(
+        &self,
+        credential_id: i64,
+        credential_version: Option<u64>,
+        mut statements: Vec<crate::backend::Statement>,
+    ) -> Result<Vec<crate::backend::QueryResult>, StoreError> {
+        if let Some(version) = credential_version {
+            statements.insert(
+                0,
+                runtime::quota_snapshot::check_credential_version(credential_id, version)?,
+            );
+            statements.insert(
+                0,
+                runtime::quota_snapshot::lock_credential_version(credential_id, Some(version))?,
+            );
+        }
+        let mut results = self.backend().batch(statements).await?;
+        if credential_version.is_some() {
+            results.remove(0);
+            if results.remove(0).rows.is_empty() {
+                // Every write also carries the predicate, so no statements
+                // changed data if this version was already replaced. Inspect
+                // the selected row rather than a no-op UPDATE's affected
+                // count, whose semantics vary by SQL backend.
+                return Err(StoreError::VersionConflict);
+            }
+        }
+        Ok(results)
     }
 }
 

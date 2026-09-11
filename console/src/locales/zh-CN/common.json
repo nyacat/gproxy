@@ -77,7 +77,8 @@
       "itemsPerPage": "每页项数",
       "selected": "已选择 {{count}} 项",
       "selectAll": "选择所有行",
-      "selectRow": "选择此行"
+      "selectRow": "选择此行",
+      "pageUnknown": "第 {{page}} 页"
     },
     "filters": {
       "start": "开始时间",

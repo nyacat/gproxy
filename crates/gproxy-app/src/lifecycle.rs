@@ -14,6 +14,12 @@ pub(crate) struct AppInner {
     pub core: Core<AppHost>,
     pub host: AppHost,
     pub invalidation_version: std::sync::atomic::AtomicI64,
+    /// Serialize the complete reload pipeline (database snapshot, transport
+    /// settings and invalidation cursor). Without this, a slower reload could
+    /// publish stale runtime settings after a newer mutation had completed.
+    pub reload_lock: futures_util::lock::Mutex<()>,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub reload_runtime_pause: std::sync::Mutex<Option<ReloadRuntimePause>>,
     #[cfg(not(target_arch = "wasm32"))]
     pub shutdown: tokio::sync::watch::Sender<bool>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -21,6 +27,12 @@ pub(crate) struct AppInner {
         tokio::sync::watch::Sender<std::sync::Arc<gproxy_admin::dto::RuntimeSettingsStatusDto>>,
     #[cfg(target_arch = "wasm32")]
     pub shutdown: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) struct ReloadRuntimePause {
+    pub read: tokio::sync::oneshot::Sender<()>,
+    pub resume: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl AppHandle {
@@ -59,6 +71,26 @@ impl AppHandle {
         &self,
         request: RequestCtx,
     ) -> Result<ExecOutcome, gproxy_core::CoreError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let spawner = &self.inner.host.services.spawner;
+            let permit = spawner.reserve_execution().await;
+            let app = self.clone();
+            spawner
+                .spawn_execution(async move { app.execute_inner(request).await }, permit)
+                .await
+                .map_err(|error| {
+                    gproxy_core::CoreError::Internal(format!("execution task failed: {error}"))
+                })?
+        }
+        #[cfg(target_arch = "wasm32")]
+        self.execute_inner(request).await
+    }
+
+    async fn execute_inner(
+        &self,
+        request: RequestCtx,
+    ) -> Result<ExecOutcome, gproxy_core::CoreError> {
         let capture = crate::logging::begin(&self.inner.host, &request).await;
         let mut result = self
             .inner
@@ -82,6 +114,7 @@ impl AppHandle {
     }
 
     pub async fn reload(&self) -> Result<(), AppError> {
+        let _reload = self.inner.reload_lock.lock().await;
         let version = crate::invalidation::bump(&self.inner.host.services.cache).await;
         self.reload_local().await?;
         let version = version?;
@@ -92,6 +125,7 @@ impl AppHandle {
     }
 
     pub async fn sync_invalidation(&self) -> Result<(), AppError> {
+        let _reload = self.inner.reload_lock.lock().await;
         let version = crate::invalidation::current(&self.inner.host.services.cache).await?;
         if version
             == self
@@ -113,6 +147,14 @@ impl AppHandle {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let settings = self.inner.host.services.control.settings();
+            #[cfg(test)]
+            {
+                let pause = self.inner.reload_runtime_pause.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    let _ = pause.read.send(());
+                    let _ = pause.resume.await;
+                }
+            }
             self.inner
                 .host
                 .services
@@ -168,7 +210,7 @@ impl AppHandle {
     }
 
     pub fn instance_name(&self) -> String {
-        self.inner.host.services.control.settings().instance_name
+        self.inner.host.services.control.instance_name()
     }
 
     pub fn update_channel(&self) -> Option<String> {
@@ -198,6 +240,27 @@ impl AppHandle {
         {
             gloo_timers::future::TimeoutFuture::new(25).await;
         }
+    }
+
+    /// Wait for maintenance to stop and for detached writes and settlements to
+    /// finish. Call after `shutdown()` and after the host has drained requests,
+    /// so no new request can enqueue work after the background queue is empty.
+    /// The caller must not itself be registered as background work.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn drain_background(&self) {
+        self.inner.host.services.spawner.drain().await;
+    }
+
+    /// Register host-owned work before returning a response or accepting an
+    /// upgrade. Dropping the receiver leaves the task running; shutdown hosts
+    /// wait for it through `drain_background()`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn spawn_background<F>(&self, task: F) -> tokio::sync::oneshot::Receiver<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.inner.host.services.spawner.spawn_tracked(task)
     }
 
     pub async fn admission_pending(&self, request_id: &str) -> Result<bool, AppError> {
@@ -237,7 +300,13 @@ impl AppHandle {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let control = self.inner.host.services.control.clone();
-            tokio::spawn(async move { control.observe_credential_quota_cycle(&observation).await })
+            self.inner
+                .host
+                .services
+                .spawner
+                .spawn_tracked(
+                    async move { control.observe_credential_quota_cycle(&observation).await },
+                )
                 .await
                 .map_err(|error| AppError::Control(format!("quota observation task: {error}")))?
                 .map_err(AppError::from)
@@ -263,14 +332,18 @@ impl AppHandle {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let control = self.inner.host.services.control.clone();
-            tokio::spawn(async move {
-                control
-                    .close_credential_quota_cycle(id, reason, closed_at)
-                    .await
-            })
-            .await
-            .map_err(|error| AppError::Control(format!("quota close task: {error}")))?
-            .map_err(AppError::from)
+            self.inner
+                .host
+                .services
+                .spawner
+                .spawn_tracked(async move {
+                    control
+                        .close_credential_quota_cycle(id, reason, closed_at)
+                        .await
+                })
+                .await
+                .map_err(|error| AppError::Control(format!("quota close task: {error}")))?
+                .map_err(AppError::from)
         }
         #[cfg(target_arch = "wasm32")]
         {

@@ -122,9 +122,9 @@ fn unavailable() -> CoreStoreError {
 fn store_error(error: gproxy_store::StoreError) -> CoreStoreError {
     let message = match error {
         gproxy_store::StoreError::VersionConflict => "credential version conflict",
-        gproxy_store::StoreError::Database(_) | gproxy_store::StoreError::InvalidData { .. } => {
-            "credential persistence failed"
-        }
+        gproxy_store::StoreError::Database(_)
+        | gproxy_store::StoreError::InvalidData { .. }
+        | gproxy_store::StoreError::QuotaWindowMissing(_) => "credential persistence failed",
     };
     CoreStoreError(message.into())
 }

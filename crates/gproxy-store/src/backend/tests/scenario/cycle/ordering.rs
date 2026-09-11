@@ -54,13 +54,13 @@ async fn boundaries(store: &Store) {
             .observe_credential_quota_cycle(&shifted)
             .await
             .unwrap();
-        assert_eq!(next.id != first.id, drift.abs() > 300, "drift {drift}");
-        if drift.abs() <= 300 {
-            assert_eq!(next.period_start, first.period_start);
-            assert_eq!(next.period_end, first.period_end);
-            assert_eq!(next.accounting_start_ms, first.accounting_start_ms);
-            assert_eq!(next.tracking.baseline_at_ms, first.tracking.baseline_at_ms);
-        }
+        // Both ends moved together on a 10_000s window: a slide, including
+        // ±301s which used to mint a cycle because slack was a hard 300s.
+        assert_eq!(next.id, first.id, "drift {drift}");
+        assert_eq!(next.period_start, first.period_start);
+        assert_eq!(next.period_end, first.period_end);
+        assert_eq!(next.accounting_start_ms, first.accounting_start_ms);
+        assert_eq!(next.tracking.baseline_at_ms, first.tracking.baseline_at_ms);
         let samples = store
             .credential_quota_observations(&next, false)
             .await

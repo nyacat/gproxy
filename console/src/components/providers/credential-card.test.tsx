@@ -42,7 +42,7 @@ describe("CredentialCard", () => {
     const component = view()
     const mounted = render(component)
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual(["/admin/api/credentials/7/quota", "/admin/api/credentials/7/quota-probe"])
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual(["/admin/api/credentials/7/quota", "/admin/api/credentials/7/quota-probe?lightweight=true"])
     expect(screen.getByRole("button", { name: "Fetching…" })).toBeDisabled()
     resolveProbe(response(probed(snapshot())))
     await screen.findByText("110.00 CNY")
@@ -50,6 +50,51 @@ describe("CredentialCard", () => {
     mounted.rerender(component)
     expect(screen.getByText("110.00 CNY")).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(["snapshot", "probe"])("cancels an unfinished %s read when the quota card closes", async (stage) => {
+    let signal: AbortSignal | null | undefined
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation((path, init) => {
+      if (stage === "probe" && String(path).endsWith("/quota")) return Promise.resolve(response(snapshot(null)))
+      signal = init?.signal
+      return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true }))
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const { unmount } = render(view())
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(stage === "probe" ? 2 : 1))
+    expect(signal?.aborted).toBe(false)
+    unmount()
+    expect(signal?.aborted).toBe(true)
+  })
+
+  it("invalidates affected cycle summaries without refreshing unrelated providers or credentials", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const ownProvider = ["credential-cycles", "providers", 3]
+    const otherProvider = ["credential-cycles", "providers", 4]
+    const ownHistory = ["credential-cycles", "history", { credential_id: 7 }]
+    const otherHistory = ["credential-cycles", "history", { credential_id: 8 }]
+    for (const key of [ownProvider, otherProvider, ownHistory, otherHistory]) client.setQueryData(key, [])
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response(snapshot()))
+      .mockResolvedValueOnce(response(probed(snapshot()))))
+    render(view(credential, client))
+    await screen.findByText("110.00 CNY")
+    await userEvent.setup().click(screen.getByRole("button", { name: "Refresh" }))
+    await waitFor(() => expect(client.getQueryState(ownProvider)?.isInvalidated).toBe(true))
+    expect(client.getQueryState(ownHistory)?.isInvalidated).toBe(true)
+    expect(client.getQueryState(otherProvider)?.isInvalidated).toBe(false)
+    expect(client.getQueryState(otherHistory)?.isInvalidated).toBe(false)
+  })
+
+  it("keeps historical cycles available when a window source has no current entries", async () => {
+    const value = snapshot()
+    value.entries = []
+    value.sources[0].capability = { ...value.sources[0].capability, kinds: ["window"], mode: "response" }
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(response(value))
+    vi.stubGlobal("fetch", fetchMock)
+    render(view())
+    expect(await screen.findByRole("button", { name: "Previous rounds in the last year" })).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledOnce()
   })
 
   it("preserves an API Key's saved balance when refresh fails and reports per-source errors", async () => {
@@ -66,7 +111,7 @@ describe("CredentialCard", () => {
     expect(screen.getByText("Upstream returned 401")).toBeInTheDocument()
     expect(screen.getByText("110.00 CNY")).toBeInTheDocument()
     expect(screen.queryByText("Upstream reports insufficient balance")).not.toBeInTheDocument()
-    expect(fetchMock.mock.calls[1]?.[0]).toBe("/admin/api/credentials/7/quota-probe?force=true")
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/admin/api/credentials/7/quota-probe?force=true&lightweight=true")
   })
 
   it("keeps unsupported and response-observed quota visible without active probing", async () => {
@@ -115,7 +160,7 @@ describe("CredentialCard", () => {
     expect(fetchMock).toHaveBeenCalledOnce()
     await userEvent.setup().click(screen.getByRole("button", { name: "Refresh" }))
     await waitFor(() => expect(screen.queryByText("Snapshot older than 10 minutes")).not.toBeInTheDocument())
-    expect(fetchMock.mock.calls[1]?.[0]).toBe("/admin/api/credentials/7/quota-probe?force=true")
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/admin/api/credentials/7/quota-probe?force=true&lightweight=true")
   })
 
   it("keeps persisted reset credits visible and refreshes their count after redemption", async () => {

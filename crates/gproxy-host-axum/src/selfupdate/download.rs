@@ -53,6 +53,14 @@ mod tests {
     #[tokio::test]
     async fn store_installations_refuse_native_update_operations_before_egress() {
         let directory = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let app = gproxy_app::App::start(gproxy_app::Config::sqlite(
+            "127.0.0.1:0".parse().unwrap(),
+            data.path().to_path_buf(),
+            gproxy_app::MasterKeyConfig::new(Some([5; 32])),
+        ))
+        .await
+        .unwrap();
         let mut manager = Manager::new(directory.path().into(), None).unwrap();
         manager.store_managed = true;
         manager.manifest_url = Some("http://127.0.0.1:1/must-not-be-requested".into());
@@ -63,7 +71,7 @@ mod tests {
             (http::Method::POST, "/admin/api/native/update/rollback"),
         ] {
             let response = manager
-                .dispatch(&method, path, None, &Default::default())
+                .dispatch(&method, path, None, &Default::default(), &app)
                 .await;
             assert_eq!(response.status(), StatusCode::CONFLICT);
             assert!(
@@ -73,6 +81,8 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        app.shutdown();
+        app.drain_background().await;
     }
 
     #[tokio::test]

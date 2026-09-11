@@ -96,6 +96,8 @@ enum StoreBackend {
     #[cfg(not(target_arch = "wasm32"))]
     Postgres {
         dsn: String,
+        pool_size: usize,
+        checkout_timeout: std::time::Duration,
     },
     #[cfg(not(target_arch = "wasm32"))]
     Mysql {
@@ -284,9 +286,15 @@ impl Config {
                 gproxy_store::BackendConfig::Sqlite { path: path.clone() }
             }
             #[cfg(not(target_arch = "wasm32"))]
-            StoreBackend::Postgres { dsn } => {
-                gproxy_store::BackendConfig::Postgres { dsn: dsn.clone() }
-            }
+            StoreBackend::Postgres {
+                dsn,
+                pool_size,
+                checkout_timeout,
+            } => gproxy_store::BackendConfig::Postgres {
+                dsn: dsn.clone(),
+                pool_size: *pool_size,
+                checkout_timeout: *checkout_timeout,
+            },
             #[cfg(not(target_arch = "wasm32"))]
             StoreBackend::Mysql { dsn } => gproxy_store::BackendConfig::Mysql { dsn: dsn.clone() },
             StoreBackend::Libsql { url, auth_token } => gproxy_store::BackendConfig::Libsql {
@@ -304,11 +312,33 @@ impl Config {
     ) -> Result<Self, ConfigError> {
         let dsn = required(dsn, "GPROXY_DSN")?;
         self.backend = match backend {
-            "postgres" => StoreBackend::Postgres { dsn },
+            "postgres" => StoreBackend::Postgres {
+                dsn,
+                pool_size: 32,
+                checkout_timeout: std::time::Duration::from_secs(5),
+            },
             "mysql" => StoreBackend::Mysql { dsn },
             _ => return Err(invalid("GPROXY_PERSISTENCE", "unsupported SQL backend")),
         };
         Ok(self)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn with_postgres_pool(
+        mut self,
+        pool_size: usize,
+        checkout_timeout: std::time::Duration,
+    ) -> Self {
+        if let StoreBackend::Postgres {
+            pool_size: size,
+            checkout_timeout: timeout,
+            ..
+        } = &mut self.backend
+        {
+            *size = pool_size.max(8);
+            *timeout = checkout_timeout;
+        }
+        self
     }
 
     #[cfg(not(target_arch = "wasm32"))]

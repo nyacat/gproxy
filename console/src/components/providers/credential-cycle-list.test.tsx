@@ -1,7 +1,8 @@
 import type { CredentialQuotaCycleDto } from "@/generated/CredentialQuotaCycleDto"
-import { render, screen, within } from "@testing-library/react"
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
+import { render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import "@/i18n"
 import { CredentialCycleList } from "@/components/providers/credential-cycle-list"
 import { WindowList } from "@/components/usage/window-list"
@@ -72,7 +73,8 @@ describe("CredentialCycleList", () => {
     const { rerender } = render(<CredentialCycleList cycles={[cycle]} windows={[observed]} loading={false} error={false} />)
     expect(screen.getByText("25%")).toBeInTheDocument()
     expect(screen.queryByText("10%")).not.toBeInTheDocument()
-    expect(screen.getByText("Used this cycle (local)")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "View estimate details" })).toBeInTheDocument()
+    expect(screen.queryByText("Used this cycle (local)")).not.toBeInTheDocument()
 
     rerender(<CredentialCycleList cycles={[cycle]} windows={[{ ...observed, upstream_used: null, upstream_limit: null, used_percent: null }]} loading={false} error={false} />)
     expect(screen.getByText("—")).toBeInTheDocument()
@@ -84,7 +86,7 @@ describe("CredentialCycleList", () => {
     const observed = { window_key: cycle.window_key, label: null, upstream_used: "25", upstream_limit: "100", used_percent: "25", unit: null, period_end: 300 }
     const { rerender } = render(<CredentialCycleList cycles={[cycle]} windows={[observed]} loading={false} error={false} />)
     expect(screen.getByText("25%")).toBeInTheDocument()
-    expect(screen.queryByText("Used this cycle (local)")).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "View estimate details" })).not.toBeInTheDocument()
     expect(screen.queryByText("10%")).not.toBeInTheDocument()
 
     rerender(<CredentialCycleList cycles={[cycle]} windows={[]} loading={false} error={false} />)
@@ -92,6 +94,32 @@ describe("CredentialCycleList", () => {
     expect(screen.queryByText("10%")).not.toBeInTheDocument()
     await userEvent.setup().click(screen.getByRole("button", { name: "five-hour · Recorded quota history (1)" }))
     expect(screen.getByText("10%")).toBeInTheDocument()
+  })
+
+  it("loads previous cycles on demand and bounds rendering across all window groups", async () => {
+    const past = Array.from({ length: 25 }, (_, index) => ({ ...cycle, id: index + 1, window_key: `window-${index % 5}`, status: "closed" }))
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify(past), { status: 200 }))
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { unmount } = render(<QueryClientProvider client={client}>
+      <CredentialCycleList credentialId={7} cycles={[]} windows={[]} loading={false} error={false} />
+    </QueryClientProvider>)
+    try {
+      const user = userEvent.setup()
+      expect(fetchMock).not.toHaveBeenCalled()
+      await user.click(screen.getByRole("button", { name: "Previous rounds in the last year" }))
+      await waitFor(() => expect(screen.getAllByRole("button", { name: "View estimate details" })).toHaveLength(10))
+      expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)).toMatchObject({ credential_id: 7, include_history: false, include_estimate: false })
+      await user.click(screen.getByRole("button", { name: "Next" }))
+      expect(screen.getAllByRole("button", { name: "View estimate details" })).toHaveLength(10)
+      await user.click(screen.getByRole("button", { name: "Next" }))
+      expect(screen.getAllByRole("button", { name: "View estimate details" })).toHaveLength(5)
+      expect(fetchMock).toHaveBeenCalledOnce()
+    } finally {
+      unmount()
+      client.clear()
+      fetchSpy.mockRestore()
+    }
   })
 
   it("accepts only explicit start and end bounds in chronological order", () => {

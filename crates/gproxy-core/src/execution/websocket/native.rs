@@ -155,9 +155,7 @@ impl<H: Host> ResponsesBridge<H> {
                 self.core.host.clone(),
                 facts,
                 http::StatusCode::SWITCHING_PROTOCOLS,
-                None,
-                None,
-                None,
+                crate::funnel::StreamDetails::default(),
                 crate::usage::Ended::Interrupted,
             )
             .await;
@@ -176,9 +174,7 @@ impl<H: Host> ResponsesBridge<H> {
                 self.core.host.clone(),
                 facts,
                 http::StatusCode::SWITCHING_PROTOCOLS,
-                None,
-                None,
-                None,
+                crate::funnel::StreamDetails::default(),
                 crate::usage::Ended::Interrupted,
             )
             .await;

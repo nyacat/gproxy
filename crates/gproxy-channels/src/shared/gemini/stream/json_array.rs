@@ -1,7 +1,7 @@
 //! Incremental JSON-array framing used by Gemini streaming responses.
 
 use gproxy_channel_api::ChannelError;
-use gproxy_protocol::gemini::GenerateContentResponse;
+use serde_json::Value;
 
 const MAX_BUFFER_BYTES: usize = 100 * 1024 * 1024;
 
@@ -21,10 +21,7 @@ enum State {
 }
 
 impl Decoder {
-    pub(super) fn push(
-        &mut self,
-        chunk: &[u8],
-    ) -> Result<Vec<GenerateContentResponse>, ChannelError> {
+    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Vec<Value>, ChannelError> {
         self.buffer.extend_from_slice(chunk);
         let output = self.decode()?;
         if self.buffer.len() > MAX_BUFFER_BYTES {
@@ -33,7 +30,7 @@ impl Decoder {
         Ok(output)
     }
 
-    pub(super) fn finish(&mut self) -> Result<Vec<GenerateContentResponse>, ChannelError> {
+    pub(super) fn finish(&mut self) -> Result<Vec<Value>, ChannelError> {
         let output = self.decode()?;
         if self.state == State::End {
             Ok(output)
@@ -42,7 +39,7 @@ impl Decoder {
         }
     }
 
-    fn decode(&mut self) -> Result<Vec<GenerateContentResponse>, ChannelError> {
+    fn decode(&mut self) -> Result<Vec<Value>, ChannelError> {
         let mut output = Vec::new();
         let mut cursor = 0;
         loop {
@@ -94,9 +91,8 @@ impl Decoder {
     }
 }
 
-fn parse_value(buffer: &[u8]) -> Result<Option<(usize, GenerateContentResponse)>, ChannelError> {
-    let mut values =
-        serde_json::Deserializer::from_slice(buffer).into_iter::<GenerateContentResponse>();
+fn parse_value(buffer: &[u8]) -> Result<Option<(usize, Value)>, ChannelError> {
+    let mut values = serde_json::Deserializer::from_slice(buffer).into_iter::<Value>();
     match values.next() {
         Some(Ok(value)) => {
             let end = values.byte_offset();

@@ -22,7 +22,8 @@ pub(super) static CLIENT_PROFILE: ClientProfile = ClientProfile {
         "ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:",
         "rsa_pss_rsae_sha512:rsa_pkcs1_sha512:rsa_pkcs1_sha1"
     ))),
-    preserve_tls13_cipher_list: Some(false),
+    // Otherwise BoringSSL replaces the explicitly configured TLS 1.3 ordering.
+    preserve_tls13_cipher_list: Some(true),
     grease: Some(false),
     extension_permutation: None,
     http2: None,

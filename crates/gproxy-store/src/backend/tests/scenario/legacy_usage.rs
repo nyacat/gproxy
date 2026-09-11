@@ -1,6 +1,7 @@
+use sea_query::{Alias, Expr, ExprTrait, Query};
 use serde_json::json;
 
-use crate::backend::{DbValue, Statement};
+use crate::backend::Statement;
 use crate::records::{UsageAggregateQuery, UsageFilter, UsageGroupBy};
 use crate::{Store, StoreError};
 
@@ -79,13 +80,12 @@ pub(super) async fn run(store: &Store) -> Result<(), StoreError> {
 async fn write_metrics(store: &Store, metrics: &serde_json::Value) -> Result<(), StoreError> {
     store
         .backend()
-        .execute(Statement::with_args(
-            "UPDATE usage_rows SET metrics_json = ? WHERE request_id = ?",
-            vec![
-                DbValue::Text(metrics.to_string()),
-                DbValue::Text("request-1".into()),
-            ],
-        ))
+        .execute(Statement::query(
+            Query::update()
+                .table(Alias::new("usage_rows"))
+                .value(Alias::new("metrics_json"), metrics.to_string())
+                .and_where(Expr::col(Alias::new("request_id")).eq("request-1")),
+        )?)
         .await?;
     Ok(())
 }

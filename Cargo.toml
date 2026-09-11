@@ -19,6 +19,7 @@ members = [
 [workspace.package]
 version = "3.0.13"
 edition = "2024"
+rust-version = "1.98.1"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/LeenHawk/gproxy"
 
@@ -60,7 +61,7 @@ mysql_async = { version = "0.37", default-features = false, features = ["default
 percent-encoding = "2"
 proc-macro2 = "1"
 quote = "1"
-redis = { version = "1.6", default-features = false, features = ["connection-manager", "tokio-rustls-comp"] }
+redis = { version = "1.6", default-features = false, features = ["connection-manager", "script", "tokio-rustls-comp"] }
 rsa = { version = "0.9", features = ["sha2"] }
 regex = "1"
 rust_decimal = { version = "1", features = ["serde"] }
@@ -71,6 +72,7 @@ rust-embed = { version = "8", features = ["include-exclude"] }
 sea-query = { version = "1.0.2", default-features = false, features = ["backend-mysql", "backend-postgres", "backend-sqlite", "derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_path_to_error = "0.1"
 syn = { version = "3", features = ["full", "visit-mut"] }
 serde_urlencoded = "0.7"
 sha2 = "0.11"
@@ -97,8 +99,12 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 zeroize = "1"
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[profile.release-size]
+inherits = "release"
+opt-level = "z"

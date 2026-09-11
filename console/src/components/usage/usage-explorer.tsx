@@ -14,6 +14,7 @@ import { SearchableSelect } from "@/components/searchable-select"
 import { Field, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { UsageTable } from "@/components/usage/usage-table"
+import { QueryState } from "@/components/query-state"
 
 type Props = {
   children?: ReactNode
@@ -26,6 +27,8 @@ type Props = {
   summary: UsageSummaryDto | null
   summaryError: boolean
   pending: boolean
+  loading?: boolean
+  error?: boolean
   onPage: (page: number) => void
   onPageSize: (size: PageSize) => void
   credentials: Array<CredentialDto>
@@ -34,7 +37,7 @@ type Props = {
   keys: Array<UserKeyDto>
 }
 
-export function UsageExplorer({ children, view, draft, onDraft, onApply, onReset, page, summary, summaryError, pending, onPage, onPageSize, credentials, providers, users, keys }: Props) {
+export function UsageExplorer({ children, view, draft, onDraft, onApply, onReset, page, summary, summaryError, pending, loading = false, error = false, onPage, onPageSize, credentials, providers, users, keys }: Props) {
   const { t, i18n } = useTranslation()
   const credentialOptions = useMemo(() => {
     const providerNames = new Map(providers.map((provider) => [provider.id, provider.name]))
@@ -67,7 +70,9 @@ export function UsageExplorer({ children, view, draft, onDraft, onApply, onReset
           {[[t("usage.requests"), summary ? formatCount(summary.requests, i18n.language) : "—"], [t("usage.record.tokens"), summary ? formatCount(Number(summary.total_tokens), i18n.language) : "—"], [t("usage.cost.label"), summary ? formatCost(summary.cost, i18n.language) : "—"]].map(([label, value]) => <div key={label}><dt className="text-xs text-muted-foreground">{label}</dt><dd className="mt-1 text-xl font-semibold tabular-nums">{value}</dd></div>)}
         </dl>
         {summaryError ? <p role="alert" className="text-sm text-destructive">{t("common.loadError")}</p> : null}
-        <UsageTable page={page} providers={providers} credentials={credentials} users={users} keys={keys} pending={pending} onPage={onPage} onPageSize={onPageSize} />
+        <QueryState loading={loading} error={error ? t("common.loadError") : ""}>
+          <UsageTable page={page} providers={providers} credentials={credentials} users={users} keys={keys} pending={pending} onPage={onPage} onPageSize={onPageSize} />
+        </QueryState>
       </> : children}
     </div>
   )

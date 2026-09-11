@@ -69,7 +69,11 @@ impl<H: Host> ContinuationStream<H> {
                     self.park(pause);
                 }
             }
-            Err(error) => self.interrupt(TransportError::Interrupted(error.to_string())),
+            Err(error) => {
+                self.output
+                    .extend(error.frames.into_iter().map(|frame| frame.0));
+                self.interrupt(TransportError::Interrupted(error.error.to_string()));
+            }
         }
     }
 
@@ -128,7 +132,11 @@ impl<H: Host> ContinuationStream<H> {
                     .output
                     .extend(frames.into_iter().map(|frame: Frame| frame.0)),
                 Err(error) => {
-                    self.terminal_error = Some(TransportError::Interrupted(error.to_string()))
+                    if end == StreamEnd::Complete {
+                        self.output
+                            .extend(error.frames.into_iter().map(|frame| frame.0));
+                    }
+                    self.terminal_error = Some(TransportError::Interrupted(error.error.to_string()))
                 }
             }
         }

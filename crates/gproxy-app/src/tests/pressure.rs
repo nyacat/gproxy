@@ -58,6 +58,31 @@ async fn near_limit_credential_is_deprioritized() {
 
     assert_eq!(resolve_credentials(&app), vec![second, credential]);
 
+    app.inner.host.services.control.apply_live_pressure(
+        &gproxy_store::records::CredentialQuotaObservation {
+            unit: None,
+            reset_behavior: gproxy_core::QuotaResetBehavior::Periodic,
+            scope: gproxy_core::QuotaScope::All,
+            sample: gproxy_core::QuotaSample {
+                source: gproxy_core::QuotaSampleSource::Response,
+                started_at_ms: now * 1000,
+                received_at_ms: now * 1000,
+            },
+            credential_id: credential,
+            window_key: "five-hour".into(),
+            label: None,
+            period_start: Some(now - 60),
+            period_end: Some(now + 18_000),
+            boundary_source: QuotaBoundarySource::Upstream,
+            boundary_confidence: QuotaBoundaryConfidence::Derived,
+            observed_at: now + 1,
+            upstream_used: Some(Decimal::from(10)),
+            upstream_limit: Some(Decimal::from(100)),
+            used_percent: Some(Decimal::from(10)),
+        },
+    );
+    assert_eq!(resolve_credentials(&app), vec![credential, second]);
+
     let request = setup::request("cycle-view", "hi", &client_key);
     let identity = app
         .inner

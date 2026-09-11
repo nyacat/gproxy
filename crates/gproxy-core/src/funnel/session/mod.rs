@@ -146,6 +146,7 @@ fn outcome_response(ctx: &FunnelCtx, (status, headers, body, disposition): Outwa
         headers: super::outward_headers(ctx, headers),
         body,
         disposition,
+        stream_cancellation: None,
         _settled: Settled(()),
     }
 }

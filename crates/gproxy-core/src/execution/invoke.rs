@@ -61,7 +61,7 @@ pub(crate) async fn run<H: Host>(
                     .await;
                 Err(error.into())
             }
-            Failure::Committed { error, .. } => Err(error),
+            Failure::Local { error } | Failure::Committed { error, .. } => Err(error),
         },
     }
 }

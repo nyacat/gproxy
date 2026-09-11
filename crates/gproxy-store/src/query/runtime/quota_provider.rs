@@ -28,19 +28,22 @@ pub(crate) fn invalidate(id: i64, input: &ProviderInput) -> Result<Vec<Statement
         .column(Alias::new("id"))
         .from(Alias::new("credentials"))
         .and_where(Expr::col(Alias::new("provider_id")).in_subquery(provider.clone()));
-    let mut statements = [
-        "credential_quota_sources",
-        "credential_quota_response_entries",
-    ]
-    .into_iter()
-    .map(|table| {
-        Statement::query(
-            Query::delete()
-                .from_table(Alias::new(table))
-                .and_where(Expr::col(Alias::new("credential_id")).in_subquery(credentials.clone())),
-        )
-    })
-    .collect::<Result<Vec<_>, _>>()?;
+    let mut statements = vec![lock_credentials(id)?];
+    statements.extend(
+        [
+            "credential_quota_sources",
+            "credential_quota_response_entries",
+        ]
+        .into_iter()
+        .map(|table| {
+            Statement::query(
+                Query::delete().from_table(Alias::new(table)).and_where(
+                    Expr::col(Alias::new("credential_id")).in_subquery(credentials.clone()),
+                ),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?,
+    );
     statements.push(Statement::query(
         Query::update()
             .table(Alias::new("credentials"))
@@ -51,6 +54,15 @@ pub(crate) fn invalidate(id: i64, input: &ProviderInput) -> Result<Vec<Statement
             .and_where(Expr::col(Alias::new("provider_id")).in_subquery(provider)),
     )?);
     Ok(statements)
+}
+
+pub(crate) fn lock_credentials(provider_id: i64) -> Result<Statement, StoreError> {
+    Statement::query(
+        Query::update()
+            .table(Alias::new("credentials"))
+            .value(Alias::new("version"), Expr::col(Alias::new("version")))
+            .and_where(Expr::col(Alias::new("provider_id")).eq(provider_id)),
+    )
 }
 
 fn changed_optional(column: &str, value: Option<&str>) -> SimpleExpr {

@@ -237,6 +237,19 @@ impl State for AppHandle {
         Box::pin(quota_probe::run(self, credential_id, force))
     }
 
+    fn quota_probe_lightweight<'a>(
+        &'a self,
+        credential_id: i64,
+        force: bool,
+    ) -> BoxFuture<'a, Result<gproxy_admin::dto::QuotaProbeResponse, AdminError>> {
+        Box::pin(quota_probe::run_with_options(
+            self,
+            credential_id,
+            force,
+            true,
+        ))
+    }
+
     fn quota_reset<'a>(
         &'a self,
         credential_id: i64,
@@ -459,6 +472,15 @@ impl State for AppHandle {
 
     fn channel_catalogue(&self) -> Vec<ChannelDto> {
         self.inner.core.channels().map(channel_dto).collect()
+    }
+
+    fn tls_presets(&self) -> Vec<gproxy_admin::dto::TlsPresetDto> {
+        self.inner
+            .core
+            .channels()
+            .filter_map(|channel| channel.client_fingerprint())
+            .filter_map(gproxy_admin::dto::client_fingerprint_dto)
+            .collect()
     }
 
     fn normalize_provider_settings(

@@ -10,6 +10,8 @@ pub struct CycleTracking {
     pub reset_behavior: gproxy_core::QuotaResetBehavior,
     pub models: std::collections::BTreeMap<String, serde_json::Value>,
     pub needs_rebuild: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuild_after: Option<i64>,
     pub scope: QuotaScope,
     pub sample: QuotaSample,
     pub baseline_at_ms: i64,

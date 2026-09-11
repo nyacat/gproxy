@@ -1,5 +1,7 @@
 use gproxy_core::RequestCtx;
+use std::panic::AssertUnwindSafe;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::future_to_promise;
 use web_sys::{Request, Response};
 
 const ADMIN_PREFIX: &str = "/admin/api";
@@ -98,6 +100,25 @@ impl EdgeHost {
         request: Request,
         client_source: String,
     ) -> Result<EdgeReply, JsValue> {
+        let mut reply = self.fetch_inner(request, client_source).await?;
+        let app = self.app.clone();
+        let recovery = future_to_promise(AssertUnwindSafe(async move {
+            if let Err(error) = app.recover_pending_settlements(4).await {
+                tracing::warn!(error = %error, "pending settlement recovery failed");
+            }
+            Ok(JsValue::UNDEFINED)
+        }));
+        reply.retain(recovery);
+        Ok(reply)
+    }
+}
+
+impl EdgeHost {
+    async fn fetch_inner(
+        &self,
+        request: Request,
+        client_source: String,
+    ) -> Result<EdgeReply, JsValue> {
         self.app.sync_invalidation().await.map_err(js_error)?;
         let request_id = request_id()?;
         let client_ip = client_source.parse().ok();
@@ -108,6 +129,10 @@ impl EdgeHost {
                     .map(EdgeReply::from);
             }
         };
+        incoming
+            .parts
+            .extensions
+            .insert(gproxy_admin::RequestId(request_id.clone()));
         if let Some(response) = self
             .app
             .oauth_dispatch(&incoming.parts, incoming.body.clone())
@@ -205,6 +230,18 @@ impl From<Response> for EdgeReply {
 }
 
 impl EdgeReply {
+    fn retain(&mut self, continuation: js_sys::Promise) {
+        self.continuation = Some(match self.continuation.take() {
+            Some(previous) => {
+                let promises = js_sys::Array::new();
+                promises.push(&previous);
+                promises.push(&continuation);
+                js_sys::Promise::all(&promises)
+            }
+            None => continuation,
+        });
+    }
+
     pub(crate) fn websocket(response: Response, continuation: js_sys::Promise) -> Self {
         Self {
             response: Some(response),

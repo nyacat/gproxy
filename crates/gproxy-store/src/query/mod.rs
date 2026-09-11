@@ -14,5 +14,6 @@ pub(crate) mod oauth_clients;
 pub(crate) mod oauth_exchange;
 pub(crate) mod oauth_sessions;
 pub(crate) mod runtime;
+pub(crate) mod settlement_recovery;
 pub(crate) mod tokenizer;
 pub(crate) mod usage;

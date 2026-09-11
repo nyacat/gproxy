@@ -194,6 +194,36 @@ pub(super) async fn run(store: &Store, credential_id: i64) -> Result<Outcome, St
     })
 }
 
+pub(super) fn spark_observation(
+    credential_id: i64,
+    window_key: &str,
+    observed_at: i64,
+    window_seconds: i64,
+    used_percent: i64,
+) -> CredentialQuotaObservation {
+    CredentialQuotaObservation {
+        unit: None,
+        reset_behavior: gproxy_core::QuotaResetBehavior::Periodic,
+        scope: gproxy_core::QuotaScope::Unknown,
+        sample: gproxy_core::QuotaSample {
+            source: gproxy_core::QuotaSampleSource::Probe,
+            started_at_ms: observed_at * 1000,
+            received_at_ms: observed_at * 1000,
+        },
+        credential_id,
+        window_key: window_key.into(),
+        label: Some("GPT-5.3-Codex-Spark".into()),
+        period_start: Some(observed_at),
+        period_end: Some(observed_at + window_seconds),
+        boundary_source: QuotaBoundarySource::Upstream,
+        boundary_confidence: QuotaBoundaryConfidence::Derived,
+        observed_at,
+        upstream_used: None,
+        upstream_limit: None,
+        used_percent: Some(Decimal::from(used_percent)),
+    }
+}
+
 fn observation(
     credential_id: i64,
     window_key: &str,

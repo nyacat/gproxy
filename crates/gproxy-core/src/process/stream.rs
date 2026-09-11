@@ -1,6 +1,7 @@
 mod json_array;
 mod sse;
 
+use gproxy_channel_api::StreamDecodeError;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -18,6 +19,7 @@ pub struct ResponseRuleDecoder {
     primary_model: String,
     alternate_model: Option<String>,
     client_headers: http::HeaderMap,
+    pending_tail: Option<StreamTail>,
 }
 
 enum Codec {
@@ -54,6 +56,7 @@ impl ResponseRuleDecoder {
             primary_model,
             alternate_model,
             client_headers,
+            pending_tail: None,
         })
     }
 
@@ -70,12 +73,15 @@ impl ResponseRuleDecoder {
         )
     }
 
-    fn decode(&mut self, frames: Vec<Frame>) -> Result<Vec<Frame>, ChannelError> {
+    fn decode(&mut self, frames: Vec<Frame>) -> Result<Vec<Frame>, StreamDecodeError> {
         let mut output = Vec::new();
         for frame in frames {
-            let decoded = match &mut self.codec {
-                Codec::Sse(codec) => codec.push(frame.0)?,
-                Codec::JsonArray(codec) => codec.push(frame.0)?,
+            let decoded = match match &mut self.codec {
+                Codec::Sse(codec) => codec.push(frame.0),
+                Codec::JsonArray(codec) => codec.push(frame.0),
+            } {
+                Ok(frames) => frames,
+                Err(error) => return Err(self.codec_error(error, output)),
             };
             for frame in decoded {
                 output.push(Frame(frame.map(|body| self.rewrite(body))));
@@ -83,43 +89,111 @@ impl ResponseRuleDecoder {
         }
         Ok(output)
     }
+
+    fn codec_error(&self, error: CodecError, mut frames: Vec<Frame>) -> StreamDecodeError {
+        frames.extend(
+            error
+                .frames
+                .into_iter()
+                .map(|frame| Frame(frame.map(|body| self.rewrite(body)))),
+        );
+        StreamDecodeError::from(error.error).prepend(frames)
+    }
 }
 
 impl StreamDecoder for ResponseRuleDecoder {
-    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
+    fn terminal_failure(&self) -> Option<&gproxy_channel_api::UpstreamFailure> {
+        self.upstream
+            .as_ref()
+            .and_then(|decoder| decoder.terminal_failure())
+    }
+
+    fn terminal_disposition(&self) -> Option<gproxy_channel_api::Disposition> {
+        self.upstream
+            .as_ref()
+            .and_then(|decoder| decoder.terminal_disposition())
+    }
+
+    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
         let frames = match self.upstream.as_mut() {
-            Some(upstream) => upstream.push(chunk)?,
+            Some(upstream) => match upstream.push(chunk) {
+                Ok(frames) => frames,
+                Err(mut error) => {
+                    let frames = self.decode(std::mem::take(&mut error.frames))?;
+                    return Err(error.prepend(frames));
+                }
+            },
             None => vec![Frame(chunk)],
         };
         self.decode(frames)
     }
 
-    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, ChannelError> {
+    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
         let mut tail = match self.upstream.as_mut() {
-            Some(upstream) => upstream.finish(end)?,
+            Some(upstream) => match upstream.finish(end) {
+                Ok(tail) => tail,
+                Err(mut error) => {
+                    if end == StreamEnd::Interrupted {
+                        error.frames.clear();
+                        return Err(error);
+                    }
+                    let frames = self.decode(std::mem::take(&mut error.frames))?;
+                    return Err(error.prepend(frames));
+                }
+            },
             None => StreamTail::default(),
         };
         if end == StreamEnd::Interrupted {
             tail.frames.clear();
             return Ok(tail);
         }
-        let mut frames = self.decode(std::mem::take(&mut tail.frames))?;
-        let final_frames = match &mut self.codec {
-            Codec::Sse(codec) => codec.finish()?,
-            Codec::JsonArray(codec) => codec.finish()?,
+        let tail_frames = std::mem::take(&mut tail.frames);
+        self.pending_tail = Some(tail);
+        let mut frames = self.decode(tail_frames)?;
+        let final_frames = match match &mut self.codec {
+            Codec::Sse(codec) => codec.finish(),
+            Codec::JsonArray(codec) => codec.finish(),
+        } {
+            Ok(frames) => frames,
+            Err(error) => return Err(self.codec_error(error, frames)),
         };
         for frame in final_frames {
             frames.push(Frame(frame.map(|body| self.rewrite(body))));
         }
+        let mut tail = self.pending_tail.take().expect("finished upstream tail");
         tail.frames = frames;
         Ok(tail)
     }
+
+    fn recover_tail(&mut self) -> StreamTail {
+        self.pending_tail.take().unwrap_or_else(|| {
+            self.upstream
+                .as_mut()
+                .map_or_else(StreamTail::default, |upstream| upstream.recover_tail())
+        })
+    }
 }
 
+#[derive(Debug)]
 enum EncodedFrame {
     Sse { event: Option<String>, data: Bytes },
     Json { prefix: &'static [u8], data: Bytes },
     Raw(Bytes),
+}
+
+#[derive(Debug)]
+struct CodecError {
+    error: ChannelError,
+    frames: Vec<EncodedFrame>,
+}
+
+impl From<ChannelError> for CodecError {
+    fn from(error: ChannelError) -> Self {
+        Self {
+            error,
+            frames: Vec::new(),
+        }
+    }
 }
 
 impl EncodedFrame {
@@ -134,5 +208,37 @@ impl EncodedFrame {
             }
             Self::Raw(body) => body,
         }
+    }
+}
+
+#[cfg(test)]
+mod partial_tests {
+    use super::*;
+
+    #[test]
+    fn rules_preserve_frames_before_invalid_utf8_in_the_same_chunk() {
+        let key = gproxy_protocol::OperationKey::content(
+            gproxy_protocol::Operation::StreamGenerateContent,
+            gproxy_protocol::ContentGenerationKind::OpenAiResponses,
+        );
+        let mut decoder = ResponseRuleDecoder::new(
+            None,
+            Arc::from([]),
+            key,
+            gproxy_protocol::StreamFraming::Sse,
+            RuleModels::new("model", None),
+            http::HeaderMap::new(),
+        )
+        .unwrap();
+        let mut bytes =
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n".to_vec();
+        bytes.extend_from_slice(b"data: \xff\n\n");
+        let error = decoder.push(Bytes::from(bytes)).unwrap_err();
+        assert_eq!(error.frames.len(), 1);
+        assert!(
+            std::str::from_utf8(&error.frames[0].0)
+                .unwrap()
+                .contains("hello")
+        );
     }
 }

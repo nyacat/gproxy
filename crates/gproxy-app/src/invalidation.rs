@@ -24,27 +24,22 @@ pub(crate) async fn bump(cache: &AppCache) -> Result<i64, AppError> {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn schedule(app: &AppHandle) {
     let inner = std::sync::Arc::downgrade(&app.inner);
-    let mut shutdown = app.inner.shutdown.subscribe();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                result = shutdown.changed() => {
-                    if result.is_err() || *shutdown.borrow_and_update() {
-                        return;
-                    }
-                }
-                _ = tokio::time::sleep(POLL_INTERVAL) => {
-                    let Some(inner) = inner.upgrade() else {
-                        return;
-                    };
-                    let app = AppHandle { inner };
-                    if let Err(error) = app.sync_invalidation().await {
-                        tracing::warn!(error = %error, "control-plane invalidation poll failed");
-                    }
+    app.inner
+        .host
+        .services
+        .spawner
+        .spawn_maintenance(app.inner.shutdown.subscribe(), async move {
+            loop {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                let app = AppHandle { inner };
+                if let Err(error) = app.sync_invalidation().await {
+                    tracing::warn!(error = %error, "control-plane invalidation poll failed");
                 }
             }
-        }
-    });
+        });
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -153,7 +153,7 @@ pub(super) fn provider_variants(
     Ok(providers)
 }
 
-pub(super) fn identities(stored: &ControlSnapshot) -> BTreeMap<(u32, Vec<u8>), KeyIdentity> {
+pub(super) fn identities(stored: &ControlSnapshot) -> BTreeMap<(u32, [u8; 32]), KeyIdentity> {
     let organizations = stored
         .organizations
         .iter()
@@ -187,23 +187,23 @@ pub(super) fn identities(stored: &ControlSnapshot) -> BTreeMap<(u32, Vec<u8>), K
         .iter()
         .filter_map(|key| {
             let user = users.get(&key.user_id)?;
-            (key.enabled && super::super::supported_user_key_digest(key.digest_version)).then(
-                || {
-                    (
-                        (key.digest_version, key.digest.clone()),
-                        KeyIdentity {
-                            caller: CallerIdentity {
-                                oauth_access_digest: None,
-                                user_id: user.id,
-                                user_key_id: key.id,
-                                org_id: user.organization_id,
-                                team_id: user.team_id,
-                            },
-                            expires_at: key.expires_at,
-                        },
-                    )
+            if !key.enabled || !super::super::supported_user_key_digest(key.digest_version) {
+                return None;
+            }
+            let digest: [u8; 32] = key.digest.as_slice().try_into().ok()?;
+            Some((
+                (key.digest_version, digest),
+                KeyIdentity {
+                    caller: CallerIdentity {
+                        oauth_access_digest: None,
+                        user_id: user.id,
+                        user_key_id: key.id,
+                        org_id: user.organization_id,
+                        team_id: user.team_id,
+                    },
+                    expires_at: key.expires_at,
                 },
-            )
+            ))
         })
         .collect()
 }

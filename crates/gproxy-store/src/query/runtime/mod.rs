@@ -7,7 +7,10 @@ pub(crate) mod quota_provider;
 pub(crate) mod quota_response;
 pub(crate) mod quota_snapshot;
 
-pub(crate) use cleanup::{delete_before, delete_oldest_logs, delete_stale_quota_activity};
+pub(crate) use cleanup::{
+    delete_before, delete_closed_additional_cycles, delete_oldest_logs, delete_oldest_observations,
+    delete_stale_quota_activity,
+};
 
 pub(crate) use cycle::*;
 pub(crate) use health::{

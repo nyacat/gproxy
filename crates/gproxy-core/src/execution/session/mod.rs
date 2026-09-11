@@ -54,11 +54,7 @@ pub(super) fn selection_key(subject: Option<SessionSubject>, user_key_id: i64) -
     i64::from_be_bytes(digest[..8].try_into().expect("SHA-256 has eight bytes"))
 }
 
-pub(super) fn subject(
-    ctx: &RequestCtx,
-    kind: OperationKind,
-    body: Option<&serde_json::Value>,
-) -> Option<SessionSubject> {
+pub(super) fn from_headers(ctx: &RequestCtx, kind: OperationKind) -> Option<SessionSubject> {
     header(&ctx.headers, "x-gproxy-session-id")
         .map(|value| digest_subject(b"gproxy", value.as_bytes()))
         .or_else(|| {
@@ -91,8 +87,18 @@ pub(super) fn subject(
                 .or_else(|| header(&ctx.headers, "x-session-affinity"))
                 .map(|value| digest_subject(b"openai", value.as_bytes()))
         })
-        .or_else(|| body.and_then(|body| fingerprint::digest(kind, body)))
         .map(SessionSubject)
+}
+
+pub(super) fn subject(
+    ctx: &RequestCtx,
+    kind: OperationKind,
+    body: Option<&serde_json::Value>,
+) -> Option<SessionSubject> {
+    from_headers(ctx, kind).or_else(|| {
+        body.and_then(|body| fingerprint::digest(kind, body))
+            .map(SessionSubject)
+    })
 }
 
 pub(super) async fn apply<H: Host>(

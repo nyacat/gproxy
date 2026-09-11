@@ -3,6 +3,7 @@ mod log;
 mod quota;
 mod quota_snapshot;
 mod quota_tracking;
+mod settlement_recovery;
 mod usage;
 
 use super::TableSpec;
@@ -15,4 +16,5 @@ pub(super) fn tables() -> impl Iterator<Item = &'static TableSpec> {
         .chain(binding::TABLES)
         .chain(quota_tracking::TABLES)
         .chain(quota_snapshot::TABLES)
+        .chain(settlement_recovery::TABLES)
 }

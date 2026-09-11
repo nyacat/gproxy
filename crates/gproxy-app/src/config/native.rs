@@ -13,6 +13,8 @@ const PORT: &str = "GPROXY_PORT";
 const DATA_DIR: &str = "GPROXY_DATA_DIR";
 const PERSISTENCE: &str = "GPROXY_PERSISTENCE";
 const DSN: &str = "GPROXY_DSN";
+const PG_POOL: &str = "GPROXY_PG_POOL";
+const PG_CHECKOUT_TIMEOUT_MS: &str = "GPROXY_PG_CHECKOUT_TIMEOUT_MS";
 const LIBSQL_URL: &str = "GPROXY_LIBSQL_URL";
 const LIBSQL_AUTH_TOKEN: &str = "GPROXY_LIBSQL_AUTH_TOKEN";
 const REDIS_URL: &str = "GPROXY_REDIS_URL";
@@ -70,6 +72,12 @@ pub(super) struct Cli {
     /// PostgreSQL or MySQL connection string
     #[arg(long, env = DSN, value_name = "DSN", hide_env_values = true)]
     dsn: Option<String>,
+    /// PostgreSQL pool size [default: 32, minimum: 8]
+    #[arg(long, env = PG_POOL, value_name = "COUNT")]
+    pg_pool: Option<String>,
+    /// PostgreSQL pool checkout timeout in milliseconds [default: 5000]
+    #[arg(long, env = PG_CHECKOUT_TIMEOUT_MS, value_name = "MS")]
+    pg_checkout_timeout_ms: Option<String>,
     /// libSQL endpoint; required only for the `libsql` backend
     #[arg(long, env = LIBSQL_URL, value_name = "URL")]
     libsql_url: Option<String>,
@@ -251,14 +259,30 @@ fn resolve(mut cli: Cli, cwd: &Path) -> Result<NativeCommand, ConfigError> {
             layered(cli.libsql_auth_token, LIBSQL_AUTH_TOKEN).unwrap_or_default(),
             secret_keys,
         ),
-        "postgres" | "mysql" => Config::sqlite(listen_addr, data_dir, secret_keys).sql_server(
+        "postgres" | "mysql" => {
+            let config = Config::sqlite(listen_addr, data_dir, secret_keys).sql_server(
+                if persistence == "postgres" {
+                    "postgres"
+                } else {
+                    "mysql"
+                },
+                layered(cli.dsn, DSN).unwrap_or_default(),
+            )?;
             if persistence == "postgres" {
-                "postgres"
+                let pool_size =
+                    parse_number(layered(cli.pg_pool, PG_POOL), PG_POOL, 32usize, false)?;
+                let timeout_ms = parse_number(
+                    layered(cli.pg_checkout_timeout_ms, PG_CHECKOUT_TIMEOUT_MS),
+                    PG_CHECKOUT_TIMEOUT_MS,
+                    5_000u64,
+                    false,
+                )?;
+                Ok(config
+                    .with_postgres_pool(pool_size, std::time::Duration::from_millis(timeout_ms)))
             } else {
-                "mysql"
-            },
-            layered(cli.dsn, DSN).unwrap_or_default(),
-        ),
+                Ok(config)
+            }
+        }
         _ => Err(invalid(
             PERSISTENCE,
             "expected `sqlite` (`db` for v2), `libsql`, `postgres`, or `mysql`",

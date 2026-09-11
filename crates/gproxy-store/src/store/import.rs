@@ -27,7 +27,7 @@ impl Store {
     }
 
     pub async fn insert_record_batch(&self, batch: RecordBatch) -> Result<Vec<i64>, StoreError> {
-        let statements = statements(batch)?;
+        let statements = statements(&batch)?;
         if statements.is_empty() {
             return Ok(Vec::new());
         }
@@ -78,7 +78,14 @@ impl Store {
     }
 }
 
-fn statements(batch: RecordBatch) -> Result<Vec<Statement>, StoreError> {
+impl RecordBatch {
+    /// Checks serialization and database value ranges without executing writes.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        statements(self).map(|_| ())
+    }
+}
+
+fn statements(batch: &RecordBatch) -> Result<Vec<Statement>, StoreError> {
     macro_rules! build {
         ($values:expr, $function:path) => {
             $values.iter().map($function).collect()

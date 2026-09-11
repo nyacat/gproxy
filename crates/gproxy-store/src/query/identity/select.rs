@@ -2,6 +2,17 @@ use crate::StoreError;
 use crate::backend::Statement;
 use crate::query::common::select_all;
 
+pub(crate) fn quota_exists(id: i64) -> Result<Statement, StoreError> {
+    use sea_query::{Alias, Expr, ExprTrait, Query};
+    let mut query = Query::select();
+    query
+        .column(Alias::new("id"))
+        .from(Alias::new("quotas"))
+        .and_where(Expr::col(Alias::new("id")).eq(id))
+        .limit(1);
+    Statement::query(&query)
+}
+
 pub(crate) fn select_organizations() -> Result<Statement, StoreError> {
     select_all("organizations", &["id", "name", "enabled"])
 }

@@ -34,12 +34,44 @@ export function cyclePoints(cycle: CredentialQuotaCycleDto, metric: QuotaMetric)
 }
 
 export function roundRange(cycle: CredentialQuotaCycleDto, metric: QuotaMetric): QuotaRound | null {
-  const valid = cyclePoints(cycle, metric).filter((point): point is QuotaPoint & { value: number } => point.value != null)
-  const latest = valid.at(-1)
+  let minimum = Infinity
+  let maximum = -Infinity
+  let count = 0
+  let latest: QuotaPoint | null = null
+  for (const sample of cycle.observations) {
+    const value = remainingQuota(sample, metric)
+    if (value == null) continue
+    minimum = Math.min(minimum, value)
+    maximum = Math.max(maximum, value)
+    count++
+    if (latest == null || sample.observed_at_ms >= latest.at) latest = { at: sample.observed_at_ms, value }
+  }
   if (!latest) return null
-  const minimum = valid.reduce((value, point) => Math.min(value, point.value), latest.value)
-  const maximum = valid.reduce((value, point) => Math.max(value, point.value), latest.value)
-  return { at: cycle.accounting_start_ms, value: latest.value, range: [latest.value - minimum, maximum - latest.value], minimum, maximum, count: valid.length, cycleId: cycle.id, observedAt: latest.at }
+  const value = latest.value!
+  return { at: cycle.accounting_start_ms, value, range: [value - minimum, maximum - value], minimum, maximum, count, cycleId: cycle.id, observedAt: latest.at }
+}
+
+// Bound SVG geometry to the chart's display resolution. Each bucket retains its
+// endpoints, extrema and a missing-value marker. Range/count statistics always
+// use all observations, independently of this display-only reduction.
+export function sampleQuotaPoints(points: QuotaPoint[], limit = 1024): QuotaPoint[] {
+  if (points.length <= limit) return points
+  const width = Math.ceil(points.length / Math.max(1, Math.floor(limit / 5)))
+  const result: QuotaPoint[] = []
+  for (let start = 0; start < points.length; start += width) {
+    const end = Math.min(points.length, start + width)
+    const indices = new Set([start, end - 1])
+    let min = -1, max = -1, gap = -1
+    for (let i = start; i < end; i++) {
+      const value = points[i].value
+      if (value == null) { if (gap < 0) gap = i; continue }
+      if (min < 0 || value < points[min].value!) min = i
+      if (max < 0 || value > points[max].value!) max = i
+    }
+    for (const i of [min, max, gap]) if (i >= 0) indices.add(i)
+    for (const i of [...indices].sort((a, b) => a - b)) result.push(points[i])
+  }
+  return result
 }
 
 export function quotaSeries(cycles: Array<CredentialQuotaCycleDto>, credentials: Array<CredentialDto>, providers: Array<ProviderDto>, t: TFunction): Array<QuotaSeries> {

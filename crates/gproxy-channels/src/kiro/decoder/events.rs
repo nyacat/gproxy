@@ -16,6 +16,20 @@ pub(super) fn handle(
     let value: Value = serde_json::from_slice(&frame.payload)
         .map_err(|error| ChannelError::Decode(format!("Kiro event JSON: {error}")))?;
     let payload = value.get(event).unwrap_or(&value);
+    if event == "invalidStateEvent"
+        || frame.exception_type.is_some()
+        || frame.message_type.as_deref() == Some("exception")
+        || event.ends_with("Exception")
+    {
+        state.failure.exception(event, payload);
+        state.ensure_started(output);
+        let sequence = state.take();
+        output.push(super::super::sse::frame(json!({
+            "type":"error", "sequence_number":sequence, "code":event, "param":null,
+            "message":payload.get("message").or_else(|| payload.get("reason")).and_then(Value::as_str).unwrap_or("Kiro stream failed")
+        })));
+        return Ok(());
+    }
     match event {
         "assistantResponseEvent" => assistant(state, payload, output),
         "reasoningContentEvent" => reasoning(state, payload, output),
@@ -37,17 +51,6 @@ pub(super) fn handle(
         "toolUseEvent" => {
             state.ensure_started(output);
             output.extend(state.tools.handle(payload, &mut state.sequence)?);
-        }
-        "invalidStateEvent" | "InternalServerException" | "internalServerException" => {
-            state.ensure_started(output);
-            state.failed = true;
-            let sequence = state.take();
-            output.push(super::super::sse::frame(json!({
-                "type":"error","sequence_number":sequence,
-                "code":"kiro_eventstream_error","param":null,
-                "message":payload.get("message").or_else(||payload.get("reason"))
-                    .and_then(Value::as_str).unwrap_or("Kiro stream failed")
-            })));
         }
         _ => {}
     }

@@ -138,7 +138,7 @@ impl CacheBackend for UpstashCache {
         state: Vec<u8>,
     ) -> BoxFuture<'a, Result<Option<i64>, Error>> {
         Box::pin(async move {
-            let script = "if redis.call('GET',KEYS[2])~=ARGV[2] then return false end; local v=redis.call('INCRBY',KEYS[1],ARGV[1]); redis.call('SET',KEYS[2],ARGV[3]); return v";
+            let script = "if redis.call('GET',KEYS[2])~=ARGV[2] then return false end; local v=redis.call('INCRBY',KEYS[1],ARGV[1]); if v==0 then redis.call('PEXPIRE',KEYS[1],3600000) else redis.call('PERSIST',KEYS[1]) end; redis.call('SET',KEYS[2],ARGV[3]); return v";
             let encode = |value| base64::engine::general_purpose::STANDARD.encode(value);
             let result = self
                 .eval(
@@ -181,6 +181,107 @@ impl CacheBackend for UpstashCache {
                 .await?
                 .as_i64()
                 == Some(1))
+        })
+    }
+
+    fn seed_counter<'a>(
+        &'a self,
+        key: &'a str,
+        value: i64,
+        ttl: Option<Duration>,
+    ) -> BoxFuture<'a, Result<bool, Error>> {
+        Box::pin(async move {
+            let mut command = vec![json!("SET"), json!(key), json!(value), json!("NX")];
+            if ttl_millis(ttl) > 0 {
+                command.extend([json!("PX"), json!(ttl_millis(ttl))]);
+            }
+            Ok(!self.command(command, "seed counter").await?.is_null())
+        })
+    }
+
+    fn reserve_spend<'a>(
+        &'a self,
+        used_key: &'a str,
+        pending_key: &'a str,
+        estimate: i64,
+        limit: i64,
+        pending_ttl: Option<Duration>,
+    ) -> BoxFuture<'a, Result<gproxy_core::SpendReserve, Error>> {
+        Box::pin(async move {
+            let code = self
+                .eval(
+                    super::spend::RESERVE_SCRIPT,
+                    &[used_key, pending_key],
+                    vec![
+                        json!(estimate.to_string()),
+                        json!(limit.to_string()),
+                        json!(ttl_millis(pending_ttl)),
+                    ],
+                    "reserve spend",
+                )
+                .await?
+                .as_i64()
+                .ok_or_else(|| error("Upstash", "reserve spend"))?;
+            Ok(match code {
+                -1 => gproxy_core::SpendReserve::MissingUsed,
+                0 => gproxy_core::SpendReserve::Denied,
+                _ => gproxy_core::SpendReserve::Allowed,
+            })
+        })
+    }
+
+    fn reserve_spend_and_set<'a>(
+        &'a self,
+        used_key: &'a str,
+        pending_key: &'a str,
+        estimate: i64,
+        limit: i64,
+        state_key: &'a str,
+        expected_state: Vec<u8>,
+        state: Vec<u8>,
+    ) -> BoxFuture<'a, Result<Option<gproxy_core::SpendReserve>, Error>> {
+        Box::pin(async move {
+            let encode = |value| base64::engine::general_purpose::STANDARD.encode(value);
+            let code = self
+                .eval(
+                    super::spend::RESERVE_AND_SET_SCRIPT,
+                    &[used_key, pending_key, state_key],
+                    vec![
+                        json!(estimate.to_string()),
+                        json!(limit.to_string()),
+                        json!(encode(expected_state)),
+                        json!(encode(state)),
+                    ],
+                    "reserve spend and set",
+                )
+                .await?
+                .as_i64()
+                .ok_or_else(|| error("Upstash", "reserve spend and set"))?;
+            match code {
+                -2 => Ok(None),
+                -1 => Ok(Some(gproxy_core::SpendReserve::MissingUsed)),
+                0 => Ok(Some(gproxy_core::SpendReserve::Denied)),
+                1 => Ok(Some(gproxy_core::SpendReserve::Allowed)),
+                _ => Err(error("Upstash", "reserve spend and set")),
+            }
+        })
+    }
+
+    fn raise_counter<'a>(
+        &'a self,
+        key: &'a str,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(async move {
+            self.eval(
+                super::spend::RAISE_SCRIPT,
+                &[key],
+                vec![json!(floor), json!(ttl_millis(ttl))],
+                "raise counter",
+            )
+            .await?;
+            Ok(())
         })
     }
 }

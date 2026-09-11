@@ -28,12 +28,12 @@ export const saveOrganization = (value: OrganizationWriteRequest, id?: number) =
 export const teams = () => api<Array<TeamDto>>("/admin/api/teams")
 export const saveTeam = (value: TeamWriteRequest, id?: number) =>
   save("/admin/api/teams", value, id)
-export const users = () => api<Array<UserDto>>("/admin/api/users")
+export const users = (signal?: AbortSignal) => api<Array<UserDto>>("/admin/api/users", { signal })
 export const saveUser = (value: UserWriteRequest, id?: number) =>
   save("/admin/api/users", value, id)
 export const saveUserPassword = (id: number, value: UserPasswordRequest) =>
   api(`/admin/api/users/${id}/password`, json("POST", value))
-export const userKeys = () => api<Array<UserKeyDto>>("/admin/api/user-keys")
+export const userKeys = (signal?: AbortSignal) => api<Array<UserKeyDto>>("/admin/api/user-keys", { signal })
 export const createUserKey = (value: UserKeyCreateRequest) =>
   api<UserKeyCreateResponse>("/admin/api/user-keys", json("POST", value))
 export const updateUserKey = (id: number, value: UserKeyUpdateRequest) =>

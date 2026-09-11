@@ -33,15 +33,23 @@ fn values(record: &CredentialQuotaCycleRecord) -> Result<Vec<SimpleExpr>, StoreE
             serde_json::to_string(&record.tracking)
                 .map_err(|error| StoreError::Database(error.to_string()))?,
         ),
+        value(i64::from(record.tracking.needs_rebuild)),
     ])
 }
 
 pub(crate) fn insert_tracked_cycle(
     record: &CredentialQuotaCycleRecord,
     previous: Option<&CredentialQuotaCycleRecord>,
+    credential_version: Option<u64>,
 ) -> Result<Statement, StoreError> {
     let mut selected = Query::select();
     selected.exprs(values(record)?);
+    if let Some(version) = credential_version {
+        selected.and_where(super::super::quota_snapshot::credential_version_matches(
+            record.credential_id,
+            version,
+        )?);
+    }
     if let Some(previous) = previous {
         let mut guard = Query::select();
         guard
@@ -73,6 +81,14 @@ pub(crate) fn update_tracked_cycle(
     record: &CredentialQuotaCycleRecord,
     expected: u64,
 ) -> Result<Statement, StoreError> {
+    update_tracked_cycle_for_version(record, expected, None)
+}
+
+pub(crate) fn update_tracked_cycle_for_version(
+    record: &CredentialQuotaCycleRecord,
+    expected: u64,
+    credential_version: Option<u64>,
+) -> Result<Statement, StoreError> {
     let mut query = Query::update();
     query
         .table(Alias::new("credential_quota_cycles"))
@@ -85,6 +101,12 @@ pub(crate) fn update_tracked_cycle(
         )
         .and_where(Expr::col(Alias::new("id")).eq(record.id))
         .and_where(Expr::col(Alias::new("version")).eq(expected));
+    if let Some(version) = credential_version {
+        query.and_where(super::super::quota_snapshot::credential_version_matches(
+            record.credential_id,
+            version,
+        )?);
+    }
     Statement::query(&query)
 }
 

@@ -157,6 +157,7 @@ pub(super) async fn credential_cycles(
         .ok_or_else(|| AdminError::BadRequest("to is required".into()))?;
     let (from, to) = range(from, to)?;
     let credential_id = util::parse_i64(util::value(&query, "credential_id"), "credential_id")?;
+    let provider_id = util::parse_i64(util::value(&query, "provider_id"), "provider_id")?;
     let include_history = util::value(&query, "include_history")
         .map(|value| {
             value
@@ -165,44 +166,185 @@ pub(super) async fn credential_cycles(
         })
         .transpose()?
         .unwrap_or(false);
-    let records = state
-        .store()
-        .credential_quota_cycles(credential_id, from, to)
-        .await?;
-    let mut values = records
-        .iter()
-        .map(map::credential_cycle)
-        .collect::<Vec<_>>();
-    let settings = state.store().control_snapshot().await?.settings;
-    let usage_disabled = settings.iter().any(|setting| {
-        setting.key == gproxy_store::records::ENABLE_USAGE
-            && setting.value == serde_json::json!(false)
-    });
-    if include_history {
-        for (record, value) in records.iter().zip(&mut values) {
-            value.observations = state
+    let include_estimate = util::value(&query, "include_estimate")
+        .map(|value| {
+            value.parse::<bool>().map_err(|_| {
+                AdminError::BadRequest("include_estimate must be true or false".into())
+            })
+        })
+        .transpose()?
+        .unwrap_or(true);
+    read_cycles(
+        state,
+        parts,
+        crate::dto::CredentialCycleReadRequest {
+            from,
+            to,
+            credential_id,
+            provider_id,
+            include_history,
+            include_estimate,
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+}
+
+pub(super) async fn credential_cycles_query(
+    state: &impl State,
+    parts: &Parts,
+    body: &Bytes,
+) -> Result<Response<Bytes>, AdminError> {
+    let mut request: crate::dto::CredentialCycleReadRequest = util::parse(body)?;
+    range(request.from, request.to)?;
+    if let Some(ids) = &mut request.cycle_ids {
+        if ids.len() > 5_000 || ids.iter().any(|id| *id <= 0) {
+            return Err(AdminError::BadRequest(
+                "cycle_ids must contain at most 5000 positive ids".into(),
+            ));
+        }
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    read_cycles(state, parts, request, true).await
+}
+
+async fn read_cycles(
+    state: &impl State,
+    parts: &Parts,
+    request: crate::dto::CredentialCycleReadRequest,
+    bounded: bool,
+) -> Result<Response<Bytes>, AdminError> {
+    use tracing::Instrument;
+    let range_ms = if bounded {
+        Some((
+            request
+                .from
+                .checked_mul(1000)
+                .ok_or_else(|| AdminError::BadRequest("from is out of range".into()))?,
+            request
+                .to
+                .checked_mul(1000)
+                .ok_or_else(|| AdminError::BadRequest("to is out of range".into()))?,
+        ))
+    } else {
+        None
+    };
+    let options = gproxy_store::records::CredentialQuotaStatisticsOptions {
+        cycle_ids: request.cycle_ids.clone(),
+        current_only: request.current_only,
+        observation_range_ms: range_ms,
+    };
+    let source = if bounded {
+        "admin.credential_cycles.query"
+    } else {
+        "admin.credential_cycles"
+    };
+    let client_view = parts
+        .headers
+        .get("x-gproxy-console-view")
+        .and_then(|v| v.to_str().ok())
+        .filter(|view| {
+            matches!(
+                *view,
+                "overview" | "providers" | "quota-history" | "quota-details"
+            )
+        })
+        .unwrap_or("unknown");
+    let request_id = parts
+        .extensions
+        .get::<crate::RequestId>()
+        .map(|id| id.0.as_str())
+        .unwrap_or("unavailable");
+    let span = tracing::info_span!("quota.statistics", source, client_view, request_id,
+        credential_id = ?request.credential_id, provider_id = ?request.provider_id,
+        from = request.from, to = request.to, include_history = request.include_history,
+        include_estimate = request.include_estimate, current_only = request.current_only,
+        selected_cycles = ?request.cycle_ids.as_ref().map(Vec::len));
+    async {
+        let mut timing = StatisticsTiming {
+            started: web_time::Instant::now(),
+            outcome: "cancelled",
+            source,
+        };
+        let result = async {
+            let usage_disabled = state
                 .store()
-                .credential_quota_observations(record, !usage_disabled)
+                .setting(gproxy_store::records::ENABLE_USAGE)
                 .await?
+                == Some(serde_json::json!(false));
+            let records = state
+                .store()
+                .credential_quota_statistics_with_options(
+                    &gproxy_store::records::CredentialQuotaCycleQuery {
+                        credential_id: request.credential_id,
+                        provider_id: request.provider_id,
+                        from: request.from,
+                        to: request.to,
+                        calculate: request.include_estimate && !usage_disabled,
+                        history: request.include_history,
+                    },
+                    &options,
+                )
+                .await?;
+            let mut values = records
                 .into_iter()
-                .map(Into::into)
-                .collect();
+                .map(|record| {
+                    let mut value = map::credential_cycle(&record.cycle);
+                    value.observations = record.observations.into_iter().map(Into::into).collect();
+                    value
+                })
+                .collect::<Vec<_>>();
+            if usage_disabled {
+                for cycle in &mut values {
+                    cycle.metrics = serde_json::json!({});
+                    cycle.models.clear();
+                    cycle.estimate = Some(crate::dto::CycleEstimateDto {
+                        tokens: None,
+                        cost: None,
+                        from_ms: None,
+                        to_ms: None,
+                        reason: Some("usage_disabled".into()),
+                    });
+                }
+            }
+            response::json(StatusCode::OK, &values)
+        }
+        .await;
+        timing.outcome = if result.is_ok() { "ok" } else { "error" };
+        result
+    }
+    .instrument(span)
+    .await
+}
+
+// Drop also covers cancelled requests. The surrounding span carries the
+// whitelisted console view and request id even with INFO production logging.
+struct StatisticsTiming {
+    started: web_time::Instant,
+    outcome: &'static str,
+    source: &'static str,
+}
+impl Drop for StatisticsTiming {
+    fn drop(&mut self) {
+        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        if elapsed_ms >= 200 || self.outcome != "ok" {
+            tracing::warn!(
+                elapsed_ms,
+                outcome = self.outcome,
+                source = self.source,
+                "admin.statistics.completed"
+            );
+        } else {
+            tracing::debug!(
+                elapsed_ms,
+                outcome = self.outcome,
+                source = self.source,
+                "admin.statistics.completed"
+            );
         }
     }
-    if usage_disabled {
-        for cycle in &mut values {
-            cycle.metrics = serde_json::json!({});
-            cycle.models.clear();
-            cycle.estimate = Some(crate::dto::CycleEstimateDto {
-                tokens: None,
-                cost: None,
-                from_ms: None,
-                to_ms: None,
-                reason: Some("usage_disabled".into()),
-            });
-        }
-    }
-    response::json(StatusCode::OK, &values)
 }
 
 pub(crate) fn range(from: i64, to: i64) -> Result<(i64, i64), AdminError> {

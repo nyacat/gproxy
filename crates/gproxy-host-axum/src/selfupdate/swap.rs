@@ -2,20 +2,16 @@ use std::path::{Path, PathBuf};
 
 use super::{Error, Result};
 
-pub(super) fn install(staged: &Path) -> Result<()> {
-    let executable = std::env::current_exe()?;
-    install_at(&executable, staged, false)
+pub(super) fn install(executable: &Path, staged: &Path) -> Result<()> {
+    install_at(executable, staged, false)
 }
 
-pub(super) fn rollback_available() -> bool {
-    std::env::current_exe()
-        .ok()
-        .is_some_and(|path| previous(&path).is_file())
+pub(super) fn rollback_available(executable: &Path) -> bool {
+    previous(executable).is_file()
 }
 
-pub(super) fn rollback() -> Result<()> {
-    let executable = std::env::current_exe()?;
-    rollback_at(&executable)
+pub(super) fn rollback(executable: &Path) -> Result<()> {
+    rollback_at(executable)
 }
 
 fn rollback_at(executable: &Path) -> Result<()> {
@@ -88,6 +84,65 @@ fn make_executable(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replacing_a_running_process_keeps_the_saved_installation_path_usable() {
+        use std::io::Read as _;
+        use std::process::{Command, Stdio};
+
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("running");
+        let staged = directory.path().join("staged");
+        std::fs::copy("/bin/sh", &target).unwrap();
+        std::fs::copy("/bin/sh", &staged).unwrap();
+        let mut child = Child(
+            Command::new(&target)
+                .args(["-c", "printf ready; read value"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = [0; 5];
+        child
+            .0
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(&ready, b"ready");
+        let proc_exe = format!("/proc/{}/exe", child.0.id());
+        let saved = std::fs::read_link(&proc_exe).unwrap();
+        assert_eq!(saved, target);
+        super::install(&saved, &staged).unwrap();
+        let after_swap = std::fs::read_link(proc_exe).unwrap();
+        assert!(
+            after_swap
+                .as_os_str()
+                .as_encoded_bytes()
+                .ends_with(b" (deleted)")
+        );
+        assert!(!after_swap.exists());
+        assert!(super::rollback_available(&saved));
+        assert!(
+            Command::new(&saved)
+                .args(["-c", "exit 0"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        super::rollback(&saved).unwrap();
+        assert!(saved.is_file());
+    }
+
     #[test]
     fn failed_swap_restores_and_successful_swap_can_roll_back() {
         let directory = tempfile::tempdir().unwrap();

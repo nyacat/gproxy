@@ -6,10 +6,34 @@ use super::super::{
 };
 use super::payloads::*;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-#[cfg_attr(not(feature = "exhaustive"), non_exhaustive)]
-pub enum KnownResponseStreamEvent {
+// Dispatch before tracking the payload: serde's internally tagged enum
+// buffering otherwise erases nested error paths.
+macro_rules! response_events {
+    ($(#[serde(rename = $wire:literal)] $variant:ident($payload:ty),)*) => {
+        #[derive(Debug, Clone, PartialEq, Serialize)]
+        #[serde(tag = "type")]
+        #[cfg_attr(not(feature = "exhaustive"), non_exhaustive)]
+        pub enum KnownResponseStreamEvent {
+            $(#[serde(rename = $wire)] $variant($payload),)*
+        }
+
+        impl<'de> Deserialize<'de> for KnownResponseStreamEvent {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let mut value = serde_json::Value::deserialize(deserializer)?;
+                let Some(serde_json::Value::String(kind)) = value.as_object_mut().and_then(|object| object.remove("type")) else {
+                    return Err(serde::de::Error::custom("Responses event requires a string type"));
+                };
+                match kind.as_str() {
+                    $($wire => serde_path_to_error::deserialize::<_, $payload>(value)
+                        .map(Self::$variant).map_err(serde::de::Error::custom),)*
+                    _ => Err(serde::de::Error::custom("unknown Responses event type")),
+                }
+            }
+        }
+    };
+}
+
+response_events! {
     #[serde(rename = "response.created")]
     ResponseCreated(ResponseLifecycleEvent),
     #[serde(rename = "response.in_progress")]

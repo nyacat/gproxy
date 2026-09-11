@@ -106,6 +106,10 @@ impl Store {
             )?);
         }
         if !statements.is_empty() {
+            statements.insert(
+                0,
+                quota_snapshot::lock_credential_version(credential_id, Some(expected_version))?,
+            );
             self.backend().batch(statements).await?;
         }
         Ok(())

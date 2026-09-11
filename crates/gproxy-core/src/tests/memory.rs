@@ -36,7 +36,10 @@ pub(super) struct State {
     pub(super) fingerprint_headers: Vec<String>,
     pub(super) loaded_credentials: Vec<CredentialId>,
     pub(super) settlements: Vec<Settlement>,
+    pub(super) fail_usage: bool,
+    pub(super) fail_usage_begin: bool,
     pub(super) captures: Vec<Captured>,
+    pub(super) capture_response_body: bool,
     pub(super) auth_calls: usize,
     pub(super) admit_calls: usize,
     pub(super) exhausted_credentials: Vec<CredentialId>,
@@ -54,6 +57,7 @@ pub(super) struct State {
     pub(super) bindings_enabled: bool,
     pub(super) bindings: BTreeMap<(i64, i64, String, String), Binding>,
     pub(super) cache: BTreeMap<String, Vec<u8>>,
+    pub(super) fail_cache_set: bool,
     pub(super) cache_ttls: BTreeMap<String, u64>,
     pub(super) caller_user_id: i64,
     pub(super) caller_key_id: i64,
@@ -63,6 +67,8 @@ pub(super) struct State {
     pub(super) socket_sent: Vec<String>,
     pub(super) socket_statuses: VecDeque<u16>,
     pub(super) run_spawned: bool,
+    pub(super) defer_spawned: bool,
+    pub(super) spawned_tasks: Vec<BoxFuture<'static, ()>>,
     pub(super) drop_spawn_once: bool,
     pub(super) omit_usage: bool,
     pub(super) quota_windows: Vec<QuotaWindow>,
@@ -100,7 +106,10 @@ impl MemoryHost {
                 fingerprint_headers: Vec::new(),
                 loaded_credentials: Vec::new(),
                 settlements: Vec::new(),
+                fail_usage: false,
+                fail_usage_begin: false,
                 captures: Vec::new(),
+                capture_response_body: true,
                 auth_calls: 0,
                 admit_calls: 0,
                 exhausted_credentials: Vec::new(),
@@ -127,6 +136,7 @@ impl MemoryHost {
                 bindings_enabled: true,
                 bindings: BTreeMap::new(),
                 cache: BTreeMap::new(),
+                fail_cache_set: false,
                 cache_ttls: BTreeMap::new(),
                 caller_user_id: 1,
                 caller_key_id: 2,
@@ -136,6 +146,8 @@ impl MemoryHost {
                 socket_sent: Vec::new(),
                 socket_statuses: VecDeque::new(),
                 run_spawned: false,
+                defer_spawned: false,
+                spawned_tasks: Vec::new(),
                 drop_spawn_once: false,
                 omit_usage: false,
                 quota_windows: Vec::new(),
@@ -177,6 +189,22 @@ impl Host for MemoryHost {
     type Usage = Self;
     type Capture = Self;
 
+    fn begin_credential_usage<'a>(
+        &'a self,
+        _request: &'a str,
+        _target: &'a crate::control::Target,
+        _started: i64,
+    ) -> BoxFuture<'a, Result<(), CoreError>> {
+        Box::pin(async move {
+            if self.state.lock().unwrap().fail_usage_begin {
+                Err(CoreError::Store(crate::error::StoreError(
+                    "activity storage unavailable".into(),
+                )))
+            } else {
+                Ok(())
+            }
+        })
+    }
     fn credentials(&self) -> &Self::Credentials {
         self
     }

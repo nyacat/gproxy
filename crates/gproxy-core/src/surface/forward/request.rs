@@ -130,6 +130,7 @@ pub(crate) async fn request<H: Host>(
         });
     let target_framing = prepared.framing.unwrap_or(source_framing);
     let mut facts = FunnelCtx {
+        activity: None,
         pricing_control: None,
         usage_channel: None,
         upstream_started_at_ms: Some(crate::quota::now_ms()),
@@ -163,8 +164,10 @@ pub(crate) async fn request<H: Host>(
     };
     if channel.quota_capabilities(&credential.secret).is_some() && facts.settle != SettleMode::Free
     {
-        core.host
-            .begin_credential_usage(
+        facts.activity = core
+            .host
+            .track_credential_usage(
+                &facts.request_id,
                 &facts.request_id,
                 &facts.target,
                 facts.upstream_started_at_ms.expect("send time"),

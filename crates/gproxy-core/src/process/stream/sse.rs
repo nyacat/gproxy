@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use gproxy_channel_api::ChannelError;
 
-use super::EncodedFrame;
+use super::{CodecError, EncodedFrame};
 
 #[derive(Default)]
 pub(super) struct SseCodec {
@@ -9,24 +9,26 @@ pub(super) struct SseCodec {
 }
 
 impl SseCodec {
-    pub(super) fn push(&mut self, chunk: Bytes) -> Result<Vec<EncodedFrame>, ChannelError> {
+    pub(super) fn push(&mut self, chunk: Bytes) -> Result<Vec<EncodedFrame>, CodecError> {
         self.buffer.extend_from_slice(&chunk);
         if self.buffer.len() > 100 * 1024 * 1024 {
-            return Err(ChannelError::Decode(
-                "process SSE frame exceeds 100 MiB".into(),
-            ));
+            return Err(ChannelError::Decode("process SSE frame exceeds 100 MiB".into()).into());
         }
         let mut output = Vec::new();
         while let Some((end, delimiter)) = delimiter(&self.buffer) {
             let raw = self.buffer.drain(..end + delimiter).collect::<Vec<_>>();
-            if let Some(frame) = parse(&raw[..end])? {
+            let frame = parse(&raw[..end]).map_err(|error| CodecError {
+                error,
+                frames: std::mem::take(&mut output),
+            })?;
+            if let Some(frame) = frame {
                 output.push(frame);
             }
         }
         Ok(output)
     }
 
-    pub(super) fn finish(&mut self) -> Result<Vec<EncodedFrame>, ChannelError> {
+    pub(super) fn finish(&mut self) -> Result<Vec<EncodedFrame>, CodecError> {
         if self.buffer.is_empty() {
             return Ok(Vec::new());
         }

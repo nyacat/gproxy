@@ -117,6 +117,7 @@ impl Store {
             .batch(vec![
                 usage::insert_usage(input)?,
                 usage::accumulate_hourly(input)?,
+                runtime::settle_usage(Some(&input.request_id))?,
             ])
             .await?;
         let inserted = results
@@ -386,7 +387,7 @@ fn invalid(field: &'static str, error: impl std::fmt::Display) -> StoreError {
     }
 }
 
-fn read_metrics(row: &Row) -> Result<(Value, Map<String, Value>), StoreError> {
+pub(super) fn read_metrics(row: &Row) -> Result<(Value, Map<String, Value>), StoreError> {
     let metrics = json(row.text("metrics_json")?, "metrics_json")?;
     if let Some(object) = metrics.as_object()
         && ["quantities", "dimensions"].iter().any(|key| {

@@ -61,7 +61,7 @@ pub fn migration_statements(version: SchemaVersion, dialect: Dialect) -> Vec<Str
     statements
 }
 
-pub(super) fn create_table(spec: &TableSpec, version: SchemaVersion, dialect: Dialect) -> String {
+pub(crate) fn create_table(spec: &TableSpec, version: SchemaVersion, dialect: Dialect) -> String {
     let mut table = Table::create();
     table.table(Alias::new(spec.name)).if_not_exists();
     for column in spec.columns.iter().filter(|column| {
@@ -92,7 +92,7 @@ pub(super) fn create_table(spec: &TableSpec, version: SchemaVersion, dialect: Di
     }
 }
 
-fn add_column(spec: &TableSpec, column: &super::ColumnSpec, dialect: Dialect) -> String {
+pub(crate) fn add_column(spec: &TableSpec, column: &super::ColumnSpec, dialect: Dialect) -> String {
     let mut statement = Table::alter();
     let indexed = column.unique
         || column.primary_key
@@ -146,7 +146,7 @@ pub(super) fn column_definition(
     definition
 }
 
-pub(super) fn create_index(table: &str, index: &IndexSpec, dialect: Dialect) -> String {
+pub(crate) fn create_index(table: &str, index: &IndexSpec, dialect: Dialect) -> String {
     let mut statement = Index::create();
     statement
         .name(index.name)

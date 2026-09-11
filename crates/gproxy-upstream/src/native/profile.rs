@@ -1,3 +1,5 @@
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use gproxy_channel_api::{
     Alpn, ClientProfile, ClientProfilePreset, Http2Setting, PseudoHeader, TlsVersion,
 };
@@ -58,7 +60,12 @@ pub(super) fn client_emulation(profile: &ClientProfile) -> wreq::Emulation {
     if let Some(http2) = &profile.http2 {
         emulation = emulation.http2_options(http2_options(http2));
     }
-    emulation.build(wreq::Group::default())
+    // wreq keys pooled connections by group, not by TLS/HTTP2 options. Hash
+    // the complete value so different profiles cannot share an established
+    // connection, while borrowed channel defaults and owned overrides can.
+    let mut identity = DefaultHasher::new();
+    profile.hash(&mut identity);
+    emulation.build(wreq::Group::new(identity.finish()))
 }
 
 fn http2_options(profile: &gproxy_channel_api::Http2Profile) -> wreq::http2::Http2Options {

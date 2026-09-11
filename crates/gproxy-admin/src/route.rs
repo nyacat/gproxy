@@ -56,6 +56,7 @@ pub(crate) enum Route {
     UsageTrend,
     QuotaWindows,
     CredentialCycles,
+    CredentialCyclesQuery,
     Channels,
     TlsPresets,
     RulePresets,
@@ -106,6 +107,9 @@ pub(crate) fn parse(method: &Method, path: &str) -> Option<Route> {
         return Some(Route::CredentialQuotaRead(credential.parse().ok()?));
     }
     if method == Method::POST {
+        if segments.as_slice() == ["credential-cycles", "query"] {
+            return Some(Route::CredentialCyclesQuery);
+        }
         let login = match segments.as_slice() {
             ["login", "authcode", "start"] => Some(Route::LoginAuthCodeStart),
             ["login", "authcode", "complete"] => Some(Route::LoginAuthCodeComplete),
@@ -336,6 +340,7 @@ pub(crate) fn audit(route: &Route, body: &[u8]) -> Option<AuditDescriptor> {
         | Route::QuotaWindows
         | Route::CredentialQuotaRead(_)
         | Route::CredentialCycles
+        | Route::CredentialCyclesQuery
         | Route::Channels
         | Route::TlsPresets
         | Route::RulePresets

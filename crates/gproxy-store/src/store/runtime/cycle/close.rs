@@ -14,6 +14,10 @@ impl Store {
                 return Ok(None);
             };
             if cycle.status == QuotaCycleStatus::Closed {
+                if cycle.tracking.needs_rebuild {
+                    self.rebuild_cycle(id).await?;
+                    return self.credential_quota_cycle(id).await;
+                }
                 return Ok(Some(cycle));
             }
             let cutoff = closed_at * 1000;
@@ -25,6 +29,10 @@ impl Store {
             }
             let expected = cycle.version;
             cycle.version += 1;
+            if cycle.accounting_end_ms != Some(cutoff) {
+                cycle.tracking.needs_rebuild = true;
+                cycle.tracking.rebuild_after = None;
+            }
             cycle.accounting_end_ms = Some(cutoff);
             cycle.status = QuotaCycleStatus::Closed;
             cycle.close_reason = Some(reason);
@@ -35,6 +43,9 @@ impl Store {
                 .affected_rows
                 == 1
             {
+                if cycle.tracking.needs_rebuild {
+                    self.rebuild_cycle(id).await?;
+                }
                 return self.credential_quota_cycle(id).await;
             }
         }

@@ -1,10 +1,12 @@
 use bytes::Bytes;
+use gproxy_channel_api::StreamDecodeError;
 use gproxy_channel_api::{ChannelError, Frame, StreamCtx, StreamDecoder, StreamEnd, StreamTail};
 use gproxy_protocol::{ContentGenerationKind, Operation, OperationKind};
 use serde_json::Value;
 
 pub(crate) struct ClaudeSseDecoder {
     buffer: Vec<u8>,
+    failure: gproxy_channel_api::FailureState,
     start: Option<Value>,
     delta: Option<Value>,
     model: String,
@@ -22,6 +24,7 @@ impl ClaudeSseDecoder {
         )
         .then(|| Self {
             buffer: Vec::new(),
+            failure: gproxy_channel_api::FailureState::new("claude", ctx.response_headers),
             start: None,
             delta: None,
             model: String::new(),
@@ -43,6 +46,7 @@ impl ClaudeSseDecoder {
         let Ok(event) = serde_json::from_str::<Value>(&data) else {
             return;
         };
+        self.failure.observe(None, &event);
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") if self.start.is_none() => {
                 self.start = event.pointer("/message/usage").cloned();
@@ -79,12 +83,17 @@ impl ClaudeSseDecoder {
 }
 
 impl StreamDecoder for ClaudeSseDecoder {
-    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
+    fn terminal_failure(&self) -> Option<&gproxy_channel_api::UpstreamFailure> {
+        self.failure.failure()
+    }
+    fn terminal_disposition(&self) -> Option<gproxy_channel_api::Disposition> {
+        self.failure.disposition()
+    }
+
+    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
         self.buffer.extend_from_slice(&chunk);
         if self.buffer.len() > 100 * 1024 * 1024 {
-            return Err(ChannelError::Decode(
-                "Claude SSE frame exceeds 100 MiB".into(),
-            ));
+            return Err(ChannelError::Decode("Claude SSE frame exceeds 100 MiB".into()).into());
         }
         self.drain();
         if chunk.is_empty() {
@@ -94,7 +103,7 @@ impl StreamDecoder for ClaudeSseDecoder {
         }
     }
 
-    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, ChannelError> {
+    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
         if end == StreamEnd::Complete && !self.buffer.is_empty() {
             let raw = std::mem::take(&mut self.buffer);
             self.observe(&raw);
@@ -111,6 +120,7 @@ impl StreamDecoder for ClaudeSseDecoder {
             );
         }
         Ok(StreamTail {
+            estimated_output_chars: None,
             frames: Vec::new(),
             usage,
             actual_service_tier: None,

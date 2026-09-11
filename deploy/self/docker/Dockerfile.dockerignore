@@ -1,0 +1,21 @@
+# 路径相对于仓库根目录（构建上下文）。
+.git
+.github
+.env
+.env.*
+target
+data
+samples
+upstream_docs
+console/node_modules
+console/dist
+deploy/cloudflare/node_modules
+deploy/cloudflare/pkg
+deploy/cloudflare/public
+deploy/deno/pkg
+deploy/deno/public
+deploy/netlify/node_modules
+deploy/netlify/pkg
+deploy/netlify/public
+deploy/self/*.tar.zst*
+deploy/self/config.env

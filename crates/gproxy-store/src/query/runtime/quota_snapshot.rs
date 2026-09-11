@@ -108,10 +108,42 @@ pub(crate) fn save(
                 state.reset_credits.as_ref().map(serialize).transpose()?,
             );
     }
-    Ok(vec![Statement::query(&insert)?, Statement::query(&update)?])
+    Ok(vec![
+        lock_credential_version(credential_id, Some(expected_version))?,
+        Statement::query(&insert)?,
+        Statement::query(&update)?,
+    ])
 }
 
-pub(super) fn credential_version_matches(
+/// Take the credential row lock before mutating its quota state. All quota
+/// writers and credential rotations use this order so a response cannot pass
+/// a version check, wait for a rotation, and then write into the new identity.
+pub(crate) fn lock_credential_version(
+    id: i64,
+    expected_version: Option<u64>,
+) -> Result<Statement, StoreError> {
+    let mut query = Query::update();
+    query
+        .table(Alias::new("credentials"))
+        .value(Alias::new("version"), Expr::col(Alias::new("version")))
+        .and_where(Expr::col(Alias::new("id")).eq(id));
+    if let Some(expected) = expected_version {
+        query.and_where(
+            Expr::col(Alias::new("version")).eq(unsigned(expected, "credential version")?),
+        );
+    }
+    Statement::query(&query)
+}
+
+pub(crate) fn check_credential_version(id: i64, version: u64) -> Result<Statement, StoreError> {
+    Statement::query(
+        Query::select()
+            .expr(Expr::val(1))
+            .and_where(credential_version_matches(id, version)?),
+    )
+}
+
+pub(crate) fn credential_version_matches(
     id: i64,
     expected_version: u64,
 ) -> Result<sea_query::SimpleExpr, StoreError> {

@@ -9,4 +9,6 @@ pub enum StoreError {
     },
     #[error("credential version conflict")]
     VersionConflict,
+    #[error("quota window {0} no longer exists")]
+    QuotaWindowMissing(i64),
 }

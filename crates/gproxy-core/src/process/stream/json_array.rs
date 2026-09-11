@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use gproxy_channel_api::ChannelError;
 
-use super::EncodedFrame;
+use super::{CodecError, EncodedFrame};
 
 #[derive(Default)]
 pub(super) struct JsonArrayCodec {
@@ -12,22 +12,23 @@ pub(super) struct JsonArrayCodec {
 }
 
 impl JsonArrayCodec {
-    pub(super) fn push(&mut self, chunk: Bytes) -> Result<Vec<EncodedFrame>, ChannelError> {
+    pub(super) fn push(&mut self, chunk: Bytes) -> Result<Vec<EncodedFrame>, CodecError> {
         self.buffer.extend_from_slice(&chunk);
         if self.buffer.len() > 100 * 1024 * 1024 {
-            return Err(ChannelError::Decode(
-                "process JSON-array element exceeds 100 MiB".into(),
-            ));
+            return Err(
+                ChannelError::Decode("process JSON-array element exceeds 100 MiB".into()).into(),
+            );
         }
         self.decode()
     }
 
-    pub(super) fn finish(&mut self) -> Result<Vec<EncodedFrame>, ChannelError> {
+    pub(super) fn finish(&mut self) -> Result<Vec<EncodedFrame>, CodecError> {
         let mut output = self.decode()?;
         if !self.ended || !self.buffer.iter().all(u8::is_ascii_whitespace) {
-            return Err(ChannelError::Decode(
-                "process JSON-array stream ended mid-element".into(),
-            ));
+            return Err(CodecError {
+                error: ChannelError::Decode("process JSON-array stream ended mid-element".into()),
+                frames: output,
+            });
         }
         output.push(EncodedFrame::Raw(if self.emitted {
             Bytes::from_static(b"]")
@@ -37,7 +38,7 @@ impl JsonArrayCodec {
         Ok(output)
     }
 
-    fn decode(&mut self) -> Result<Vec<EncodedFrame>, ChannelError> {
+    fn decode(&mut self) -> Result<Vec<EncodedFrame>, CodecError> {
         let mut output = Vec::new();
         if !self.started {
             trim(&mut self.buffer);

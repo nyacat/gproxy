@@ -13,8 +13,8 @@ import { formatInstant } from "@/lib/format"
 export function AuditPage() {
   const { t, i18n } = useTranslation()
   const [eventQuery, userQuery] = useQueries({ queries: [
-    { queryKey: ["audit"], queryFn: () => audit(500) },
-    { queryKey: ["users"], queryFn: users },
+    { queryKey: ["audit"], queryFn: ({ signal }) => audit(500, signal) },
+    { queryKey: ["users"], queryFn: ({ signal }) => users(signal) },
   ] })
   const userNames = useMemo(() => new Map((userQuery.data ?? []).map((user) => [user.id, user.name])), [userQuery.data])
   const action = (event: AuditEventDto) => {

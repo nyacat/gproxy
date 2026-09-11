@@ -77,6 +77,8 @@ pub(crate) enum Error {
     Swap,
     #[error("no rollback executable is available")]
     Rollback,
+    #[error("an update or rollback is already in progress")]
+    Busy,
     #[error("update filesystem operation failed")]
     Io(#[from] std::io::Error),
 }
@@ -84,9 +86,11 @@ pub(crate) enum Error {
 impl Error {
     pub(super) fn status(&self) -> StatusCode {
         match self {
-            Self::Incompatible | Self::Version | Self::Rollback | Self::MicrosoftStore => {
-                StatusCode::CONFLICT
-            }
+            Self::Incompatible
+            | Self::Version
+            | Self::Rollback
+            | Self::MicrosoftStore
+            | Self::Busy => StatusCode::CONFLICT,
             Self::Configuration => StatusCode::BAD_REQUEST,
             _ => StatusCode::BAD_GATEWAY,
         }

@@ -288,3 +288,118 @@ fn smithy(event: &str, payload: Value) -> Vec<u8> {
     frame.extend_from_slice(&crc32fast::hash(&frame).to_be_bytes());
     frame
 }
+
+#[test]
+fn exceptions_keep_their_category_without_synthesizing_completion() {
+    for (kind, expected) in [
+        (
+            "throttlingException",
+            gproxy_channel_api::Disposition::Retryable,
+        ),
+        (
+            "validationException",
+            gproxy_channel_api::Disposition::Terminal,
+        ),
+        (
+            "accessDeniedException",
+            gproxy_channel_api::Disposition::Terminal,
+        ),
+    ] {
+        let wire = smithy(kind, json!({"message":"upstream rejected request"}));
+        let mut decoder = super::sse::BedrockStreamDecoder::new();
+        let mut frames = Vec::new();
+        for chunk in wire.chunks(7) {
+            frames.extend(decoder.push(Bytes::copy_from_slice(chunk)).unwrap());
+        }
+        frames.extend(decoder.finish(StreamEnd::Complete).unwrap().frames);
+        assert_eq!(decoder.terminal_disposition(), Some(expected));
+        let output = frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(&frame.0))
+            .collect::<String>();
+        assert!(output.contains(kind));
+        assert!(!output.contains("message_stop"));
+    }
+}
+
+#[test]
+fn valid_bedrock_prefix_survives_later_frame_or_event_errors() {
+    let valid = smithy("messageStart", json!({"role":"assistant"}));
+    let mut corrupt = smithy(
+        "contentBlockStart",
+        json!({"contentBlockIndex":0,"start":{}}),
+    );
+    *corrupt.last_mut().unwrap() ^= 1;
+    let invalid_event = smithy(
+        "contentBlockDelta",
+        json!({"delta":{"text":"missing index"}}),
+    );
+    let expected = super::sse::BedrockStreamDecoder::new()
+        .push(Bytes::copy_from_slice(&valid))
+        .unwrap()
+        .into_iter()
+        .map(|frame| frame.0)
+        .collect::<Vec<_>>();
+    assert!(!expected.is_empty());
+    for invalid in [corrupt, invalid_event] {
+        let wire = [valid.as_slice(), invalid.as_slice()].concat();
+        for split in 0..=wire.len() {
+            let mut decoder = super::sse::BedrockStreamDecoder::new();
+            let mut delivered = Vec::new();
+            let mut failed = false;
+            for chunk in [&wire[..split], &wire[split..]] {
+                let frames = match decoder.push(Bytes::copy_from_slice(chunk)) {
+                    Ok(frames) => frames,
+                    Err(error) => {
+                        failed = true;
+                        error.frames
+                    }
+                };
+                delivered.extend(frames.into_iter().map(|frame| frame.0));
+                if failed {
+                    break;
+                }
+            }
+            assert!(failed, "split={split}");
+            assert_eq!(delivered, expected, "split={split}");
+        }
+    }
+}
+
+#[test]
+fn invoke_exceptions_keep_request_id_and_partial_output() {
+    use base64::Engine;
+    let request = Bytes::from_static(br#"{"anthropic_version":"bedrock-2023-05-31"}"#);
+    let headers = HeaderMap::from_iter([(
+        http::HeaderName::from_static("x-amzn-requestid"),
+        "aws-request".parse().unwrap(),
+    )]);
+    let mut decoder = AwsBedrockChannel
+        .stream_decoder(gproxy_channel_api::StreamCtx {
+            key: STREAM,
+            framing: gproxy_protocol::StreamFraming::Sse,
+            request_body: &request,
+            response_headers: &headers,
+        })
+        .unwrap();
+    let event = json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}});
+    let wire = [
+        smithy(
+            "chunk",
+            json!({"bytes":base64::engine::general_purpose::STANDARD.encode(event.to_string())}),
+        ),
+        smithy("throttlingException", json!({"message":"busy"})),
+    ]
+    .concat();
+    let frames = decoder.push(Bytes::from(wire)).unwrap();
+    let text = frames
+        .into_iter()
+        .map(|frame| String::from_utf8(frame.0.to_vec()).unwrap())
+        .collect::<String>();
+    assert!(text.contains("partial"));
+    assert!(text.contains("throttlingException"));
+    assert!(decoder.finish(StreamEnd::Complete).is_ok());
+    let failure = decoder.terminal_failure().unwrap();
+    assert_eq!(failure.disposition, Disposition::Retryable);
+    assert_eq!(failure.request_id.as_deref(), Some("aws-request"));
+}

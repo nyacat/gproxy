@@ -9,7 +9,7 @@ use crate::{App, AppHandle, Config, ControlMutation, MutationResult};
 
 pub(super) use super::v2_schema::{v2_database, v2_seal};
 
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     pub app: AppHandle,
     pub provider: i64,
     pub credential: i64,
@@ -19,7 +19,18 @@ pub(super) struct Fixture {
     pub _directory: tempfile::TempDir,
 }
 
-pub(super) async fn fixture() -> Fixture {
+pub(crate) async fn fixture() -> Fixture {
+    fixture_with_postgres(None).await
+}
+
+pub(super) async fn fixture_with_postgres(dsn: Option<String>) -> Fixture {
+    fixture_with_backends(dsn, None).await
+}
+
+pub(super) async fn fixture_with_backends(
+    dsn: Option<String>,
+    redis_url: Option<String>,
+) -> Fixture {
     let directory = tempfile::tempdir().expect("app tempdir");
     let mut master_key = [0_u8; 32];
     getrandom::fill(&mut master_key).expect("master key randomness");
@@ -30,6 +41,14 @@ pub(super) async fn fixture() -> Fixture {
         directory.path().to_path_buf(),
         crate::MasterKeyConfig::new(Some(master_key)),
     );
+    let config = match dsn {
+        Some(dsn) => config.sql_server("postgres", dsn).unwrap(),
+        None => config,
+    };
+    let config = match redis_url {
+        Some(url) => config.with_cache(crate::config::CacheConfig::Redis { url }),
+        None => config,
+    };
     let app = App::start(config).await.expect("start app");
     let provider = id(app
         .mutate(ControlMutation::Provider(

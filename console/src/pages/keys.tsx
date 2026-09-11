@@ -22,12 +22,12 @@ export function IdentityPage() {
     queries: [
       { queryKey: ["organizations"], queryFn: organizations },
       { queryKey: ["teams"], queryFn: teams },
-      { queryKey: ["users"], queryFn: users },
-      { queryKey: ["user-keys"], queryFn: userKeys },
+      { queryKey: ["users"], queryFn: ({ signal }) => users(signal) },
+      { queryKey: ["user-keys"], queryFn: ({ signal }) => userKeys(signal) },
       { queryKey: ["permissions"], queryFn: permissions },
       { queryKey: ["rate-limits"], queryFn: rateLimits },
       { queryKey: ["quotas"], queryFn: quotas },
-      { queryKey: ["providers"], queryFn: providers },
+      { queryKey: ["providers"], queryFn: ({ signal }) => providers(signal) },
       { queryKey: ["channels"], queryFn: channels },
     ],
   })

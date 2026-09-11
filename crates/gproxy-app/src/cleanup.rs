@@ -1,12 +1,19 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
 use gproxy_core::Host;
+#[cfg(not(target_arch = "wasm32"))]
 use gproxy_store::records::SettingRecord;
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::host::AppHost;
 
+#[cfg(not(target_arch = "wasm32"))]
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+#[cfg(not(target_arch = "wasm32"))]
 const SECONDS_PER_DAY: u64 = 86_400;
+#[cfg(not(target_arch = "wasm32"))]
 const MIB: u64 = 1024 * 1024;
 
 pub(crate) const RETENTION_DAYS: &str = gproxy_store::records::RETENTION_DAYS;
@@ -18,24 +25,32 @@ pub(crate) const MAX_DATABASE_SIZE_MB: &str = gproxy_store::records::MAX_DATABAS
 /// because every deployment gets a bound instead of only the configured ones.
 /// A century of retention means the calendar never purges and the size cap is
 /// the bound that actually bites.
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_RETENTION_DAYS: u64 = 36_500;
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_MAX_DATABASE_SIZE_MB: u64 = 1_024;
 
-pub(crate) fn schedule(host: &AppHost) {
-    let Some(spawner) = host.spawner() else {
-        return;
-    };
-    let host = host.clone();
-    spawner.spawn(Box::pin(async move {
-        loop {
-            if let Err(error) = sweep(&host).await {
-                tracing::warn!(error = %error, "observability cleanup sweep failed");
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn schedule(app: &crate::AppHandle) {
+    let host = app.inner.host.clone();
+    app.inner
+        .host
+        .services
+        .spawner
+        .spawn_maintenance(app.inner.shutdown.subscribe(), async move {
+            loop {
+                if let Err(error) = sweep(&host).await {
+                    tracing::warn!(error = %error, "observability cleanup sweep failed");
+                }
+                host.wait(SWEEP_INTERVAL).await;
             }
-            host.wait(SWEEP_INTERVAL).await;
-        }
-    }));
+        });
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn schedule(_app: &crate::AppHandle) {}
+
+#[cfg(not(target_arch = "wasm32"))]
 async fn sweep(host: &AppHost) -> Result<(), gproxy_store::StoreError> {
     let snapshot = host.services.control.current();
     let retention_cutoff = positive(&snapshot.settings, RETENTION_DAYS)
@@ -66,6 +81,7 @@ async fn sweep(host: &AppHost) -> Result<(), gproxy_store::StoreError> {
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn positive(settings: &[SettingRecord], key: &str) -> Option<u64> {
     settings
         .iter()
@@ -76,6 +92,7 @@ fn positive(settings: &[SettingRecord], key: &str) -> Option<u64> {
         .map(|value| value as u64)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn invalid_setting(key: &'static str) -> gproxy_store::StoreError {
     gproxy_store::StoreError::InvalidData {
         field: "setting",
@@ -83,6 +100,7 @@ fn invalid_setting(key: &'static str) -> gproxy_store::StoreError {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn unix_now() -> i64 {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)

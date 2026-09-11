@@ -83,6 +83,9 @@ impl CacheBackend for MemoryHost {
         ttl: Option<Duration>,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         let mut state = self.state.lock().expect("state lock");
+        if state.fail_cache_set {
+            return Box::pin(async { Err(StoreError("cache set failed".into())) });
+        }
         state.cache.insert(key.into(), value);
         if let Some(ttl) = ttl {
             state.cache_ttls.insert(key.into(), ttl.as_secs());
@@ -188,6 +191,142 @@ impl CacheBackend for MemoryHost {
         }
         Box::pin(async { Ok(true) })
     }
+
+    fn seed_counter<'a>(
+        &'a self,
+        key: &'a str,
+        value: i64,
+        ttl: Option<Duration>,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        let mut state = self.state.lock().expect("state lock");
+        if state.cache.contains_key(key) {
+            return Box::pin(async { Ok(false) });
+        }
+        state.cache.insert(key.into(), value.to_be_bytes().to_vec());
+        if let Some(ttl) = ttl {
+            state.cache_ttls.insert(key.into(), ttl.as_secs());
+        }
+        Box::pin(async { Ok(true) })
+    }
+
+    fn reserve_spend<'a>(
+        &'a self,
+        used_key: &'a str,
+        pending_key: &'a str,
+        estimate: i64,
+        limit: i64,
+        pending_ttl: Option<Duration>,
+    ) -> BoxFuture<'a, Result<crate::SpendReserve, StoreError>> {
+        let result = (|| {
+            let mut state = self.state.lock().expect("state lock");
+            let Some(used) = integer(&state.cache, used_key)? else {
+                return Ok(crate::SpendReserve::MissingUsed);
+            };
+            let pending = increment(&mut state.cache, pending_key, estimate)?;
+            if pending_ttl.is_some() {
+                let _ = pending_ttl;
+            }
+            if crate::spend_fits(used, pending, estimate, limit) {
+                Ok(crate::SpendReserve::Allowed)
+            } else {
+                increment(&mut state.cache, pending_key, -estimate)?;
+                Ok(crate::SpendReserve::Denied)
+            }
+        })();
+        Box::pin(async move { result })
+    }
+
+    fn reserve_spend_and_set<'a>(
+        &'a self,
+        used_key: &'a str,
+        pending_key: &'a str,
+        estimate: i64,
+        limit: i64,
+        state_key: &'a str,
+        expected_state: Vec<u8>,
+        state_value: Vec<u8>,
+    ) -> BoxFuture<'a, Result<Option<crate::SpendReserve>, StoreError>> {
+        let result = (|| {
+            let mut state = self.state.lock().expect("state lock");
+            if state.cache.get(state_key) == Some(&state_value) {
+                return Ok(Some(crate::SpendReserve::Allowed));
+            }
+            if state.cache.get(state_key) != Some(&expected_state) {
+                return Ok(None);
+            }
+            let Some(used) = integer(&state.cache, used_key)? else {
+                return Ok(Some(crate::SpendReserve::MissingUsed));
+            };
+            let pending = integer(&state.cache, pending_key)?
+                .unwrap_or(0)
+                .checked_add(estimate)
+                .ok_or_else(|| StoreError("cache counter overflow".into()))?;
+            if !crate::spend_fits(used, pending, estimate, limit) {
+                return Ok(Some(crate::SpendReserve::Denied));
+            }
+            state
+                .cache
+                .insert(pending_key.into(), pending.to_be_bytes().to_vec());
+            state.cache.insert(state_key.into(), state_value);
+            state.cache_ttls.remove(pending_key);
+            state.cache_ttls.remove(state_key);
+            Ok(Some(crate::SpendReserve::Allowed))
+        })();
+        Box::pin(async move { result })
+    }
+
+    fn raise_counter<'a>(
+        &'a self,
+        key: &'a str,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        let result = (|| {
+            let mut state = self.state.lock().expect("state lock");
+            let value = integer(&state.cache, key)?.map_or(floor, |current| current.max(floor));
+            state.cache.insert(key.into(), value.to_be_bytes().to_vec());
+            if let Some(ttl) = ttl {
+                state.cache_ttls.insert(key.into(), ttl.as_secs());
+            }
+            Ok(())
+        })();
+        Box::pin(async move { result })
+    }
+}
+
+fn integer(
+    cache: &std::collections::BTreeMap<String, Vec<u8>>,
+    key: &str,
+) -> Result<Option<i64>, StoreError> {
+    cache
+        .get(key)
+        .map(|value| {
+            Ok(i64::from_be_bytes(value.as_slice().try_into().map_err(
+                |_| StoreError("cache counter is not an i64".into()),
+            )?))
+        })
+        .transpose()
+}
+
+fn increment(
+    cache: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    key: &str,
+    by: i64,
+) -> Result<i64, StoreError> {
+    let current = match cache.get(key) {
+        Some(value) => i64::from_be_bytes(
+            value
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError("cache counter is not an i64".into()))?,
+        ),
+        None => 0,
+    };
+    let next = current
+        .checked_add(by)
+        .ok_or_else(|| StoreError("cache counter overflow".into()))?;
+    cache.insert(key.into(), next.to_be_bytes().to_vec());
+    Ok(next)
 }
 
 impl UpstreamTransport for MemoryHost {
@@ -387,9 +526,28 @@ impl UsageSink for MemoryHost {
             .push(settlement.clone());
         Box::pin(async {})
     }
+
+    fn record_checked<'a>(
+        &'a self,
+        settlement: &'a Settlement,
+    ) -> BoxFuture<'a, Result<(), crate::CoreError>> {
+        if self.state.lock().expect("state lock").fail_usage {
+            Box::pin(async { Err(crate::CoreError::Internal("usage sink unavailable".into())) })
+        } else {
+            let record = UsageSink::record(self, settlement);
+            Box::pin(async move {
+                record.await;
+                Ok(())
+            })
+        }
+    }
 }
 
 impl CaptureSink for MemoryHost {
+    fn captures_response_body(&self) -> bool {
+        self.state.lock().expect("state lock").capture_response_body
+    }
+
     fn record<'a>(&'a self, capture: &'a Capture) -> BoxFuture<'a, ()> {
         self.state
             .lock()
@@ -475,6 +633,10 @@ impl Spawner for MemoryHost {
     fn spawn(&self, task: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>) {
         let run = {
             let mut state = self.state.lock().expect("state lock");
+            if state.defer_spawned {
+                state.spawned_tasks.push(task);
+                return;
+            }
             if state.drop_spawn_once {
                 state.drop_spawn_once = false;
                 state.run_spawned = true;

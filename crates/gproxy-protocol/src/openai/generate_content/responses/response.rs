@@ -161,7 +161,8 @@ pub struct ResponseObject {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, gproxy_protocol_macros::WireBuilder)]
 #[cfg_attr(not(feature = "exhaustive"), non_exhaustive)]
 pub struct ResponseError {
-    pub code: ResponseErrorCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<ResponseErrorCode>,
     pub message: String,
     #[serde(default, flatten)]
     pub rest: Rest,

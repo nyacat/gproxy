@@ -50,7 +50,7 @@ impl QuotaScope {
 /// everything else is dimensional — a new measure is an entry in `metrics`
 /// priced by a data-driven rate rule, not a new column (a first-class
 /// column cost v2 34 files).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct NormalizedUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -63,7 +63,7 @@ pub struct NormalizedUsage {
     pub attempts: Vec<UsageAttempt>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UsageAttempt {
     pub model: String,
     pub usage: Box<NormalizedUsage>,

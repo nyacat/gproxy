@@ -9,6 +9,10 @@ class TestResizeObserver {
 }
 
 Object.defineProperty(globalThis, "ResizeObserver", { value: TestResizeObserver, writable: true })
+Object.defineProperty(window, "matchMedia", { writable: true, value: (query: string) => ({
+  media: query, matches: false, onchange: null,
+  addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {}, dispatchEvent: () => true,
+}) })
 Object.defineProperty(Element.prototype, "scrollIntoView", { value() {}, writable: true })
 
 afterEach(cleanup)

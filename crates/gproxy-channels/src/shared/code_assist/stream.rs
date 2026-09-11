@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use gproxy_channel_api::StreamDecodeError;
 use gproxy_channel_api::{ChannelError, Frame, StreamCtx, StreamDecoder, StreamEnd, StreamTail};
 use serde_json::Value;
 
@@ -24,17 +25,24 @@ struct CodeAssistJsonArray {
 }
 
 impl StreamDecoder for CodeAssistJsonArray {
-    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
+    fn terminal_failure(&self) -> Option<&gproxy_channel_api::UpstreamFailure> {
+        self.inner.terminal_failure()
+    }
+    fn terminal_disposition(&self) -> Option<gproxy_channel_api::Disposition> {
+        self.inner.terminal_disposition()
+    }
+
+    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
         self.buffer.extend_from_slice(&chunk);
         if self.buffer.len() > 100 * 1024 * 1024 {
-            return Err(ChannelError::Decode(
-                "Code Assist JSON response exceeds 100 MiB".into(),
-            ));
+            return Err(
+                ChannelError::Decode("Code Assist JSON response exceeds 100 MiB".into()).into(),
+            );
         }
         Ok(Vec::new())
     }
 
-    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, ChannelError> {
+    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
         if end == StreamEnd::Interrupted {
             self.buffer.clear();
             return self.inner.finish(end);
@@ -45,10 +53,17 @@ impl StreamDecoder for CodeAssistJsonArray {
             serde_json::to_vec(&[super::unwrap_value(&value)])
                 .map_err(|error| ChannelError::Decode(error.to_string()))?,
         );
-        self.inner.push(frame.clone())?;
-        let mut tail = self.inner.finish(end)?;
-        tail.frames = vec![Frame(frame)];
+        let frames = self.inner.push(frame)?;
+        let mut tail = match self.inner.finish(end) {
+            Ok(tail) => tail,
+            Err(error) => return Err(error.prepend(frames)),
+        };
+        tail.frames = frames;
         Ok(tail)
+    }
+
+    fn recover_tail(&mut self) -> StreamTail {
+        self.inner.recover_tail()
     }
 }
 
@@ -58,13 +73,19 @@ struct CodeAssistSse {
 }
 
 impl CodeAssistSse {
-    fn drain(&mut self) -> Result<Vec<Frame>, ChannelError> {
+    fn drain(&mut self) -> Result<Vec<Frame>, StreamDecodeError> {
         let mut output = Vec::new();
         while let Some((end, delimiter)) = delimiter(&self.buffer) {
             let raw = self.buffer.drain(..end + delimiter).collect::<Vec<_>>();
-            if let Some(frame) = canonical(&raw[..end])? {
-                self.inner.push(frame.clone())?;
-                output.push(Frame(frame));
+            let frame = match canonical(&raw[..end]) {
+                Ok(frame) => frame,
+                Err(error) => return Err(StreamDecodeError::from(error).prepend(output)),
+            };
+            if let Some(frame) = frame {
+                match self.inner.push(frame) {
+                    Ok(frames) => output.extend(frames),
+                    Err(error) => return Err(error.prepend(output)),
+                }
             }
         }
         Ok(output)
@@ -72,32 +93,43 @@ impl CodeAssistSse {
 }
 
 impl StreamDecoder for CodeAssistSse {
-    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
+    fn terminal_failure(&self) -> Option<&gproxy_channel_api::UpstreamFailure> {
+        self.inner.terminal_failure()
+    }
+    fn terminal_disposition(&self) -> Option<gproxy_channel_api::Disposition> {
+        self.inner.terminal_disposition()
+    }
+
+    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
         self.buffer.extend_from_slice(&chunk);
         if self.buffer.len() > 100 * 1024 * 1024 {
-            return Err(ChannelError::Decode(
-                "Code Assist SSE frame exceeds 100 MiB".into(),
-            ));
+            return Err(
+                ChannelError::Decode("Code Assist SSE frame exceeds 100 MiB".into()).into(),
+            );
         }
         self.drain()
     }
 
-    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, ChannelError> {
+    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
         let frames = if end == StreamEnd::Complete && !self.buffer.is_empty() {
-            canonical(&std::mem::take(&mut self.buffer))?
-                .into_iter()
-                .map(Frame)
-                .collect()
+            match canonical(&std::mem::take(&mut self.buffer))? {
+                Some(frame) => self.inner.push(frame)?,
+                None => Vec::new(),
+            }
         } else {
             self.buffer.clear();
             Vec::new()
         };
-        for frame in &frames {
-            self.inner.push(frame.0.clone())?;
-        }
-        let mut tail = self.inner.finish(end)?;
+        let mut tail = match self.inner.finish(end) {
+            Ok(tail) => tail,
+            Err(error) => return Err(error.prepend(frames)),
+        };
         tail.frames = frames;
         Ok(tail)
+    }
+
+    fn recover_tail(&mut self) -> StreamTail {
+        self.inner.recover_tail()
     }
 }
 

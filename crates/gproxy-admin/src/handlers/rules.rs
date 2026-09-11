@@ -172,6 +172,12 @@ async fn routing_input(
     request: RoutingRuleWriteRequest,
 ) -> Result<gproxy_store::records::RoutingRuleInput, AdminError> {
     ensure_provider(state, request.provider_id).await?;
+    routing_record(request)
+}
+
+pub(super) fn routing_record(
+    request: RoutingRuleWriteRequest,
+) -> Result<gproxy_store::records::RoutingRuleInput, AdminError> {
     let implementation = match request.implementation {
         RoutingImplementationDto::Passthrough => "passthrough",
         RoutingImplementationDto::TransformTo => "transform_to",
@@ -203,7 +209,7 @@ async fn routing_input(
     Ok(input)
 }
 
-fn rule_set_input(
+pub(super) fn rule_set_input(
     request: RuleSetWriteRequest,
 ) -> Result<gproxy_store::records::RuleSetInput, AdminError> {
     if request.name.trim().is_empty() {
@@ -230,6 +236,12 @@ async fn rule_input(
     {
         return Err(AdminError::BadRequest("unknown rule set".into()));
     }
+    rule_record(request)
+}
+
+pub(super) fn rule_record(
+    request: RuleWriteRequest,
+) -> Result<gproxy_store::records::RuleInput, AdminError> {
     let input = gproxy_store::records::RuleInput {
         rule_set_id: request.rule_set_id,
         kind: request.config.kind().into(),

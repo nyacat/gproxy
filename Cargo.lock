@@ -1513,6 +1513,7 @@ dependencies = [
  "futures-core",
  "gproxy-protocol",
  "http",
+ "regex",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -1567,6 +1568,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.20",
  "tracing",
+ "tracing-subscriber",
  "web-time",
 ]
 
@@ -1619,6 +1621,7 @@ dependencies = [
  "gproxy-core",
  "http",
  "js-sys",
+ "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -1632,6 +1635,7 @@ dependencies = [
  "http",
  "serde",
  "serde_json",
+ "serde_path_to_error",
 ]
 
 [[package]]
@@ -1649,6 +1653,7 @@ version = "3.0.13"
 dependencies = [
  "base64 0.23.1",
  "bytes",
+ "futures-util",
  "gproxy-core",
  "js-sys",
  "mysql_async",
@@ -1662,6 +1667,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-rusqlite",
+ "tracing",
  "ts-rs",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -2924,6 +2930,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "ryu",
+ "sha1_smol",
  "socket2",
  "tokio",
  "tokio-rustls",
@@ -3337,6 +3344,12 @@ dependencies = [
  "cpufeatures 0.2.17",
  "digest 0.10.7",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"

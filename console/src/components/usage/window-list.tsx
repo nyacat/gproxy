@@ -1,3 +1,4 @@
+import { CycleEstimateDetails } from "./cycle-estimate-details"
 import { useMemo } from "react"
 import { useTranslation } from "react-i18next"
 import type { CredentialQuotaCycleDto } from "@/generated/CredentialQuotaCycleDto"
@@ -27,6 +28,7 @@ export function WindowList({ cycles, labels }: { cycles: Array<CredentialQuotaCy
         return (
           <div key={cycle.id} className="flex flex-col gap-3">
             <CycleWindow cycle={cycle} label={labels?.get(cycle.id) ?? `${windowName(cycle.window_key, t, label)} · #${cycle.credential_id}`} />
+            <CycleEstimateDetails cycle={cycle} />
             <p className="text-xs text-muted-foreground">#{cycle.id} · {t("usage.cycleUsage.starts", { value: formatInstant(cycle.accounting_start_ms / 1000, i18n.language) })} · {t("usage.cycleUsage.observed", { value: formatInstant(cycle.last_observed_at, i18n.language) })}</p>
           </div>
         )

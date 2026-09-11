@@ -57,7 +57,17 @@ pub(super) fn run<H: Host>(
                 }
                 Ok(Received::Frame(Some(frame @ WsFrame::Text(_)))) => {
                     let was_ready = meter.ready();
-                    match meter.observe(&frame) {
+                    let observation = meter.observe(&frame);
+                    if let Some(failure) = meter.take_failure() {
+                        guard.failure(
+                            failure,
+                            matches!(
+                                &observation,
+                                gproxy_channel_api::SessionObservation::Usage(_)
+                            ),
+                        );
+                    }
+                    match observation {
                         SessionObservation::None => {}
                         SessionObservation::Usage(sample) if was_ready => {
                             if let Err(error) = guard.totals_mut().add(

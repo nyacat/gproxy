@@ -1,9 +1,11 @@
 use bytes::Bytes;
-use gproxy_channel_api::{ChannelError, Frame, OperationStream, Pause, StreamEnd, StreamOutput};
+use gproxy_channel_api::{
+    ChannelError, Frame, OperationStream, Pause, StreamDecodeError, StreamEnd, StreamOutput,
+};
 use serde_json::{Value, json};
 
 use super::SessionState;
-use super::sse::{Decoder, Event, encode};
+use super::sse::{Decoder, encode};
 
 pub(in crate::claudeweb) struct Codec {
     pub(super) decoder: Decoder,
@@ -15,6 +17,7 @@ pub(in crate::claudeweb) struct Codec {
     pub(super) legacy: bool,
     pub(super) started: bool,
     pub(super) stopped: bool,
+    failure: gproxy_channel_api::FailureState,
     pub(super) resume_start: bool,
 }
 
@@ -30,39 +33,59 @@ impl Codec {
             legacy: false,
             started: false,
             stopped: false,
+            failure: gproxy_channel_api::FailureState::new("claudeweb", &http::HeaderMap::new()),
             resume_start: resume,
         }
     }
 
-    fn events(&mut self, events: Vec<Event>) -> Result<StreamOutput, ChannelError> {
+    fn events(&mut self, eof: bool) -> Result<StreamOutput, StreamDecodeError> {
         let mut frames = Vec::new();
         if self.resume_start {
             self.resume_start = false;
             self.started = true;
             frames.push(Frame(self.message_start()));
         }
-        let mut events = events.into_iter();
-        while let Some(event) = events.next() {
+        loop {
+            let event = match self.decoder.next(eof) {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) => return Err(StreamDecodeError::from(error).prepend(frames)),
+            };
             let Some(mut value) = event.value else {
                 frames.push(Frame(event.raw));
                 continue;
             };
+            self.failure.observe(None, &value);
+            if self.failure.failure().is_some() {
+                frames.push(Frame(encode(&value)));
+                self.stopped = true;
+                continue;
+            }
             if value.get("type").is_none() {
                 self.legacy = true;
                 self.legacy_event(&value, &mut frames);
                 continue;
             }
-            if let Some(pause) = self.modern(&mut value, &mut frames)? {
-                let mut pending = events.map(|event| event.raw).collect::<Vec<_>>();
-                if let Some(buffer) = self.decoder.take_pending() {
-                    pending.push(buffer);
-                }
+            let pause = match self.modern(&mut value, &mut frames) {
+                Ok(pause) => pause,
+                Err(error) => return Err(StreamDecodeError::from(error).prepend(frames)),
+            };
+            if let Some(pause) = pause {
+                let pending = self.decoder.take_pending().into_iter().collect();
+                let state = match serde_json::to_value(&self.state) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        return Err(StreamDecodeError::from(ChannelError::Decode(
+                            error.to_string(),
+                        ))
+                        .prepend(frames));
+                    }
+                };
                 return Ok(StreamOutput {
                     frames,
                     pause: Some(Pause {
                         id: pause,
-                        state: serde_json::to_value(&self.state)
-                            .map_err(|error| ChannelError::Decode(error.to_string()))?,
+                        state,
                         pending,
                     }),
                 });
@@ -106,17 +129,20 @@ impl Codec {
 }
 
 impl OperationStream for Codec {
-    fn push(&mut self, chunk: Bytes) -> Result<StreamOutput, ChannelError> {
-        let events = self.decoder.push(&chunk)?;
-        self.events(events)
+    fn terminal_failure(&self) -> Option<&gproxy_channel_api::UpstreamFailure> {
+        self.failure.failure()
     }
 
-    fn finish(&mut self, end: StreamEnd) -> Result<Vec<Frame>, ChannelError> {
+    fn push(&mut self, chunk: Bytes) -> Result<StreamOutput, StreamDecodeError> {
+        self.decoder.push(&chunk)?;
+        self.events(false)
+    }
+
+    fn finish(&mut self, end: StreamEnd) -> Result<Vec<Frame>, StreamDecodeError> {
         if end == StreamEnd::Interrupted {
             return Ok(Vec::new());
         }
-        let events = self.decoder.finish()?;
-        let mut output = self.events(events)?.frames;
+        let mut output = self.events(true)?.frames;
         if self.legacy && !self.stopped {
             output.push(Frame(encode(
                 &json!({"type":"content_block_stop","index":0}),

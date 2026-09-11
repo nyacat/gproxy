@@ -13,27 +13,27 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
-    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Vec<Event>, ChannelError> {
+    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<(), ChannelError> {
         self.buffer.extend_from_slice(chunk);
         if self.buffer.len() > 100 * 1024 * 1024 {
             return Err(ChannelError::Decode(
                 "ClaudeWeb SSE frame exceeds 100 MiB".into(),
             ));
         }
-        let mut events = Vec::new();
-        while let Some((end, delimiter)) = boundary(&self.buffer) {
-            let raw = self.buffer.drain(..end + delimiter).collect::<Vec<_>>();
-            events.push(event(Bytes::from(raw))?);
-        }
-        Ok(events)
+        Ok(())
     }
 
-    pub(super) fn finish(&mut self) -> Result<Vec<Event>, ChannelError> {
-        if self.buffer.is_empty() {
-            Ok(Vec::new())
+    /// Parse only the next event, so a tool pause retains the exact unparsed
+    /// suffix and a later malformed event cannot discard the delivered prefix.
+    pub(super) fn next(&mut self, eof: bool) -> Result<Option<Event>, ChannelError> {
+        let raw = if let Some((end, delimiter)) = boundary(&self.buffer) {
+            self.buffer.drain(..end + delimiter).collect()
+        } else if eof && !self.buffer.is_empty() {
+            std::mem::take(&mut self.buffer)
         } else {
-            Ok(vec![event(Bytes::from(std::mem::take(&mut self.buffer)))?])
-        }
+            return Ok(None);
+        };
+        event(Bytes::from(raw)).map(Some)
     }
 
     pub(super) fn take_pending(&mut self) -> Option<Bytes> {

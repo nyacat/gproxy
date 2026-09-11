@@ -3,6 +3,7 @@ name = "gproxy-channel-api"
 description = "GPROXY v3 channel contract: how the engine talks to a provider adapter"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
@@ -15,6 +16,7 @@ gproxy-protocol = { workspace = true, features = ["exhaustive"] }
 bytes.workspace = true
 futures-core.workspace = true
 http.workspace = true
+regex.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true

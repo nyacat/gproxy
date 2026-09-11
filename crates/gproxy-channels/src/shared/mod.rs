@@ -11,6 +11,7 @@ pub(crate) mod image_multipart;
 pub(crate) mod login;
 pub(crate) mod openai;
 pub(crate) mod quota;
+pub(crate) mod responses_meter;
 pub(crate) mod routing;
 
 pub(crate) mod quota_api;

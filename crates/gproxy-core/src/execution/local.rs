@@ -141,6 +141,7 @@ async fn serve<H: Host>(
         Disposition::Terminal
     };
     let funnel = FunnelCtx {
+        activity: None,
         upstream_started_at_ms: None,
         request_id: request.request_id.clone(),
         target,

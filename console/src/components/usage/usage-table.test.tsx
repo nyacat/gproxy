@@ -17,7 +17,7 @@ it("shows time, total duration and average output TPS, including zero-duration r
   }
   localStorage.clear()
   render(<QueryClientProvider client={new QueryClient()}>
-    <UsageTable page={{ items: [record, { ...record, id: 2, output_tokens: 0 }, { ...record, id: 3, latency_ms: 0 }], page: 1, page_size: 10, total: 3 }}
+    <UsageTable page={{ items: [record, { ...record, id: 2, output_tokens: 0 }, { ...record, id: 3, latency_ms: 0 }], page: 1, page_size: 10, total: 3, has_more: false }}
       providers={[]} credentials={[]} users={[]} keys={[]} pending={false} onPage={vi.fn()} onPageSize={vi.fn()} />
   </QueryClientProvider>)
 

@@ -24,6 +24,27 @@ const STREAM: OperationKey = OperationKey::content(
 );
 
 #[test]
+fn default_fingerprint_matches_requests_and_uses_one_cli_version() {
+    let defaults = ClaudeCodeChannel.client_fingerprint().unwrap();
+    for user_agent in [
+        None,
+        Some("other-client/1.0"),
+        Some("claude-cli/2.1.258 (external, cli)"),
+    ] {
+        let mut headers = HeaderMap::new();
+        super::auth::apply_headers(&mut headers, "token", "session", user_agent).unwrap();
+        for (name, value) in &defaults.headers {
+            assert_eq!(headers[name], *value, "{name}");
+        }
+        assert_eq!(
+            headers[http::header::USER_AGENT],
+            "claude-cli/2.1.268 (external, cli)"
+        );
+        assert_eq!(headers["x-claude-code-session-id"], "session");
+    }
+}
+
+#[test]
 fn descriptor_disposition_and_surface_table_are_explicit() {
     let descriptor = ClaudeCodeChannel.descriptor();
     assert_eq!(
@@ -106,7 +127,7 @@ fn prepare_applies_cli_shape_hygiene_cch_and_exact_endpoints() {
     headers.insert("authorization", "Bearer downstream".parse().unwrap());
     headers.insert(
         http::header::USER_AGENT,
-        "claude-cli/2.1.258 (external, sdk-cli)".parse().unwrap(),
+        "claude-cli/2.1.268 (external, sdk-cli)".parse().unwrap(),
     );
     let body = Bytes::from(
         json!({
@@ -154,7 +175,7 @@ fn prepare_applies_cli_shape_hygiene_cch_and_exact_endpoints() {
     assert_eq!(prepared.request.headers()["x-app"], "cli");
     assert_eq!(
         prepared.request.headers()[http::header::USER_AGENT],
-        "claude-cli/2.1.258 (external, sdk-cli)"
+        "claude-cli/2.1.268 (external, sdk-cli)"
     );
     assert_eq!(
         prepared.request.headers()["x-claude-code-session-id"],
@@ -178,7 +199,7 @@ fn prepare_applies_cli_shape_hygiene_cch_and_exact_endpoints() {
     assert_eq!(shaped["system"][1]["cache_control"]["type"], "ephemeral");
     assert_eq!(
         shaped["system"][0]["text"],
-        "x-anthropic-billing-header: cc_version=2.1.258.5e8; cc_entrypoint=sdk-cli; cch=00000;"
+        "x-anthropic-billing-header: cc_version=2.1.268.08b; cc_entrypoint=sdk-cli; cch=00000;"
     );
     let ids: Value = serde_json::from_str(shaped["metadata"]["user_id"].as_str().unwrap()).unwrap();
     assert_eq!(ids["device_id"], "device-1");

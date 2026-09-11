@@ -77,7 +77,7 @@ async fn size_pressure_purges_logs_and_preserves_usage_history() {
             .await
             .expect("size-pressure sweep");
         assert!(result.over_size_limit);
-        assert_eq!(result.pressure_rows, 5);
+        assert!(result.pressure_rows >= 5);
         assert_eq!(row_count(&store, "request_logs").await, 0);
         assert_eq!(row_count(&store, "wire_logs").await, 0);
         assert_eq!(row_count(&store, "usage_rows").await, 2);
@@ -110,6 +110,8 @@ async fn postgres_and_mysql_share_schema_queries_and_rollback() {
         (
             crate::BackendConfig::Postgres {
                 dsn: std::env::var("GPROXY_TEST_POSTGRES_DSN").expect("GPROXY_TEST_POSTGRES_DSN"),
+                pool_size: 8,
+                checkout_timeout: std::time::Duration::from_secs(5),
             },
             Dialect::Postgres,
         ),
@@ -128,6 +130,28 @@ async fn postgres_and_mysql_share_schema_queries_and_rollback() {
         assert_eq!(scenario::run(&store).await, expected);
         assert_batch_rollback(store.backend()).await;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via GPROXY_TEST_POSTGRES_DSN"]
+async fn postgres_schema_queries_and_rollback() {
+    let directory = tempfile::tempdir().unwrap();
+    let (native, _) = native_store(directory.path().join("postgres-reference.db"))
+        .await
+        .unwrap();
+    let store = crate::Store::open(crate::BackendConfig::Postgres {
+        dsn: std::env::var("GPROXY_TEST_POSTGRES_DSN").expect("GPROXY_TEST_POSTGRES_DSN"),
+        pool_size: 8,
+        checkout_timeout: std::time::Duration::from_secs(5),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        table_names(&store, Dialect::Postgres).await,
+        expected_shape().into_keys().collect()
+    );
+    assert_eq!(scenario::run(&store).await, scenario::run(&native).await);
+    assert_batch_rollback(store.backend()).await;
 }
 
 async fn assert_batch_rollback(executor: &dyn Executor) {

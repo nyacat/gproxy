@@ -54,6 +54,46 @@ impl<H: Host> Guard<H> {
             .upstream_model = model.into();
     }
 
+    pub(super) fn failure(
+        &self,
+        failure: gproxy_channel_api::UpstreamFailure,
+        usage_received: bool,
+    ) {
+        let ctx = self.ctx();
+        super::super::diagnostic::log(
+            ctx,
+            http::StatusCode::SWITCHING_PROTOCOLS,
+            &failure,
+            true,
+            usage_received,
+        );
+        let Some(version) = ctx.credential_version else {
+            return;
+        };
+        let health = match failure.disposition {
+            gproxy_channel_api::Disposition::Retryable => crate::CredentialHealth::Degraded,
+            gproxy_channel_api::Disposition::CredentialDead => crate::CredentialHealth::Dead,
+            _ => return,
+        };
+        let credential = ctx.target.credential;
+        let model = ctx.target.upstream_model.clone();
+        let host = self.host.clone();
+        self.host
+            .spawner()
+            .expect("session spawner")
+            .spawn(Box::pin(async move {
+                host.record_credential_health(
+                    credential,
+                    &model,
+                    version,
+                    health,
+                    Some(http::StatusCode::SWITCHING_PROTOCOLS),
+                    &failure.health_detail(),
+                )
+                .await;
+            }));
+    }
+
     pub(super) async fn finish(mut self, ended: Ended) {
         let ctx = self.ctx.take().expect("active Realtime session context");
         let totals = self.totals.take().expect("active Realtime session totals");
@@ -105,6 +145,7 @@ async fn settle<H: Host>(host: &H, ctx: &FunnelCtx, totals: &Totals, ended: Ende
             status: direct.then_some(http::StatusCode::SWITCHING_PROTOCOLS),
             response_body: None,
             estimated_output_chars: None,
+            terminal_disposition: None,
             record_usage: true,
             usage: Some(totals.usage.clone()),
             actual_service_tier: None,

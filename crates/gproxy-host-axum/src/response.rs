@@ -17,6 +17,7 @@ pub(crate) struct HostResponse(
     Option<WebSocketUpgrade>,
     RequestPermit,
     String,
+    gproxy_app::AppHandle,
 );
 
 impl HostResponse {
@@ -25,14 +26,15 @@ impl HostResponse {
         upgrade: Option<WebSocketUpgrade>,
         permit: RequestPermit,
         request_id: String,
+        app: gproxy_app::AppHandle,
     ) -> Self {
-        Self(result, upgrade, permit, request_id)
+        Self(result, upgrade, permit, request_id, app)
     }
 }
 
 impl IntoResponse for HostResponse {
     fn into_response(self) -> Response {
-        let Self(result, upgrade, permit, request_id) = self;
+        let Self(result, upgrade, permit, request_id, app) = self;
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => return core_error(error, permit, &request_id),
@@ -71,8 +73,7 @@ impl IntoResponse for HostResponse {
                         &request_id,
                     );
                 };
-                let mut response = upgrade
-                    .on_upgrade(move |socket| crate::websocket::pump(socket, upstream, permit));
+                let mut response = crate::websocket::upgrade(upgrade, upstream, permit, app);
                 append_missing(response.headers_mut(), &headers);
                 response
             }

@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { ChevronsUpDownIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
@@ -6,6 +6,7 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { Field, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import { OptionPages, OPTIONS_PER_PAGE } from "@/components/option-pages"
 
 export function QuotaHistoryFilter({ label, options, excluded, onChange }: {
   label: string
@@ -15,8 +16,14 @@ export function QuotaHistoryFilter({ label, options, excluded, onChange }: {
 }) {
   const { t } = useTranslation()
   const [search, setSearch] = useState("")
+  const [page, setPage] = useState(0)
   const selected = options.filter((option) => !excluded.has(option.value)).length
-  const visible = options.filter((option) => option.label.toLocaleLowerCase().includes(search.toLocaleLowerCase()))
+  const visible = useMemo(() => {
+    const needle = search.toLocaleLowerCase()
+    return options.filter((option) => option.label.toLocaleLowerCase().includes(needle))
+  }, [options, search])
+  const pages = Math.max(1, Math.ceil(visible.length / OPTIONS_PER_PAGE))
+  const currentPage = Math.min(page, pages - 1)
   return <Popover>
     <PopoverTrigger asChild>
       <Button variant="outline" className="min-w-0 justify-between" aria-label={label}>
@@ -24,7 +31,7 @@ export function QuotaHistoryFilter({ label, options, excluded, onChange }: {
       </Button>
     </PopoverTrigger>
     <PopoverContent align="start" className="w-80 max-w-[calc(100vw-2rem)]">
-      <Input aria-label={t("common.search")} placeholder={t("common.search")} value={search} onChange={(event) => setSearch(event.target.value)} />
+      <Input aria-label={t("common.search")} placeholder={t("common.search")} value={search} onChange={(event) => { setSearch(event.target.value); setPage(0) }} />
       <div className="flex gap-2">
         <Button variant="ghost" size="sm" onClick={() => { const next = new Set(excluded); visible.forEach((option) => next.delete(option.value)); onChange(next) }}>{t("usage.quotaHistory.selectAll")}</Button>
         <Button variant="ghost" size="sm" onClick={() => onChange(new Set([...excluded, ...visible.map((option) => option.value)]))}>{t("usage.quotaHistory.selectNone")}</Button>
@@ -32,7 +39,7 @@ export function QuotaHistoryFilter({ label, options, excluded, onChange }: {
       <FieldSet className="max-h-72 overflow-y-auto">
         <FieldLegend className="sr-only">{label}</FieldLegend>
         <FieldGroup className="gap-3">
-          {visible.map((option) => <Field key={option.value} orientation="horizontal">
+          {visible.slice(currentPage * OPTIONS_PER_PAGE, (currentPage + 1) * OPTIONS_PER_PAGE).map((option) => <Field key={option.value} orientation="horizontal">
             <FieldLabel className="min-w-0 break-words">
               <Checkbox checked={!excluded.has(option.value)} onCheckedChange={(checked) => {
                 const next = new Set(excluded)
@@ -45,6 +52,7 @@ export function QuotaHistoryFilter({ label, options, excluded, onChange }: {
           {!visible.length && <p className="text-sm text-muted-foreground">{t("common.none")}</p>}
         </FieldGroup>
       </FieldSet>
+      <OptionPages page={currentPage} pages={pages} onPage={setPage} />
     </PopoverContent>
   </Popover>
 }

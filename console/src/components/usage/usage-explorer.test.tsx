@@ -47,7 +47,7 @@ const props = {
       ended: "complete",
       latency_ms: 10,
     }],
-    total: 1,
+    total: 1, has_more: false,
     page: 1,
     page_size: 10,
   },

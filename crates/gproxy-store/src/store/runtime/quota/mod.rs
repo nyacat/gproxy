@@ -21,18 +21,20 @@ impl Store {
         window_id: i64,
         delta: Decimal,
     ) -> Result<QuotaWindowRecord, StoreError> {
+        let window = self.quota_window_locks.window(window_id);
+        let _guard = window.lock().await;
         const RETRIES: usize = 8;
         for _ in 0..RETRIES {
             if self.quota_settlement_exists(request_id, window_id).await? {
                 return self
                     .quota_window(window_id)
                     .await?
-                    .ok_or_else(|| StoreError::Database("quota window vanished".into()));
+                    .ok_or(StoreError::QuotaWindowMissing(window_id));
             }
             let existing = self
                 .quota_window(window_id)
                 .await?
-                .ok_or_else(|| StoreError::Database("quota window vanished".into()))?;
+                .ok_or(StoreError::QuotaWindowMissing(window_id))?;
             let cost_used = existing.cost_used + delta;
             let result = self
                 .backend()
@@ -57,7 +59,12 @@ impl Store {
                 }
                 Ok(_) => {}
                 Err(error) if unique_conflict(&error) => {}
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if self.quota_window(window_id).await?.is_none() {
+                        return Err(StoreError::QuotaWindowMissing(window_id));
+                    }
+                    return Err(error);
+                }
             }
         }
         Err(StoreError::Database(
@@ -65,7 +72,7 @@ impl Store {
         ))
     }
 
-    async fn quota_settlement_exists(
+    pub async fn quota_settlement_exists(
         &self,
         request_id: &str,
         window_id: i64,

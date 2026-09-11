@@ -77,8 +77,8 @@ pub(crate) fn classify(ctx: &RequestCtx) -> Result<Classified, CoreError> {
     if matched.upgrade != ctx.upgrade {
         return Err(CoreError::Unsupported);
     }
-    let body = serde_json::from_slice::<serde_json::Value>(&ctx.body).ok();
-    let stream = detect_stream(matched.stream, body.as_ref(), &ctx.body);
+    let hints = serde_json::from_slice::<BodyHints>(&ctx.body).ok();
+    let stream = detect_stream(matched.stream, hints.as_ref(), &ctx.body);
     let operation = if stream {
         streaming_sibling(matched.operation).unwrap_or(matched.operation)
     } else {
@@ -105,17 +105,12 @@ pub(crate) fn classify(ctx: &RequestCtx) -> Result<Classified, CoreError> {
         })
         .map(|(_, value)| value.clone())
         .or_else(|| {
-            body.as_ref().and_then(|body| {
-                body.get("model")
-                    .or_else(|| {
-                        if operation == Operation::CreateRealtimeCall {
-                            body.pointer("/session/model")
-                        } else {
-                            None
-                        }
-                    })?
-                    .as_str()
-                    .map(str::to_owned)
+            hints.as_ref().and_then(|body| {
+                body.model.clone().or_else(|| {
+                    (operation == Operation::CreateRealtimeCall)
+                        .then(|| body.session.as_ref()?.model.clone())
+                        .flatten()
+                })
             })
         })
         .or_else(|| {
@@ -135,7 +130,12 @@ pub(crate) fn classify(ctx: &RequestCtx) -> Result<Classified, CoreError> {
         Affinity::None | Affinity::Session => None,
     };
     let session = (spec.affinity == Affinity::Session)
-        .then(|| super::session::subject(ctx, matched.kind, body.as_ref()))
+        .then(|| {
+            super::session::from_headers(ctx, matched.kind).or_else(|| {
+                let body = serde_json::from_slice::<serde_json::Value>(&ctx.body).ok();
+                super::session::subject(ctx, matched.kind, body.as_ref())
+            })
+        })
         .flatten();
     Ok(Classified {
         key: OperationKey::try_new(operation, matched.kind)
@@ -161,19 +161,45 @@ fn query_value<'a>(query: Option<&'a str>, name: &str) -> Option<&'a str> {
     })
 }
 
-fn detect_stream(detect: StreamDetect, json: Option<&serde_json::Value>, body: &[u8]) -> bool {
+#[derive(serde::Deserialize)]
+struct BodyHints {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    stream: Option<serde_json::Value>,
+    #[serde(default)]
+    stream_format: Option<serde_json::Value>,
+    #[serde(default)]
+    session: Option<SessionHints>,
+}
+
+#[derive(serde::Deserialize)]
+struct SessionHints {
+    #[serde(default)]
+    model: Option<String>,
+}
+
+fn detect_stream(detect: StreamDetect, json: Option<&BodyHints>, body: &[u8]) -> bool {
     match detect {
         StreamDetect::Never => false,
         StreamDetect::Always => true,
         StreamDetect::BodyFlag(field) => json
-            .and_then(|body| body.get(field)?.as_bool())
+            .and_then(|hints| stream_field(hints, field)?.as_bool())
             .unwrap_or(false),
         StreamDetect::BodyValue(field, expected) => json
-            .and_then(|body| body.get(field)?.as_str())
+            .and_then(|hints| stream_field(hints, field)?.as_str())
             .is_some_and(|value| value == expected),
         StreamDetect::BodyFlagOrMultipart(field) => json
-            .and_then(|body| body.get(field)?.as_bool())
+            .and_then(|hints| stream_field(hints, field)?.as_bool())
             .unwrap_or_else(|| multipart_flag(body, field)),
+    }
+}
+
+fn stream_field<'a>(hints: &'a BodyHints, field: &str) -> Option<&'a serde_json::Value> {
+    match field {
+        "stream" => hints.stream.as_ref(),
+        "stream_format" => hints.stream_format.as_ref(),
+        _ => None,
     }
 }
 

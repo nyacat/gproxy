@@ -9,7 +9,7 @@ import { formatCost, formatInstant, formatTokensPerSecond } from "@/lib/format"
 
 export function UsageRecordDetail({ record, onClose, providers }: { record: UsageRecordDto | null; onClose: () => void; providers: Array<ProviderDto> }) {
   const { t, i18n } = useTranslation()
-  const detail = useQuery({ queryKey: ["log-detail", record?.request_id], queryFn: () => logDetail(record!.request_id), enabled: record != null, retry: false })
+  const detail = useQuery({ queryKey: ["log-detail", record?.request_id], queryFn: ({ signal }) => logDetail(record!.request_id, signal), enabled: record != null, retry: false, gcTime: 0 })
   return <Sheet open={record != null} onOpenChange={(open) => { if (!open) onClose() }}>
     <SheetContent className="overflow-y-auto sm:max-w-3xl">
       <SheetHeader><SheetTitle>{t("usage.record.detail")}</SheetTitle><SheetDescription className="break-all font-mono">{record?.request_id}</SheetDescription></SheetHeader>
