@@ -93,8 +93,13 @@ fn admit_inner<'a>(
             .services
             .control
             .authorization_model(model, &request.mode);
-        let plan = authorize(&snapshot, identity, operation, model.as_deref(), plan)?;
+        let mut plan = authorize(&snapshot, identity, operation, model.as_deref(), plan)?;
         let now = unix_now();
+        // Authorization may have removed the recovery candidate picked during
+        // routing. Give an eligible degraded model a chance within this caller's pool.
+        host.services
+            .control
+            .prioritize_health_probe(&mut plan, now);
         let mut state = AdmissionState {
             identity: IdentityState::from(identity),
             model,

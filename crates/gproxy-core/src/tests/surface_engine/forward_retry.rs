@@ -75,6 +75,42 @@ fn declaration_controls_budgeted_forward_failover() {
     assert_eq!(state.admission_finishes, [true]);
 }
 
+#[test]
+fn unavailable_surface_candidates_are_skipped_without_sending_or_spending_budget() {
+    for dead in [false, true] {
+        for path in ["/surface/retry", "/surface/mutate"] {
+            let host = make_host(1, [StatusCode::OK]);
+            {
+                let mut state = host.state.lock().unwrap();
+                state.track_health_attempts = true;
+                let unavailable = (CredentialId(7), "upstream-model".into());
+                if dead {
+                    state.unavailable_model_pairs.push(unavailable);
+                } else {
+                    state.cooling_model_pairs.push(unavailable);
+                }
+            }
+            let core = build_core(&host).unwrap();
+            let method = if path == "/surface/mutate" {
+                Method::POST
+            } else {
+                Method::GET
+            };
+            let result = outcome(&core, &host, method, path, None, None, false).unwrap();
+            assert_eq!(result.status, StatusCode::OK);
+            if let ResponseBody::Stream(mut stream) = result.body {
+                block_on(async { while stream.next().await.is_some() {} });
+            }
+            let state = host.state.lock().unwrap();
+            assert_eq!(state.upstream_requests.len(), 1);
+            assert_eq!(state.health_attempts.len(), 1);
+            assert_eq!(state.health_attempts[0].0, CredentialId(8));
+            assert_eq!(state.health_releases.len(), 1);
+            assert!(state.health_leases.is_empty());
+        }
+    }
+}
+
 fn make_host<const N: usize>(budget: u32, statuses: [StatusCode; N]) -> MemoryHost {
     let host = MemoryHost::new(false);
     let mut state = host.state.lock().expect("state lock");

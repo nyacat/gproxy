@@ -131,8 +131,9 @@ pub(super) async fn delete(
 pub(super) async fn credential_health_reset(
     state: &impl State,
     id: i64,
+    body: &Bytes,
 ) -> Result<Response<Bytes>, AdminError> {
-    write::credential_health_reset(state, id).await
+    write::credential_health_reset(state, id, body).await
 }
 
 pub(super) async fn credential_secret(

@@ -32,6 +32,8 @@ pub enum CoreError {
     Unsupported,
     #[error("rate limited")]
     RateLimited { retry_after_secs: u32 },
+    #[error("credential model is cooling down; retry after {retry_after_secs} seconds")]
+    CredentialCoolingDown { retry_after_secs: u32 },
     #[error("quota exceeded")]
     QuotaExceeded,
     #[error("no usable credential")]
@@ -61,6 +63,7 @@ impl CoreError {
             Self::UnknownRoute(_) | Self::UnknownProvider(_) => StatusCode::NOT_FOUND,
             Self::Unsupported => StatusCode::BAD_REQUEST,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::CredentialCoolingDown { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::QuotaExceeded => StatusCode::PAYMENT_REQUIRED,
             Self::NoCredentials | Self::UpstreamExhausted(_) => StatusCode::BAD_GATEWAY,
             Self::Transform(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

@@ -12,6 +12,7 @@ pub(super) struct Guard<H: Host> {
     ctx: Option<FunnelCtx>,
     lease: Option<Lease>,
     totals: Option<Totals>,
+    health_task: Option<futures_util::future::Shared<gproxy_channel_api::BoxFuture<'static, ()>>>,
 }
 
 impl<H: Host> Guard<H> {
@@ -21,6 +22,7 @@ impl<H: Host> Guard<H> {
             ctx: Some(ctx),
             lease: None,
             totals: Some(Totals::new()),
+            health_task: None,
         }
     }
     pub(super) fn new(host: Shared<H>, ctx: FunnelCtx, lease: Lease) -> Self {
@@ -29,6 +31,7 @@ impl<H: Host> Guard<H> {
             ctx: Some(ctx),
             lease: Some(lease),
             totals: Some(Totals::new()),
+            health_task: None,
         }
     }
 
@@ -54,44 +57,68 @@ impl<H: Host> Guard<H> {
             .upstream_model = model.into();
     }
 
-    pub(super) fn failure(
-        &self,
+    pub(super) async fn failure(
+        &mut self,
         failure: gproxy_channel_api::UpstreamFailure,
+        model: &str,
         usage_received: bool,
     ) {
-        let ctx = self.ctx();
+        let mut ctx = self.ctx().clone();
+        ctx.target.upstream_model = model.into();
         super::super::diagnostic::log(
-            ctx,
+            &ctx,
             http::StatusCode::SWITCHING_PROTOCOLS,
             &failure,
             true,
             usage_received,
         );
-        let Some(version) = ctx.credential_version else {
-            return;
-        };
-        let health = match failure.disposition {
-            gproxy_channel_api::Disposition::Retryable => crate::CredentialHealth::Degraded,
-            gproxy_channel_api::Disposition::CredentialDead => crate::CredentialHealth::Dead,
-            _ => return,
-        };
-        let credential = ctx.target.credential;
-        let model = ctx.target.upstream_model.clone();
+        self.record_health(ctx, Some(failure)).await;
+    }
+
+    pub(super) async fn success(&mut self, model: &str) {
+        let mut ctx = self.ctx().clone();
+        ctx.target.upstream_model = model.into();
+        self.record_health(ctx, None).await;
+    }
+
+    async fn record_health(
+        &mut self,
+        ctx: FunnelCtx,
+        failure: Option<gproxy_channel_api::UpstreamFailure>,
+    ) {
+        let previous = self.health_task.take();
         let host = self.host.clone();
-        self.host
-            .spawner()
-            .expect("session spawner")
-            .spawn(Box::pin(async move {
-                host.record_credential_health(
-                    credential,
-                    &model,
-                    version,
-                    health,
-                    Some(http::StatusCode::SWITCHING_PROTOCOLS),
-                    &failure.health_detail(),
+        let task: gproxy_channel_api::BoxFuture<'static, ()> = Box::pin(async move {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            if let Some(failure) = failure {
+                super::super::health::record_failure(
+                    host.as_ref(),
+                    &ctx,
+                    http::StatusCode::SWITCHING_PROTOCOLS,
+                    &failure,
                 )
                 .await;
-            }));
+            } else {
+                super::super::health::record_response(
+                    host.as_ref(),
+                    &ctx,
+                    gproxy_channel_api::Disposition::Success,
+                    http::StatusCode::SWITCHING_PROTOCOLS,
+                )
+                .await;
+            }
+        });
+        // A cancelled recv cannot drop an observed outcome or let an older
+        // failure arrive after the next successful response on this session.
+        let task = task.shared();
+        self.health_task = Some(task.clone());
+        self.host
+            .spawner()
+            .expect("session spawner checked before egress")
+            .spawn(Box::pin(task.clone()));
+        task.await;
     }
 
     pub(super) async fn finish(mut self, ended: Ended) {

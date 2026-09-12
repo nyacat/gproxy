@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -31,6 +31,13 @@ pub(super) struct State {
     pub(super) wait_calls: usize,
     pub(super) rotations: Vec<u64>,
     pub(super) health: Vec<(CredentialId, String, CredentialHealth)>,
+    pub(super) health_writes_pending: bool,
+    pub(super) track_health_attempts: bool,
+    pub(super) health_attempts: Vec<(CredentialId, String, u64)>,
+    pub(super) health_releases: Vec<(CredentialId, String, u64)>,
+    pub(super) health_leases: BTreeSet<(CredentialId, String, u64)>,
+    pub(super) cooling_model_pairs: Vec<(CredentialId, String)>,
+    pub(super) unavailable_model_pairs: Vec<(CredentialId, String)>,
     pub(super) authorizations: Vec<String>,
     pub(super) upstream_requests: Vec<(http::HeaderMap, String)>,
     pub(super) upstream_bodies: Vec<Bytes>,
@@ -84,6 +91,21 @@ pub(super) struct Captured {
     pub(super) credential_id: Option<CredentialId>,
 }
 
+struct HealthActivity {
+    state: Arc<Mutex<State>>,
+    key: (CredentialId, String, u64),
+}
+
+impl crate::CredentialHealthActivity for HealthActivity {}
+
+impl Drop for HealthActivity {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().expect("state lock");
+        assert!(state.health_leases.remove(&self.key));
+        state.health_releases.push(self.key.clone());
+    }
+}
+
 impl MemoryHost {
     pub(super) fn new(conflict: bool) -> Self {
         Self {
@@ -102,6 +124,13 @@ impl MemoryHost {
                 wait_calls: 0,
                 rotations: Vec::new(),
                 health: Vec::new(),
+                health_writes_pending: false,
+                track_health_attempts: false,
+                health_attempts: Vec::new(),
+                health_releases: Vec::new(),
+                health_leases: BTreeSet::new(),
+                cooling_model_pairs: Vec::new(),
+                unavailable_model_pairs: Vec::new(),
                 authorizations: Vec::new(),
                 upstream_requests: Vec::new(),
                 upstream_bodies: Vec::new(),
@@ -293,6 +322,46 @@ impl Host for MemoryHost {
         Box::pin(async move { Ok(tokens) })
     }
 
+    fn begin_credential_health_attempt<'a>(
+        &'a self,
+        _: &'a str,
+        target: &'a crate::Target,
+        credential_version: u64,
+    ) -> BoxFuture<'a, Result<Option<crate::CredentialHealthLease>, CoreError>> {
+        Box::pin(async move {
+            let mut state = self.state.lock().expect("state lock");
+            let key = (
+                target.credential,
+                target.upstream_model.clone(),
+                credential_version,
+            );
+            if state
+                .unavailable_model_pairs
+                .contains(&(target.credential, target.upstream_model.clone()))
+            {
+                return Err(CoreError::NoCredentials);
+            }
+            if state
+                .cooling_model_pairs
+                .contains(&(target.credential, target.upstream_model.clone()))
+                || state.health_leases.contains(&key)
+            {
+                return Err(CoreError::CredentialCoolingDown {
+                    retry_after_secs: 30,
+                });
+            }
+            if !state.track_health_attempts {
+                return Ok(None);
+            }
+            state.health_attempts.push(key.clone());
+            state.health_leases.insert(key.clone());
+            Ok(Some(Arc::new(HealthActivity {
+                state: self.state.clone(),
+                key,
+            }) as crate::CredentialHealthLease))
+        })
+    }
+
     fn record_credential_health<'a>(
         &'a self,
         credential: CredentialId,
@@ -302,12 +371,21 @@ impl Host for MemoryHost {
         _: Option<http::StatusCode>,
         _: &'a str,
     ) -> BoxFuture<'a, ()> {
-        self.state
-            .lock()
-            .expect("state lock")
-            .health
-            .push((credential, model.to_owned(), health));
-        Box::pin(async {})
+        Box::pin(async move {
+            std::future::poll_fn(|_| {
+                if self.state.lock().expect("state lock").health_writes_pending {
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(())
+                }
+            })
+            .await;
+            self.state.lock().expect("state lock").health.push((
+                credential,
+                model.to_owned(),
+                health,
+            ));
+        })
     }
     fn wait<'a>(&'a self, _: std::time::Duration) -> BoxFuture<'a, ()> {
         let mut state = self.state.lock().expect("state lock");

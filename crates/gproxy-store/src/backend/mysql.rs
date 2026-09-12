@@ -109,18 +109,24 @@ fn replace_mysql_syntax(sql: &str) -> String {
     if sql.starts_with("INSERT INTO `credential_health`")
         && let Some((insert, _)) = sql.split_once(" ON DUPLICATE KEY UPDATE ")
     {
-        let condition = "VALUES(`credential_version`) > `credential_version` OR (VALUES(`credential_version`) = `credential_version` AND VALUES(`version`) >= `version`)";
+        let condition = "VALUES(`credential_version`) > `credential_version` OR (VALUES(`credential_version`) = `credential_version` AND VALUES(`version`) > `version`)";
+        let failures = "IF(VALUES(`state`)='degraded',IF(VALUES(`credential_version`)=`credential_version` AND `state`='degraded',LEAST(`consecutive_failures`+1,16),1),0)";
+        // MySQL evaluates assignments left to right. Read the old state for
+        // the failure count first, and update ordering keys only after every
+        // other field has used them to reject stale or replayed observations.
         let updates = [
             "state",
-            "credential_version",
-            "version",
             "observed_at",
             "response_status",
             "detail",
+            "version",
+            "credential_version",
         ]
         .map(|column| format!("`{column}`=IF({condition},VALUES(`{column}`),`{column}`)"))
         .join(",");
-        return format!("{insert} ON DUPLICATE KEY UPDATE {updates}");
+        return format!(
+            "{insert} ON DUPLICATE KEY UPDATE `consecutive_failures`=IF({condition},{failures},`consecutive_failures`),{updates}"
+        );
     }
     sql
 }

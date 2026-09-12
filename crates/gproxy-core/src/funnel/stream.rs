@@ -310,6 +310,7 @@ impl<H: Host> FunnelStream<H> {
             // Cancellation without a terminal result has no health observation
             // and must not clear a previous failure.
             if status.is_success()
+                && !ctx.health_delegated
                 && let Some(version) = ctx.credential_version
                 && let Some((health, detail)) = health
             {

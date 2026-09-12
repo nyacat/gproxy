@@ -13,6 +13,7 @@ use crate::{AdminError, PortalIdentity, State};
 
 mod control;
 mod default_prices;
+mod health_reset;
 mod helpers;
 mod observability;
 mod portal_keys;

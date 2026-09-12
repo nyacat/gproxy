@@ -54,7 +54,7 @@ pub(crate) async fn dispatch(
         ),
         Route::CredentialQuotaProbe(id) => connectivity::quota_probe(state, id, parts).await,
         Route::CredentialQuotaReset(id) => connectivity::quota_reset(state, id).await,
-        Route::CredentialHealthReset(id) => control::credential_health_reset(state, id).await,
+        Route::CredentialHealthReset(id) => control::credential_health_reset(state, id, body).await,
         Route::RevealCredentialSecret(id) => control::credential_secret(state, id).await,
         Route::RevealUserKey(id) => identity::reveal(state, id).await,
         Route::UserPassword(id) => identity::password(state, id, body).await,

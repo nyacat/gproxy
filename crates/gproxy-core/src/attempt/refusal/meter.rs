@@ -12,6 +12,7 @@ pub(super) struct Meter(Arc<Mutex<State>>);
 #[derive(Default)]
 struct State {
     failure: Option<gproxy_channel_api::UpstreamFailure>,
+    disposition: Option<gproxy_channel_api::Disposition>,
     decoder: Option<Box<dyn StreamDecoder>>,
     attempts: Vec<UsageAttempt>,
     latest: Option<NormalizedUsage>,
@@ -39,6 +40,7 @@ impl Meter {
         let mut state = self.0.lock().expect("fallback meter lock");
         state.decoder = decoder;
         state.failure = None;
+        state.disposition = None;
         state.model = model;
         state.started = Some(started);
         state.input = input;
@@ -53,10 +55,15 @@ impl Meter {
         state.received = state
             .received
             .saturating_add(crate::usage::utf8_chars(&chunk));
-        match state.decoder.as_mut() {
-            Some(decoder) => decoder.push(chunk),
-            None => Ok(vec![Frame(chunk)]),
-        }
+        let Some(decoder) = state.decoder.as_mut() else {
+            return Ok(vec![Frame(chunk)]);
+        };
+        let result = decoder.push(chunk);
+        let disposition = decoder.terminal_disposition();
+        let failure = decoder.terminal_failure().cloned();
+        state.disposition = disposition;
+        state.failure = failure;
+        result
     }
 
     pub(super) fn finish(
@@ -70,6 +77,7 @@ impl Meter {
         };
         let result = decoder.finish(end);
         state.failure = decoder.terminal_failure().cloned();
+        state.disposition = decoder.terminal_disposition();
         let tail = match result {
             Ok(tail) => tail,
             Err(error) => {
@@ -153,6 +161,22 @@ impl Meter {
 
     pub(super) fn len(&self) -> usize {
         self.0.lock().expect("meter").attempts.len()
+    }
+
+    pub(super) fn health(
+        &self,
+    ) -> (
+        Option<gproxy_channel_api::Disposition>,
+        Option<gproxy_channel_api::UpstreamFailure>,
+    ) {
+        let state = self.0.lock().expect("fallback meter lock");
+        (state.disposition, state.failure.clone())
+    }
+
+    pub(super) fn reset_health(&self) {
+        let mut state = self.0.lock().expect("fallback meter lock");
+        state.disposition = None;
+        state.failure = None;
     }
 
     pub(super) fn reject(&self, model: String, started: i64, status: u16) {

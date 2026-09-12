@@ -88,6 +88,8 @@ impl StreamDecoder for Decoder {
 fn context() -> FunnelCtx {
     FunnelCtx {
         activity: None,
+        health_activity: None,
+        health_delegated: false,
         upstream_started_at_ms: None,
         request_id: "cancel-inline".into(),
         target: target(),

@@ -243,14 +243,20 @@
       "healthObserved": "觀測於 {{time}}",
       "healthDetail": "健康詳細資料",
       "healthReset": {
-        "action": "清除健康狀態",
-        "hint": "點擊徽章清除已記錄的健康狀態。",
+        "action": "重設",
+        "scope": "重設 {{scope}} 的健康狀態",
+        "all": "重設此帳號全部健康記錄",
+        "hint": "重設單項不會影響其他模型；重設全部會同時清除帳號級和模型級記錄。",
         "success": "已清除健康狀態。",
         "error": "無法清除健康狀態。"
       },
       "modelHealth": {
-        "issues": "異常模型 {{count}} 個",
-        "more": "還有 {{count}} 個…"
+        "issues": "部分模型異常 ({{count}})",
+        "account": "帳號級（全部模型）",
+        "accountStatus": "帳號：{{status}}",
+        "unspecified": "未指定模型",
+        "none": "暫無健康異常記錄。",
+        "view": "查看帳號與模型健康狀態"
       },
       "quota": {
         "empty": "上游 usage 介面未回傳額度視窗。",

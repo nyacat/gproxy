@@ -3,7 +3,8 @@ mod model;
 mod normalize;
 
 use gproxy_protocol::openai::realtime::{
-    CreateRealtimeCallRequest, KnownRealtimeServerEvent, RealtimeServerEvent, RealtimeSession,
+    CreateRealtimeCallRequest, KnownRealtimeResponseStatus, KnownRealtimeServerEvent,
+    RealtimeResponseStatus, RealtimeServerEvent, RealtimeSession,
 };
 
 use super::{SessionObservation, SessionUsage, SessionUsageKind};
@@ -15,6 +16,8 @@ pub struct RealtimeMeter {
     dedupe: dedupe::Dedupe,
     ready: bool,
     failure: Option<crate::UpstreamFailure>,
+    observation_model: Option<String>,
+    successful_model: Option<String>,
     failed_response: bool,
     failure_ids: std::collections::VecDeque<u64>,
 }
@@ -30,6 +33,8 @@ impl RealtimeMeter {
             dedupe: dedupe::Dedupe::default(),
             ready: false,
             failure: None,
+            observation_model: None,
+            successful_model: None,
             failed_response: false,
             failure_ids: Default::default(),
         }
@@ -37,41 +42,57 @@ impl RealtimeMeter {
 
     pub fn observe(&mut self, frame: &WsFrame) -> SessionObservation {
         self.failure = None;
+        self.observation_model = None;
+        self.successful_model = None;
         self.failed_response = false;
         let text = match frame {
             WsFrame::Text(text) => text,
             WsFrame::Binary(_) => return compromised("sideband sent a binary event", false),
             WsFrame::Close(_) => return SessionObservation::None,
         };
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
-            && let Some(failure) = crate::UpstreamFailure::from_value(
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+            self.observation_model = value
+                .pointer("/response/model")
+                .and_then(serde_json::Value::as_str)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned);
+            if value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|event| {
+                    event.starts_with("conversation.item.input_audio_transcription.")
+                })
+            {
+                self.observation_model = self.transcription_model.clone();
+            }
+            if let Some(failure) = crate::UpstreamFailure::from_value(
                 "realtime",
                 &http::HeaderMap::new(),
                 None,
                 &value,
                 None,
-            )
-        {
-            use std::hash::{Hash, Hasher};
-            self.failed_response = true;
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            // Provider event ids distinguish repeated failures; a bounded hash
-            // of the envelope is the fallback, never retained plaintext.
-            value
-                .get("event_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(text)
-                .hash(&mut hasher);
-            let id = hasher.finish();
-            if !self.failure_ids.contains(&id) {
-                self.failure_ids.push_back(id);
-                if self.failure_ids.len() > 256 {
-                    self.failure_ids.pop_front();
+            ) {
+                use std::hash::{Hash, Hasher};
+                self.failed_response = true;
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                // Provider event ids distinguish repeated failures; a bounded hash
+                // of the envelope is the fallback, never retained plaintext.
+                value
+                    .get("event_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(text)
+                    .hash(&mut hasher);
+                let id = hasher.finish();
+                if !self.failure_ids.contains(&id) {
+                    self.failure_ids.push_back(id);
+                    if self.failure_ids.len() > 256 {
+                        self.failure_ids.pop_front();
+                    }
+                    self.failure = Some(failure);
                 }
-                self.failure = Some(failure);
-            }
-            if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
-                return SessionObservation::None;
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
+                    return SessionObservation::None;
+                }
             }
         }
         let event: RealtimeServerEvent = match serde_json::from_str(text) {
@@ -99,6 +120,17 @@ impl RealtimeMeter {
 
     pub fn take_failure(&mut self) -> Option<crate::UpstreamFailure> {
         self.failure.take()
+    }
+
+    pub fn observation_model(&self) -> &str {
+        self.observation_model
+            .as_deref()
+            .unwrap_or(&self.primary_model)
+    }
+
+    /// A validated successful terminal event, distinct from billable usage.
+    pub fn take_successful_model(&mut self) -> Option<String> {
+        self.successful_model.take()
     }
 
     pub fn primary_model(&self) -> &str {
@@ -136,6 +168,22 @@ impl RealtimeMeter {
                         if let Some(id) = event.response.id.as_ref() {
                             self.dedupe.record_response(id);
                         }
+                        if self.ready
+                            && !self.failed_response
+                            && event
+                                .response
+                                .status_details
+                                .as_ref()
+                                .is_none_or(|details| details.error.is_none())
+                            && matches!(
+                                event.response.status,
+                                Some(RealtimeResponseStatus::Known(
+                                    KnownRealtimeResponseStatus::Completed
+                                ))
+                            )
+                        {
+                            self.successful_model = Some(self.observation_model().to_owned());
+                        }
                         SessionObservation::Usage(SessionUsage {
                             kind: SessionUsageKind::Primary,
                             model: self.primary_model.clone(),
@@ -159,6 +207,9 @@ impl RealtimeMeter {
                 match normalize::audio(usage) {
                     Ok(usage) => {
                         self.dedupe.record_transcription(identity);
+                        if self.ready && !self.failed_response {
+                            self.successful_model = Some(model.clone());
+                        }
                         SessionObservation::Usage(SessionUsage {
                             kind: SessionUsageKind::Transcription,
                             model,

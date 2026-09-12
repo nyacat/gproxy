@@ -33,6 +33,8 @@ pub(super) async fn run<H: Host>(
     let body = prepared.request.body().clone();
     let mut facts = FunnelCtx {
         activity: None,
+        health_activity: None,
+        health_delegated: false,
         upstream_started_at_ms: Some(crate::quota::now_ms()),
         request_id,
         target,
@@ -110,11 +112,17 @@ pub(super) async fn run<H: Host>(
     // Cleanup calls run detached without a channel handle; they also carry
     // no credential version, so health recording is a no-op for them anyway.
     if let Some(channel) = channel {
-        crate::funnel::health::response(
+        // Uploads and conversation setup do not prove model recovery. The
+        // parent attempt owns its health lease until the final model response.
+        crate::funnel::health::stream_response(
             host.as_ref(),
             channel,
             &facts,
-            disposition,
+            channel.classify(gproxy_channel_api::ResponseView {
+                status: parts.status,
+                headers: &parts.headers,
+                body: &body,
+            }),
             parts.status,
             &parts.headers,
         )

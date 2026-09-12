@@ -58,17 +58,12 @@ pub(super) fn run<H: Host>(
                 Ok(Received::Frame(Some(frame @ WsFrame::Text(_)))) => {
                     let was_ready = meter.ready();
                     let observation = meter.observe(&frame);
-                    if let Some(failure) = meter.take_failure() {
-                        guard.failure(
-                            failure,
-                            matches!(
-                                &observation,
-                                gproxy_channel_api::SessionObservation::Usage(_)
-                            ),
-                        );
-                    }
-                    match observation {
-                        SessionObservation::None => {}
+                    let failure = meter
+                        .take_failure()
+                        .map(|failure| (failure, meter.observation_model().to_owned()));
+                    let usage_received = matches!(&observation, SessionObservation::Usage(_));
+                    let compromised = match observation {
+                        SessionObservation::None => false,
                         SessionObservation::Usage(sample) if was_ready => {
                             if let Err(error) = guard.totals_mut().add(
                                 sample,
@@ -77,26 +72,33 @@ pub(super) fn run<H: Host>(
                                 requested_tier.as_deref(),
                             ) {
                                 super::usage::log_compromise(guard.ctx(), &error);
-                                ended = Ended::Interrupted;
-                                fail_closed(&host, &mut guard, &mut termination).await;
-                                break;
+                                true
+                            } else {
+                                false
                             }
                         }
                         SessionObservation::Usage(_) => {
                             tracing::error!(request_id = %guard.ctx().request_id, "Realtime usage arrived before trusted session state");
-                            ended = Ended::Interrupted;
-                            fail_closed(&host, &mut guard, &mut termination).await;
-                            break;
+                            true
                         }
                         SessionObservation::Compromised { reason, .. } => {
                             tracing::error!(request_id = %guard.ctx().request_id, reason, "Realtime meter integrity was compromised");
-                            ended = Ended::Interrupted;
-                            fail_closed(&host, &mut guard, &mut termination).await;
-                            break;
+                            true
                         }
-                    }
+                    };
                     if meter.ready() {
                         guard.set_primary_model(meter.primary_model());
+                    }
+                    if let Some((failure, model)) = failure {
+                        guard.failure(failure, &model, usage_received).await;
+                    }
+                    if compromised {
+                        ended = Ended::Interrupted;
+                        fail_closed(&host, &mut guard, &mut termination).await;
+                        break;
+                    }
+                    if let Some(model) = meter.take_successful_model() {
+                        guard.success(&model).await;
                     }
                 }
                 Ok(Received::Frame(Some(frame @ WsFrame::Binary(_)))) => {

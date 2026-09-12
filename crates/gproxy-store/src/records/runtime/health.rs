@@ -46,6 +46,8 @@ pub struct CredentialHealthRecord {
     pub credential_version: u64,
     pub version: i64,
     pub state: CredentialHealthState,
+    #[serde(default)]
+    pub consecutive_failures: u32,
     pub observed_at: i64,
     pub response_status: Option<u16>,
     pub detail: Option<String>,

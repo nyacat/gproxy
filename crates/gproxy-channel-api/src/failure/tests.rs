@@ -29,6 +29,16 @@ fn protocol_error_matrix() {
             Disposition::Retryable,
         ),
         (
+            json!({"type":"error","code":"server_is_overloaded","message":"busy"}),
+            "upstream",
+            Disposition::Retryable,
+        ),
+        (
+            json!({"type":"response.failed","response":{"status":"failed","error":{"code":"server_is_overloaded","message":"busy"}}}),
+            "upstream",
+            Disposition::Retryable,
+        ),
+        (
             json!({"error":{"code":400,"status":"INVALID_ARGUMENT","message":"bad"}}),
             "input",
             Disposition::Terminal,
@@ -204,6 +214,11 @@ fn semantic_http_errors_preserve_provider_fallback_for_unknown_denials() {
         (
             StatusCode::OK,
             br#"{"error":{"code":"future_error"}}"#,
+            Disposition::Retryable,
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"code":"server_is_overloaded"}}"#,
             Disposition::Retryable,
         ),
         (

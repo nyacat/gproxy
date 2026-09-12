@@ -11,6 +11,7 @@ pub(super) struct ActiveResponse {
     pub(super) pending_injections: u32,
     pub(super) pending_steers: u32,
     pub(super) terminal: Option<Ended>,
+    pub(super) steered_response_id: Option<String>,
     pub(super) responses: Vec<Bytes>,
     pub(super) output_chars: u64,
     pub(super) failure: gproxy_channel_api::FailureState,
@@ -32,8 +33,43 @@ impl ActiveResponse {
             pending_injections: 0,
             pending_steers: 0,
             terminal: None,
+            steered_response_id: None,
             responses: Vec::new(),
             output_chars: 0,
+        }
+    }
+
+    pub(super) fn steered_incomplete(&self) -> bool {
+        self.failure.failure().is_some_and(|failure| {
+            failure.event_type == "response.incomplete"
+                && !failure.error_envelope
+                && failure.category == "incomplete"
+                && failure.code.as_deref() == Some("steered")
+        })
+    }
+
+    pub(super) fn reset_failure(&mut self) {
+        self.failure = gproxy_channel_api::FailureState::new(
+            "responses_websocket",
+            self.facts
+                .response_headers
+                .as_ref()
+                .unwrap_or(&http::HeaderMap::new()),
+        );
+    }
+
+    pub(super) fn observe_failure(&mut self, value: &serde_json::Value) {
+        if self.steered_incomplete() {
+            // A planned steer interruption must not hide a subsequent actual
+            // failure while the replacement response is being created.
+            let previous = self.failure.clone();
+            self.reset_failure();
+            self.failure.observe(None, value);
+            if self.failure.failure().is_none() || self.steered_incomplete() {
+                self.failure = previous;
+            }
+        } else {
+            self.failure.observe(None, value);
         }
     }
 }

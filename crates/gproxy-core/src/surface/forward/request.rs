@@ -84,6 +84,10 @@ pub(crate) async fn request<H: Host>(
         &target.provider,
     )
     .await?;
+    let health_activity = core
+        .host
+        .begin_credential_health_attempt(&request_id, target, credential.version)
+        .await?;
     let mut prepared = match channel.prepare_surface(
         &request,
         websocket,
@@ -131,6 +135,8 @@ pub(crate) async fn request<H: Host>(
     let target_framing = prepared.framing.unwrap_or(source_framing);
     let mut facts = FunnelCtx {
         activity: None,
+        health_activity,
+        health_delegated: false,
         pricing_control: None,
         usage_channel: None,
         upstream_started_at_ms: Some(crate::quota::now_ms()),

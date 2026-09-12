@@ -6,7 +6,7 @@ use super::setup;
 #[tokio::test]
 async fn sticky_plans_keep_degraded_credentials_as_fallbacks_without_affinity() {
     use gproxy_core::CredentialId;
-    use gproxy_store::records::{CredentialHealthInput, CredentialHealthState};
+    use gproxy_store::records::{CredentialHealthRecord, CredentialHealthState};
 
     let fixture = setup::fixture().await;
     let app = &fixture.app;
@@ -46,7 +46,7 @@ async fn sticky_plans_keep_degraded_credentials_as_fallbacks_without_affinity() 
         .unwrap()
         .version;
     let control = &app.inner.host.services.control;
-    for (model, credential_version, state, affinity) in [
+    for (index, (model, credential_version, state, affinity)) in [
         (
             "upstream-model",
             version,
@@ -63,14 +63,23 @@ async fn sticky_plans_keep_degraded_credentials_as_fallbacks_without_affinity() 
         // A health observation for a different credential version cannot
         // suppress affinity on the current version.
         ("*", version + 1, CredentialHealthState::Degraded, true),
-    ] {
-        control.observe_credential_health(&CredentialHealthInput {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        control.observe_stored_credential_health(&CredentialHealthRecord {
             credential_id: fixture.credential,
             model: model.into(),
             credential_version,
-            version: 1,
+            version: i64::try_from(index + 1).unwrap(),
             state,
-            observed_at: 1,
+            consecutive_failures: u32::from(state != CredentialHealthState::Healthy),
+            observed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .try_into()
+                .unwrap(),
             response_status: Some(200),
             detail: None,
         });

@@ -32,6 +32,9 @@ pub const TABLES: &[TableSpec] = &[
             Col::required("credential_version", Integer),
             Col::required("version", Integer),
             Col::required("state", Text),
+            Col::required("consecutive_failures", Integer)
+                .default("0")
+                .since(SchemaVersion::CredentialHealthBackoff),
             Col::required("observed_at", Integer),
             Col::optional("response_status", Integer),
             Col::optional("detail", Text),

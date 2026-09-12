@@ -10,10 +10,10 @@ impl<H: Host> ResponsesBridge<H> {
     pub(super) async fn connect_native(
         &mut self,
         request: &RequestCtx,
-        plan: &Plan,
+        fallback_plan: &mut Plan,
         classified: &Classified,
     ) -> Result<bool, TransportError> {
-        let mut native_plan = plan.clone();
+        let mut native_plan = fallback_plan.clone();
         native_plan.targets.retain(|target| {
             attempt::support(&self.core, target, classified.key)
                 .ok()
@@ -45,13 +45,12 @@ impl<H: Host> ResponsesBridge<H> {
             Err(crate::error::CoreError::Forbidden(_)) => return Ok(false),
             Err(error) => return Err(super::transport(error)),
         };
-        let candidates = plan.targets.iter().take(plan.budget.max_attempts as usize);
-        for target in candidates {
-            let Ok(attempt::Prepared {
-                egress: Egress::WebSocket(upstream_request),
-                facts,
-                ..
-            }) = attempt::prepare(
+        let mut attempts = 0;
+        for target in &plan.targets {
+            if attempts >= plan.budget.max_attempts {
+                break;
+            }
+            let prepared = match attempt::prepare(
                 &self.core,
                 self.control.as_ref(),
                 target,
@@ -64,20 +63,51 @@ impl<H: Host> ResponsesBridge<H> {
                 Instant::now(),
             )
             .await
+            {
+                Ok(prepared) => prepared,
+                Err(
+                    crate::CoreError::CredentialCoolingDown { .. }
+                    | crate::CoreError::NoCredentials
+                    | crate::CoreError::Unsupported
+                    | crate::CoreError::Channel(
+                        gproxy_channel_api::ChannelError::Secret(_)
+                        | gproxy_channel_api::ChannelError::Refresh(_)
+                        | gproxy_channel_api::ChannelError::Prepare(_),
+                    ),
+                ) => continue,
+                Err(error) => {
+                    self.core
+                        .host
+                        .finish_admission(&request.request_id, None)
+                        .await;
+                    return Err(super::transport(error));
+                }
+            };
+            let attempt::Prepared {
+                egress: Egress::WebSocket(upstream_request),
+                facts,
+                ..
+            } = prepared
             else {
                 continue;
             };
             let frame = super::request_text(upstream_request.body())?;
-            let Ok(mut socket) = self
+            attempts += 1;
+            let mut socket = match self
                 .core
                 .host
                 .transport()
                 .open_websocket(*upstream_request)
                 .await
-            else {
-                continue;
+            {
+                Ok(socket) => socket,
+                Err(error) => {
+                    self.native_attempt_failed(&facts, &error).await;
+                    continue;
+                }
             };
-            if socket.send(WsFrame::Text(frame)).await.is_err() {
+            if let Err(error) = socket.send(WsFrame::Text(frame)).await {
+                self.native_attempt_failed(&facts, &error).await;
                 continue;
             }
             let version = facts
@@ -92,6 +122,8 @@ impl<H: Host> ResponsesBridge<H> {
             .host
             .finish_admission(&request.request_id, None)
             .await;
+        fallback_plan.budget.max_attempts =
+            fallback_plan.budget.max_attempts.saturating_sub(attempts);
         Ok(false)
     }
 
@@ -170,6 +202,7 @@ impl<H: Host> ResponsesBridge<H> {
             .send(WsFrame::Text(super::request_text(frame.body())?))
             .await;
         if let Err(error) = sent {
+            self.native_attempt_failed(&facts, &error).await;
             crate::funnel::complete_stream(
                 self.core.host.clone(),
                 facts,
@@ -182,5 +215,44 @@ impl<H: Host> ResponsesBridge<H> {
         }
         self.active = Some(ActiveResponse::new(facts));
         Ok(())
+    }
+
+    async fn native_attempt_failed(
+        &mut self,
+        facts: &crate::funnel::FunnelCtx,
+        error: &TransportError,
+    ) {
+        if let TransportError::Status(status) = error
+            && let Ok(status) = http::StatusCode::from_u16(*status)
+        {
+            let channel = self
+                .core
+                .channels
+                .get(&facts.target.provider.channel)
+                .expect("prepared channel");
+            let headers = http::HeaderMap::new();
+            let disposition = channel.classify(gproxy_channel_api::ResponseView {
+                status,
+                headers: &headers,
+                body: &[],
+            });
+            crate::funnel::health::record_response(
+                self.core.host.as_ref(),
+                facts,
+                disposition,
+                status,
+            )
+            .await;
+        } else {
+            crate::funnel::health::degraded(
+                self.core.host.as_ref(),
+                &facts.target,
+                facts.credential_version,
+                None,
+                "upstream websocket request failed",
+            )
+            .await;
+        }
+        crate::funnel::error::attempt_transport(self.core.host.as_ref(), facts, error).await;
     }
 }

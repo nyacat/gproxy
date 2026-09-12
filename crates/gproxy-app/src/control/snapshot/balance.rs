@@ -99,8 +99,8 @@ pub(super) fn health_rank(seed: &TargetSeed, health: &CredentialHealthMap) -> u8
     ["*", seed.upstream_model.as_str()]
         .into_iter()
         .filter_map(|model| health.get(&seed.credential)?.get(model))
-        .filter(|(version, _)| *version == seed.credential_version)
-        .map(|(_, state)| match state {
+        .filter(|record| record.credential_version == seed.credential_version)
+        .map(|record| match record.state {
             gproxy_store::records::CredentialHealthState::Healthy => 0,
             gproxy_store::records::CredentialHealthState::Degraded => 1,
             gproxy_store::records::CredentialHealthState::Dead => 2,

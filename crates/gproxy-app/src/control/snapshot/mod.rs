@@ -2,6 +2,7 @@ mod authorization;
 mod balance;
 mod build;
 mod capability;
+mod health;
 mod index;
 mod materialize;
 mod pressure;
@@ -38,6 +39,9 @@ pub(crate) struct SnapshotControl {
     snapshot: Arc<ArcSwap<CompiledSnapshot>>,
     credential_pressure: Arc<ArcSwap<CredentialPressureMap>>,
     credential_health: Arc<ArcSwap<CredentialHealthMap>>,
+    /// Serialize database reads through publication, including resets/reloads.
+    health_sync: Arc<futures_util::lock::Mutex<()>>,
+    health_probes: Arc<Mutex<health::HealthProbes>>,
     rotation: Arc<balance::RotationCounters>,
     oauth_keys: Arc<ArcSwap<std::collections::BTreeSet<i64>>>,
     /// Decrypted credentials, keyed by id. Every path that changes a stored
@@ -103,6 +107,8 @@ impl SnapshotControl {
             snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
             credential_pressure: Arc::new(ArcSwap::from_pointee(credential_pressure)),
             credential_health: Arc::new(ArcSwap::from_pointee(credential_health)),
+            health_sync: Arc::default(),
+            health_probes: Arc::default(),
             rotation: Arc::new(balance::RotationCounters::default()),
             oauth_keys: Arc::new(ArcSwap::from_pointee(oauth_keys)),
             credential_records: Arc::default(),
@@ -136,9 +142,10 @@ impl SnapshotControl {
                 let _ = pause.resume.await;
             }
         }
-        let health = load_health(&self.store).await?;
         let oauth_keys = self.store.oauth_user_key_ids().await?.into_iter().collect();
         let compiled = Arc::new(CompiledSnapshot::build(stored, &self.runtime)?);
+        let _health_sync = self.health_sync.lock().await;
+        let health = load_health(&self.store).await?;
         // A second reload can finish while this one is waiting on another
         // backend read. Its generation wins; publishing this older snapshot
         // would roll the routing table and health state backwards.
@@ -174,15 +181,7 @@ impl SnapshotControl {
             .records
             .get(&id)
             .map(|record| record.version)
-            .or_else(|| {
-                self.snapshot
-                    .load()
-                    .stored
-                    .credentials
-                    .iter()
-                    .find(|record| record.id == id)
-                    .map(|record| record.version)
-            })
+            .or_else(|| self.snapshot.load().credential_versions.get(&id).copied())
     }
 
     pub(crate) fn credential_for_load(&self, id: i64) -> (Option<CredentialRecord>, u64) {
@@ -254,36 +253,6 @@ impl SnapshotControl {
                 true
             }
         }
-    }
-
-    pub(crate) fn credential_health_state(
-        &self,
-        credential: gproxy_channel_api::CredentialId,
-        model: &str,
-    ) -> Option<(u64, gproxy_store::records::CredentialHealthState)> {
-        self.credential_health
-            .load()
-            .get(&credential)?
-            .get(model)
-            .copied()
-    }
-
-    pub(crate) fn observe_credential_health(
-        &self,
-        input: &gproxy_store::records::CredentialHealthInput,
-    ) {
-        let credential = gproxy_channel_api::CredentialId(input.credential_id);
-        let model = input.model.clone();
-        let version = input.credential_version;
-        let state = input.state;
-        self.credential_health.rcu(|current| {
-            let mut updated = (**current).clone();
-            updated
-                .entry(credential)
-                .or_default()
-                .insert(model.clone(), (version, state));
-            Arc::new(updated)
-        });
     }
 
     pub(crate) fn apply_live_pressure(
@@ -499,7 +468,9 @@ impl ControlPlane for SnapshotControl {
             &self.credential_health.load(),
             &self.rotation,
         )?;
-        pressure::apply(&mut plan, &self.credential_pressure.load(), unix_now());
+        let now = unix_now();
+        pressure::apply(&mut plan, &self.credential_pressure.load(), now);
+        self.prioritize_health_probe(&mut plan, now);
         Ok(plan)
     }
 
@@ -558,7 +529,7 @@ async fn load_health(store: &Store) -> Result<CredentialHealthMap, StoreError> {
         health
             .entry(gproxy_channel_api::CredentialId(record.credential_id))
             .or_default()
-            .insert(record.model, (record.credential_version, record.state));
+            .insert(record.model.clone(), record);
     }
     Ok(health)
 }

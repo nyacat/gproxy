@@ -331,6 +331,11 @@ pub trait UpstreamTransport: MaybeSync {
 pub trait CredentialUsageActivity: MaybeSend + MaybeSync {}
 pub type CredentialUsageLease = crate::Shared<dyn CredentialUsageActivity>;
 
+/// Host-owned health probe lifetime. The final clone releases the attempt's
+/// exclusive probe slot after completion or cancellation.
+pub trait CredentialHealthActivity: MaybeSend + MaybeSync {}
+pub type CredentialHealthLease = crate::Shared<dyn CredentialHealthActivity>;
+
 /// The aggregate a host hands to [`crate::Core`]. Associated types keep
 /// everything statically dispatched; no `dyn` on the hot path.
 pub trait Host: MaybeSend + MaybeSync + 'static {
@@ -380,6 +385,18 @@ pub trait Host: MaybeSend + MaybeSync + 'static {
         body: &'a bytes::Bytes,
         settle: gproxy_protocol::SettleMode,
     ) -> BoxFuture<'a, Result<(), CoreError>>;
+
+    /// Gate a real upstream attempt after its actual model and credential
+    /// version are known. A host may reserve one recovery probe for this pair.
+    fn begin_credential_health_attempt<'a>(
+        &'a self,
+        request_id: &'a str,
+        target: &'a crate::control::Target,
+        credential_version: u64,
+    ) -> BoxFuture<'a, Result<Option<CredentialHealthLease>, CoreError>> {
+        let _ = (request_id, target, credential_version);
+        Box::pin(async { Ok(None) })
+    }
 
     /// Reserve additional paid work within an already admitted request.
     fn admit_retry<'a>(

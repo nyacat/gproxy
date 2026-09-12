@@ -16,6 +16,7 @@ struct State<H: Host> {
     runner: Runner<H>,
     input: ByteStream,
     headers: http::HeaderMap,
+    status: http::StatusCode,
     events: Events,
     raw: Vec<Bytes>,
     raw_len: usize,
@@ -35,6 +36,7 @@ pub(super) fn wrap<H: Host>(
         runner,
         input,
         headers: parts.headers.clone(),
+        status: parts.status,
         events: Events::new(),
         raw: Vec::new(),
         raw_len: 0,
@@ -112,25 +114,45 @@ impl<H: Host> State<H> {
                         self.raw.push(chunk.clone());
                     }
                     self.accept_frames(self.runner.meter.push(chunk))?;
+                    let interruption = (self.done && self.terminal_error.is_some())
+                        .then_some("upstream fallback stream decoding failed");
+                    if interruption.is_some() {
+                        let _ = self.runner.meter.finish(StreamEnd::Interrupted, false);
+                    }
+                    self.runner
+                        .record_stream_health(self.status, false, interruption)
+                        .await;
                 }
                 Some(Err(error)) => {
+                    let finished = self.runner.meter.finish(StreamEnd::Interrupted, false);
                     self.runner
-                        .meter
-                        .finish(StreamEnd::Interrupted, false)
-                        .map_err(|error| error.error)?;
+                        .record_interrupted_health("upstream fallback stream transport failed")
+                        .await;
+                    finished.map_err(|error| error.error)?;
                     return Err(error.into());
                 }
                 None => {
                     self.accept_frames(self.runner.meter.finish(StreamEnd::Complete, false))?;
                     if self.done {
+                        self.runner
+                            .record_interrupted_health("upstream fallback stream decoding failed")
+                            .await;
                         continue;
                     }
                     match self.events.end() {
                         Ok((frames, body, open_tool)) => {
+                            self.runner
+                                .record_stream_health(self.status, true, None)
+                                .await;
                             self.pending.extend(frames);
                             self.completion = Some((body, open_tool));
                         }
                         Err(error) => {
+                            self.runner
+                                .record_interrupted_health(
+                                    "upstream fallback stream decoding failed",
+                                )
+                                .await;
                             self.pending.extend(error.frames);
                             self.terminal_error = Some(error.error);
                             self.done = true;
@@ -195,9 +217,7 @@ impl<H: Host> State<H> {
             return Ok(());
         };
         if !next.status().is_success() {
-            let next = crate::attempt::body::collect(next)
-                .await
-                .map_err(|error| CoreError::Transport(error.error))?;
+            let next = self.runner.collect_response(next).await?;
             self.runner
                 .capture(next.status(), next.headers(), Some(next.body().clone()))
                 .await;
@@ -217,6 +237,7 @@ impl<H: Host> State<H> {
         let (parts, input) = next.into_parts();
         self.input = input;
         self.headers = parts.headers;
+        self.status = parts.status;
         self.raw.clear();
         self.raw_len = 0;
         self.events.retry(

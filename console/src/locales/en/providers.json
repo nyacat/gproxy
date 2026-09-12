@@ -243,14 +243,20 @@
       "healthObserved": "Observed {{time}}",
       "healthDetail": "Health detail",
       "healthReset": {
-        "action": "Clear health state",
-        "hint": "Click the badge to clear the recorded health state.",
+        "action": "Reset",
+        "scope": "Reset health for {{scope}}",
+        "all": "Reset all health records for this account",
+        "hint": "Resetting one entry leaves other models unchanged. Resetting all clears both account and model records.",
         "success": "Health state cleared.",
         "error": "Could not clear the health state."
       },
       "modelHealth": {
-        "issues": "Abnormal models: {{count}}",
-        "more": "+{{count}} more…"
+        "issues": "Some models affected ({{count}})",
+        "account": "Account-wide",
+        "accountStatus": "Account: {{status}}",
+        "unspecified": "Unspecified model",
+        "none": "No health issues recorded.",
+        "view": "View account and model health"
       },
       "quota": {
         "empty": "The usage endpoint reported no quota windows.",

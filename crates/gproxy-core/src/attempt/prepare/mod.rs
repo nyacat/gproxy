@@ -89,6 +89,10 @@ pub(crate) async fn prepare<H: Host>(
     if !admission.admitted && support.source != support.target {
         return Err(CoreError::Unsupported);
     }
+    let health_activity = core
+        .host
+        .begin_credential_health_attempt(&ctx.request_id, target, credential.version)
+        .await?;
     let stream = upstream_stream(classified.stream, support.source, support.target);
     let mut method = ctx.method.clone();
     let mut path = ctx.path.clone();
@@ -226,6 +230,8 @@ pub(crate) async fn prepare<H: Host>(
     let target_framing = gproxy_protocol::default_framing(support.target.kind(), false);
     let facts = FunnelCtx {
         activity: None,
+        health_activity,
+        health_delegated: false,
         pricing_control: Some(std::sync::Arc::from(control.detached())),
         usage_channel: core.channels.shared(channel.descriptor().id),
         upstream_started_at_ms: None,

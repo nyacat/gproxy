@@ -17,6 +17,9 @@ pub(super) async fn run<H: Host>(
         let collected = match crate::attempt::body::collect(response).await {
             Ok(response) => response,
             Err(error) => {
+                runner
+                    .record_interrupted_health("upstream fallback response interrupted")
+                    .await;
                 runner.meter.record(
                     NormalizedUsage {
                         input_tokens: crate::usage::estimate_input_tokens(&runner.replay.body),
@@ -34,6 +37,9 @@ pub(super) async fn run<H: Host>(
                 return failure(CoreError::Transport(error.error));
             }
         };
+        runner
+            .record_buffered_health(collected.status(), collected.headers(), collected.body())
+            .await;
         runner
             .capture(
                 collected.status(),

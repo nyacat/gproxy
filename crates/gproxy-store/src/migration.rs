@@ -54,6 +54,7 @@ pub(crate) async fn migrate_to(
                 | SchemaVersion::SettlementRecovery
                 | SchemaVersion::QuotaActivityLifecycle
                 | SchemaVersion::QuotaHistoryIndex
+                | SchemaVersion::CredentialHealthBackoff
         ) {
             branch_history::additive_statements(executor, dialect, version).await?
         } else {
