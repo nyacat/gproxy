@@ -2,7 +2,7 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use super::SseFrame;
-use crate::TransformError;
+use crate::{StreamTransformError, TransformError};
 
 const MAX_BUFFER_BYTES: usize = 100 * 1024 * 1024;
 const WIRE: &str = "Gemini JSON-array stream";
@@ -23,26 +23,45 @@ enum DecodeState {
 }
 
 impl JsonArrayDecoder {
-    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, TransformError> {
+    pub(super) fn push(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<SseFrame>, StreamTransformError<SseFrame>> {
         self.buffer.extend_from_slice(chunk);
-        let frames = self.decode()?;
+        let frames = self.decode(false)?;
         if self.buffer.len() > MAX_BUFFER_BYTES {
-            return Err(TransformError::shape(WIRE, "buffer exceeds 100 MiB"));
+            self.buffer.clear();
+            return Err(StreamTransformError {
+                error: TransformError::shape(WIRE, "buffer exceeds 100 MiB"),
+                frames,
+            });
         }
         Ok(frames)
     }
 
-    pub(super) fn finish(&mut self) -> Result<Vec<SseFrame>, TransformError> {
-        let frames = self.decode()?;
+    pub(super) fn finish(&mut self) -> Result<Vec<SseFrame>, StreamTransformError<SseFrame>> {
+        let frames = self.decode(true)?;
         if self.state == DecodeState::End {
             Ok(frames)
         } else {
-            Err(TransformError::IncompleteStream)
+            self.buffer.clear();
+            Err(StreamTransformError {
+                error: TransformError::IncompleteStream,
+                frames,
+            })
         }
     }
 
-    fn decode(&mut self) -> Result<Vec<SseFrame>, TransformError> {
+    fn decode(&mut self, eof: bool) -> Result<Vec<SseFrame>, StreamTransformError<SseFrame>> {
         let mut frames = Vec::new();
+        if let Err(error) = self.decode_into(&mut frames, eof) {
+            self.buffer.clear();
+            return Err(StreamTransformError { error, frames });
+        }
+        Ok(frames)
+    }
+
+    fn decode_into(&mut self, frames: &mut Vec<SseFrame>, eof: bool) -> Result<(), TransformError> {
         let mut cursor = 0;
         loop {
             cursor += whitespace_len(&self.buffer[cursor..]);
@@ -70,6 +89,13 @@ impl JsonArrayDecoder {
                     let end = cursor + length;
                     let separator = end + whitespace_len(&self.buffer[end..]);
                     let Some(byte) = self.buffer.get(separator).copied() else {
+                        if eof {
+                            // Preserve a complete final value before reporting
+                            // its missing array delimiter. Do not synthesize a
+                            // successful stream ending for the caller.
+                            frames.push(SseFrame { event: None, data });
+                            cursor = separator;
+                        }
                         break;
                     };
                     self.state = match byte {
@@ -94,7 +120,7 @@ impl JsonArrayDecoder {
             }
         }
         self.buffer.drain(..cursor);
-        Ok(frames)
+        Ok(())
     }
 }
 

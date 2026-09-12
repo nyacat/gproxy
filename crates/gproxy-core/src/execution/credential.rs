@@ -54,10 +54,13 @@ async fn load<H: Host>(
         if let Some(peer) = wait_for_peer(host, channel, id, channel_id, observed_version).await? {
             return Ok(peer);
         }
-        observed_version = load_checked(host, id, channel_id).await?.version;
+        observed_version = load_current_checked(host, id, channel_id).await?.version;
     }
 
-    let current = load_checked(host, id, channel_id).await?;
+    // The lease may have been released by a peer while we were waiting. Read
+    // the authoritative row before sending a refresh request, rather than a
+    // stale process-local cache entry.
+    let current = load_current_checked(host, id, channel_id).await?;
     if !force && !refresh_due(channel, &current, unix_now()?) {
         return Ok(current);
     }
@@ -88,9 +91,9 @@ async fn load<H: Host>(
         .persist_rotation(id, replacement, current.version)
         .await
     {
-        Ok(()) => load_checked(host, id, channel_id).await,
+        Ok(()) => load_current_checked(host, id, channel_id).await,
         Err(error) => {
-            let peer = load_checked(host, id, channel_id).await?;
+            let peer = load_current_checked(host, id, channel_id).await?;
             if peer.version != current.version && !refresh_due(channel, &peer, unix_now()?) {
                 Ok(peer)
             } else {
@@ -110,7 +113,7 @@ async fn wait_for_peer<H: Host>(
     let polls = REFRESH_LEASE_TTL.as_secs() / REFRESH_POLL_INTERVAL.as_secs();
     for _ in 0..polls {
         host.wait(REFRESH_POLL_INTERVAL).await;
-        let peer = load_checked(host, id, channel_id).await?;
+        let peer = load_current_checked(host, id, channel_id).await?;
         if peer.version != observed_version && !refresh_due(channel, &peer, unix_now()?) {
             return Ok(Some(peer));
         }
@@ -123,7 +126,22 @@ async fn load_checked<H: Host>(
     id: CredentialId,
     channel: &str,
 ) -> Result<CredentialRecord, CoreError> {
-    let record = host.credentials().load(id).await?;
+    check_record(host.credentials().load(id).await?, id, channel)
+}
+
+async fn load_current_checked<H: Host>(
+    host: &H,
+    id: CredentialId,
+    channel: &str,
+) -> Result<CredentialRecord, CoreError> {
+    check_record(host.credentials().load_current(id).await?, id, channel)
+}
+
+fn check_record(
+    record: CredentialRecord,
+    id: CredentialId,
+    channel: &str,
+) -> Result<CredentialRecord, CoreError> {
     if record.id != id {
         return Err(CoreError::Internal(
             "credential store returned the wrong credential".into(),

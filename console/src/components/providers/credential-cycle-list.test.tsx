@@ -97,8 +97,14 @@ describe("CredentialCycleList", () => {
   })
 
   it("loads previous cycles on demand and bounds rendering across all window groups", async () => {
-    const past = Array.from({ length: 25 }, (_, index) => ({ ...cycle, id: index + 1, window_key: `window-${index % 5}`, status: "closed" }))
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify(past), { status: 200 }))
+    const past = Array.from({ length: 25 }, (_, index) => ({ ...cycle, id: 25 - index, window_key: `window-${index % 5}`, status: "closed" }))
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_path, init) => {
+      const request = JSON.parse(init?.body as string)
+      const offset = request.cursor == null ? 0 : past.findIndex((cycle) => cycle.id === request.cursor.id) + 1
+      const items = past.slice(offset, offset + request.limit)
+      const last = items.at(-1)!
+      return new Response(JSON.stringify({ items, next_cursor: offset + items.length < past.length ? { last_observed_at: last.last_observed_at, id: last.id } : null }), { status: 200 })
+    })
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock)
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const { unmount } = render(<QueryClientProvider client={client}>
@@ -109,12 +115,16 @@ describe("CredentialCycleList", () => {
       expect(fetchMock).not.toHaveBeenCalled()
       await user.click(screen.getByRole("button", { name: "Previous rounds in the last year" }))
       await waitFor(() => expect(screen.getAllByRole("button", { name: "View estimate details" })).toHaveLength(10))
-      expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)).toMatchObject({ credential_id: 7, include_history: false, include_estimate: false })
+      expect(fetchMock.mock.calls[0]?.[0]).toBe("/admin/api/credential-cycles/page")
+      expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)).toMatchObject({ credential_id: 7, cursor: null, limit: 10 })
       await user.click(screen.getByRole("button", { name: "Next" }))
-      expect(screen.getAllByRole("button", { name: "View estimate details" })).toHaveLength(10)
+      await waitFor(() => expect(screen.getAllByRole("button", { name: "View estimate details" })).toHaveLength(10))
+      expect(JSON.parse(fetchMock.mock.calls[1]?.[1]?.body as string).cursor).toEqual({ last_observed_at: 150, id: 16 })
       await user.click(screen.getByRole("button", { name: "Next" }))
-      expect(screen.getAllByRole("button", { name: "View estimate details" })).toHaveLength(5)
-      expect(fetchMock).toHaveBeenCalledOnce()
+      await waitFor(() => expect(screen.getAllByRole("button", { name: "View estimate details" })).toHaveLength(5))
+      expect(JSON.parse(fetchMock.mock.calls[2]?.[1]?.body as string).cursor).toEqual({ last_observed_at: 150, id: 6 })
+      expect(screen.getByRole("button", { name: "Next" })).toBeDisabled()
+      expect(fetchMock).toHaveBeenCalledTimes(3)
     } finally {
       unmount()
       client.clear()

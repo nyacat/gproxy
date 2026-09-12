@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::TransformError;
+use crate::{StreamTransformError, TransformError};
 
 #[derive(Debug)]
 pub struct SseFrame {
@@ -39,17 +39,35 @@ pub struct SseDecoder {
 }
 
 impl SseDecoder {
-    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, TransformError> {
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, StreamTransformError<SseFrame>> {
         self.buffer.extend_from_slice(chunk);
-        if self.buffer.len() > 100 * 1024 * 1024 {
-            return Err(TransformError::shape("SSE", "frame exceeds 100 MiB"));
-        }
         let mut frames = Vec::new();
-        while let Some((end, delimiter)) = delimiter(&self.buffer) {
-            let raw = self.buffer.drain(..end + delimiter).collect::<Vec<_>>();
-            if let Some(frame) = parse(&raw[..end])? {
-                frames.push(frame);
+        let mut cursor = 0;
+        while let Some((end, delimiter)) = delimiter(&self.buffer[cursor..]) {
+            if end > 100 * 1024 * 1024 {
+                self.buffer.clear();
+                return Err(StreamTransformError {
+                    error: TransformError::shape("SSE", "frame exceeds 100 MiB"),
+                    frames,
+                });
             }
+            match parse(&self.buffer[cursor..cursor + end]) {
+                Ok(Some(frame)) => frames.push(frame),
+                Ok(None) => {}
+                Err(error) => {
+                    self.buffer.clear();
+                    return Err(StreamTransformError { error, frames });
+                }
+            }
+            cursor += end + delimiter;
+        }
+        self.buffer.drain(..cursor);
+        if self.buffer.len() > 100 * 1024 * 1024 {
+            self.buffer.clear();
+            return Err(StreamTransformError {
+                error: TransformError::shape("SSE", "frame exceeds 100 MiB"),
+                frames,
+            });
         }
         Ok(frames)
     }
@@ -94,4 +112,21 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|candidate| candidate == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_later_frame_preserves_the_completed_prefix() {
+        let mut input = b"data: {\"text\":\"kept\"}\n\ndata: ".to_vec();
+        input.resize(input.len() + 100 * 1024 * 1024, b'x');
+        let mut decoder = SseDecoder::default();
+        let error = decoder.push(&input).unwrap_err();
+        assert!(error.to_string().contains("exceeds 100 MiB"));
+        assert_eq!(error.frames.len(), 1);
+        assert_eq!(error.frames[0].data, r#"{"text":"kept"}"#);
+        assert!(decoder.finish().unwrap().is_none());
+    }
 }

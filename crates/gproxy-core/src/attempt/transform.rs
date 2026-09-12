@@ -35,10 +35,26 @@ impl TransformDecoder {
         for frame in frames {
             match self.converter.push(frame.0) {
                 Ok(frames) => output.extend(frames.into_iter().map(Frame)),
-                Err(error) => return Err(StreamDecodeError::from(decode(error)).prepend(output)),
+                Err(error) => return Err(decode(error).prepend(output)),
             }
         }
         Ok(output)
+    }
+
+    fn failed_frames(&mut self, mut error: StreamDecodeError) -> StreamDecodeError {
+        let mut frames = match self.convert(std::mem::take(&mut error.frames)) {
+            Ok(frames) => frames,
+            Err(error) => return error,
+        };
+        // Error frames are complete semantic input, but their wire framing may
+        // omit the last SSE delimiter or JSON-array bracket. Flush content
+        // without asking the converter to invent successful terminal events.
+        let tail = self
+            .converter
+            .finish_prefix()
+            .unwrap_or_else(|error| error.frames);
+        frames.extend(tail.into_iter().map(Frame));
+        error.prepend(frames)
     }
 }
 
@@ -59,10 +75,7 @@ impl StreamDecoder for TransformDecoder {
         let frames = match self.upstream.as_mut() {
             Some(upstream) => match upstream.push(chunk) {
                 Ok(frames) => frames,
-                Err(mut error) => {
-                    let frames = self.convert(std::mem::take(&mut error.frames))?;
-                    return Err(error.prepend(frames));
-                }
+                Err(error) => return Err(self.failed_frames(error)),
             },
             None => vec![Frame(chunk)],
         };
@@ -78,8 +91,7 @@ impl StreamDecoder for TransformDecoder {
                         error.frames.clear();
                         return Err(error);
                     }
-                    let frames = self.convert(std::mem::take(&mut error.frames))?;
-                    return Err(error.prepend(frames));
+                    return Err(self.failed_frames(error));
                 }
             },
             None => StreamTail::default(),
@@ -97,7 +109,7 @@ impl StreamDecoder for TransformDecoder {
         let mut frames = self.convert(tail_frames)?;
         match self.converter.finish() {
             Ok(tail) => frames.extend(tail.into_iter().map(Frame)),
-            Err(error) => return Err(StreamDecodeError::from(decode(error)).prepend(frames)),
+            Err(error) => return Err(decode(error).prepend(frames)),
         }
         let mut tail = self.pending_tail.take().expect("finished upstream tail");
         tail.frames = frames;
@@ -113,8 +125,9 @@ impl StreamDecoder for TransformDecoder {
     }
 }
 
-fn decode(error: gproxy_transform::TransformError) -> ChannelError {
-    ChannelError::Decode(error.to_string())
+fn decode(error: gproxy_transform::StreamTransformError) -> StreamDecodeError {
+    StreamDecodeError::from(ChannelError::Decode(error.error.to_string()))
+        .prepend(error.frames.into_iter().map(Frame).collect())
 }
 
 #[cfg(test)]
@@ -164,5 +177,87 @@ mod tests {
         assert!(tail.usage.is_none());
         assert!(tail.actual_service_tier.is_none());
         assert!(tail.frames.is_empty());
+    }
+
+    #[test]
+    fn gemini_unterminated_final_event_survives_rules_and_transform_before_error() {
+        use gproxy_channel_api::{Channel, StreamCtx};
+        use std::sync::Arc;
+
+        let key = |kind| OperationKey::content(Operation::StreamGenerateContent, kind);
+        let target = key(ContentGenerationKind::GeminiGenerateContent);
+        let value = br#"{"responseId":"r1","modelVersion":"gemini","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"hello"}]}}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"totalTokenCount":10}}"#;
+        for framing in [StreamFraming::Sse, StreamFraming::JsonArray] {
+            let wire = [
+                if framing == StreamFraming::Sse {
+                    b"data: ".as_slice()
+                } else {
+                    b"["
+                },
+                value,
+            ]
+            .concat();
+            for rules in [false, true] {
+                for split in 0..=wire.len() {
+                    let headers = http::HeaderMap::new();
+                    let request = Bytes::new();
+                    let mut upstream = gproxy_channels::AiStudioChannel.stream_decoder(StreamCtx {
+                        key: target,
+                        framing,
+                        request_body: &request,
+                        response_headers: &headers,
+                    });
+                    if rules {
+                        upstream = Some(Box::new(
+                            crate::process::ResponseRuleDecoder::new(
+                                upstream,
+                                Arc::from([]),
+                                target,
+                                framing,
+                                crate::process::RuleModels::new("gemini", None),
+                                headers,
+                            )
+                            .unwrap(),
+                        ));
+                    }
+                    let mut decoder = TransformDecoder::new(
+                        key(ContentGenerationKind::OpenAiChat),
+                        target,
+                        StreamFraming::Sse,
+                        framing,
+                        upstream,
+                    );
+                    let mut output = Vec::new();
+                    for chunk in [&wire[..split], &wire[split..]] {
+                        output.extend(decoder.push(Bytes::copy_from_slice(chunk)).unwrap());
+                    }
+                    let error = decoder.finish(StreamEnd::Complete).unwrap_err();
+                    assert!(error.to_string().contains("ended"), "{error}");
+                    output.extend(error.frames);
+                    let text = String::from_utf8(
+                        output
+                            .into_iter()
+                            .flat_map(|frame| frame.0.to_vec())
+                            .collect(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        text.matches("hello").count(),
+                        1,
+                        "framing={framing:?}, rules={rules}, split={split}: {text}"
+                    );
+                    assert!(
+                        !text.contains("[DONE]"),
+                        "must not synthesize success: {text}"
+                    );
+                    assert!(!text.contains("\"finish_reason\":\"stop\""), "{text}");
+                    let tail = decoder.recover_tail();
+                    let usage = tail.usage.unwrap();
+                    assert_eq!((usage.input_tokens, usage.output_tokens), (7, 3));
+                    assert!(tail.frames.is_empty());
+                    assert!(decoder.recover_tail().usage.is_none());
+                }
+            }
+        }
     }
 }

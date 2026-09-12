@@ -371,7 +371,7 @@ fn gemini_pairs_register_streams_and_preserve_native_code_ids() {
     assert!(matches!(
         after_finish.push(Bytes::from_static(
             b"data: {\"responseId\":\"done\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"late\"}]}}]}\n\n",
-        )),
+        )).map_err(|error| error.error),
         Err(TransformError::InvalidShape { .. })
     ));
     let mut after_terminal = ResponseStream::new(
@@ -387,7 +387,7 @@ fn gemini_pairs_register_streams_and_preserve_native_code_ids() {
     assert!(matches!(
         after_terminal.push(Bytes::from_static(
             b"event: response.queued\ndata: {\"type\":\"response.queued\",\"response\":{\"id\":\"late\",\"object\":\"response\",\"status\":\"queued\",\"output\":[]}}\n\n",
-        )),
+        )).map_err(|error| error.error),
         Err(TransformError::InvalidShape { .. })
     ));
 

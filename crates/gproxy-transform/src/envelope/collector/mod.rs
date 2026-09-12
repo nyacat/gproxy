@@ -74,7 +74,7 @@ impl ResponseCollector {
     }
 
     pub fn push(&mut self, chunk: Bytes) -> Result<(), TransformError> {
-        for frame in self.decoder.push(&chunk)? {
+        for frame in self.decoder.push(&chunk).map_err(|error| error.error)? {
             self.frame(frame)?;
         }
         Ok(())

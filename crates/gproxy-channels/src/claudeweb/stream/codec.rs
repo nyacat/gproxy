@@ -139,10 +139,15 @@ impl OperationStream for Codec {
     }
 
     fn finish(&mut self, end: StreamEnd) -> Result<Vec<Frame>, StreamDecodeError> {
+        Ok(self.finish_output(end)?.frames)
+    }
+
+    fn finish_output(&mut self, end: StreamEnd) -> Result<StreamOutput, StreamDecodeError> {
         if end == StreamEnd::Interrupted {
-            return Ok(Vec::new());
+            return Ok(StreamOutput::frames(Vec::new()));
         }
-        let mut output = self.events(true)?.frames;
+        let mut result = self.events(true)?;
+        let mut output = std::mem::take(&mut result.frames);
         if self.legacy && !self.stopped {
             output.push(Frame(encode(
                 &json!({"type":"content_block_stop","index":0}),
@@ -156,6 +161,7 @@ impl OperationStream for Codec {
             output.push(Frame(encode(&json!({"type":"message_stop"}))));
             self.stopped = true;
         }
-        Ok(output)
+        result.frames = output;
+        Ok(result)
     }
 }

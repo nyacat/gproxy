@@ -7,8 +7,9 @@ RUN corepack enable
 COPY console/package.json console/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY console/ ./
-# Docker 构建上下文不含 .git，给控制台提供固定的本地构建标识。
-RUN GPROXY_BUILD_HASH=local pnpm build
+# Docker 构建上下文不含 .git，由 build.sh 将同一标识传给前端和二进制。
+ARG GPROXY_BUILD_HASH=unknown
+RUN GPROXY_BUILD_HASH="$GPROXY_BUILD_HASH" pnpm build
 
 FROM public.ecr.aws/docker/library/rust:1-trixie AS builder
 
@@ -18,7 +19,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
 COPY --from=console /source/console/dist/ crates/gproxy-host-axum/assets/web/
-# 由 build.sh 传入；ARG 会作为环境变量提供给下面的 Cargo 命令。
+# 由 build.sh 传入；显式导出给 build.rs，确保二进制与前端使用同一标识。
 ARG CARGO_PROFILE_RELEASE_OPT_LEVEL
 ARG CARGO_PROFILE_RELEASE_LTO
 ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS
@@ -29,7 +30,8 @@ ARG CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS
 ARG CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS
 ARG CARGO_PROFILE_RELEASE_INCREMENTAL
 ARG RUSTFLAGS
-RUN cargo build --locked --release --target x86_64-unknown-linux-gnu \
+ARG GPROXY_BUILD_HASH=unknown
+RUN GPROXY_BUILD_HASH="$GPROXY_BUILD_HASH" cargo build --locked --release --target x86_64-unknown-linux-gnu \
     --package gproxy-host-axum --bin gproxy
 
 FROM debian:13-slim

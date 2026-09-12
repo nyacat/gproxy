@@ -53,7 +53,7 @@ fn rejects_invalid_framing_and_truncation() {
     ] {
         let mut decoder = JsonArrayDecoder::default();
         assert!(matches!(
-            decoder.push(input),
+            decoder.push(input).map_err(|error| error.error),
             Err(TransformError::InvalidShape { .. })
         ));
     }
@@ -61,7 +61,7 @@ fn rejects_invalid_framing_and_truncation() {
         let mut decoder = JsonArrayDecoder::default();
         let _ = decoder.push(input).unwrap();
         assert!(matches!(
-            decoder.finish(),
+            decoder.finish().map_err(|error| error.error),
             Err(TransformError::IncompleteStream)
         ));
     }
@@ -77,7 +77,9 @@ fn rejects_invalid_framing_and_truncation() {
     oversized_element.resize(MAX_BUFFER_BYTES + 2, b'x');
     let mut decoder = JsonArrayDecoder::default();
     assert!(matches!(
-        decoder.push(&oversized_element),
+        decoder
+            .push(&oversized_element)
+            .map_err(|error| error.error),
         Err(TransformError::InvalidShape { .. })
     ));
 }

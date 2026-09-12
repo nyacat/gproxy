@@ -87,6 +87,25 @@ fn invoke_refreshes_with_version_guard_and_finishes_the_funnel() -> Result<(), I
 }
 
 #[test]
+fn peer_refresh_bypasses_a_process_local_credential_cache() -> Result<(), InitError> {
+    let host = MemoryHost::new(false);
+    {
+        let mut state = host.state.lock().unwrap();
+        state.cached_credential = Some(state.credential.clone());
+        state.peer_refresh_on_wait = true;
+    }
+    let core = core(&host)?;
+    let response = block_on(core.invoke(&host, &target(), request(false, "peer-cache")))
+        .expect("use peer rotation without refreshing the stale token again");
+    assert_eq!(response.status, StatusCode::OK);
+    let state = host.state.lock().unwrap();
+    assert_eq!(state.authorizations, ["Bearer peer"]);
+    assert_eq!(state.wait_calls, 1);
+    assert!(state.rotations.is_empty());
+    Ok(())
+}
+
+#[test]
 fn configured_fingerprint_overrides_headers_and_fails_loudly() -> Result<(), InitError> {
     let host = MemoryHost::new(false);
     host.state.lock().expect("state lock").credential.secret =

@@ -191,6 +191,103 @@ fn claudeweb_late_decode_error_relays_completed_output_before_settling_interrupt
     }
 }
 
+#[test]
+fn claudeweb_eof_tool_pause_matches_delimited_pause_and_settles_each_turn_once() {
+    let mut previous = None;
+    for delimiter in ["\n\n", ""] {
+        let (host, core) = claudeweb_core();
+        let mut wire = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-web\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu-web\",\"name\":\"weather\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}",
+        ).to_owned();
+        wire.push_str(delimiter);
+        {
+            let mut state = host.state.lock().unwrap();
+            state.defer_spawned = true;
+            state.scripted.extend([
+                (http::StatusCode::OK, vec![Bytes::from_static(b"{}")]),
+                (http::StatusCode::OK, vec![Bytes::from_static(b"{}")]),
+                (http::StatusCode::OK, vec![Bytes::from(wire)]),
+            ]);
+        }
+        let collect = |outcome: crate::ExecOutcome| {
+            let ResponseBody::Stream(mut stream) = outcome.body else {
+                panic!("stream")
+            };
+            block_on(async move {
+                let mut bytes = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    bytes.extend_from_slice(&chunk.expect("valid operation output"));
+                }
+                String::from_utf8(bytes).unwrap()
+            })
+        };
+        let first = collect(
+            block_on(core.execute(
+                &host,
+                request(
+                    "eof-first",
+                    json!({
+                        "model":"claude-opus-4-8","stream":true,
+                        "messages":[{"role":"user","content":"use weather"}],
+                        "tools":[{"name":"weather","input_schema":{"type":"object"}}]
+                    }),
+                ),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            first.matches("data: {\"type\":\"message_stop\"}").count(),
+            1
+        );
+        assert!(first.contains("\"stop_reason\":\"tool_use\""));
+        if let Some(previous) = &previous {
+            assert_eq!(&first, previous);
+        }
+        previous = Some(first);
+        assert_eq!(host.state.lock().unwrap().continuations.len(), 1);
+        // The final task settles the completed turn; leave its expiry delay
+        // queued until after the next turn has claimed the continuation.
+        let settle = host.state.lock().unwrap().spawned_tasks.pop().unwrap();
+        block_on(settle);
+        assert_eq!(host.state.lock().unwrap().settlements.len(), 1);
+        let resumed = collect(block_on(core.execute(&host, request("eof-resume", json!({
+            "model":"claude-opus-4-8","stream":true,
+            "messages":[
+                {"role":"assistant","content":[{"type":"tool_use","id":"toolu-web","name":"weather","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu-web","content":"sunny"}]}
+            ]
+        })))).expect("EOF pause remains claimable"));
+        assert!(resumed.contains("message_stop"));
+        assert!(host.state.lock().unwrap().continuations.is_empty());
+        loop {
+            let task = host.state.lock().unwrap().spawned_tasks.pop();
+            let Some(task) = task else { break };
+            block_on(task);
+        }
+        let state = host.state.lock().unwrap();
+        assert_eq!(state.settlements.len(), 2);
+        assert_eq!(
+            state
+                .settlements
+                .iter()
+                .filter(|s| s.request_id == "eof-first")
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .settlements
+                .iter()
+                .filter(|s| s.request_id == "eof-resume")
+                .count(),
+            1
+        );
+    }
+}
+
 fn request(id: &str, body: serde_json::Value) -> RequestCtx {
     RequestCtx {
         request_id: id.into(),

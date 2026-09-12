@@ -16,10 +16,11 @@ vi.mock("@/components/page-layout", () => ({ PageLayout: ({ children }: { childr
 vi.mock("@/components/observability-tabs", () => ({ ObservabilityTabs: () => null }))
 vi.mock("@/components/usage/quota-history", () => ({ QuotaHistory: () => <div>quota history</div> }))
 vi.mock("@/components/usage/usage-explorer", () => ({
-  UsageExplorer: ({ draft, onDraft, onApply, view, page, children }: ComponentProps<typeof UsageExplorer>) => <div>
+  UsageExplorer: ({ draft, onDraft, onApply, onPage, view, page, children }: ComponentProps<typeof UsageExplorer>) => <div>
     <input aria-label="model" value={draft.model ?? ""} onChange={(event) => onDraft({ ...draft, model: event.target.value })} />
     <button onClick={() => onDraft({ ...draft, provider_id: 7, credential_id: 9 })}>filter provider</button>
     <button onClick={onApply}>apply</button>
+    <button onClick={() => onPage(2)}>second page</button>
     {view === "records" ? <div>{page.items[0]?.request_id ?? "empty records"}</div> : children}
   </div>,
 }))
@@ -123,6 +124,34 @@ describe("observability request lifetimes", () => {
     await waitFor(() => expect(initial.signal.aborted).toBe(true))
     expect(matching("usage-records")[1].url.searchParams.get("model")).toBe("narrowed")
   })
+
+  it("does not display records from a previous filter alongside a new summary", async () => {
+    mount(<UsagePage />)
+    await act(async () => {
+      matching("usage-records")[0].respond({ items: [{ request_id: "previous model request" }], total: null, page: 1, page_size: 10, has_more: false })
+      matching("usage-summary")[0].respond({ requests: 1, cost: "0", total_tokens: "0" })
+    })
+    await screen.findByText("previous model request")
+    fireEvent.change(screen.getByLabelText("model"), { target: { value: "new model" } })
+    fireEvent.click(screen.getByText("apply"))
+    await waitFor(() => expect(matching("usage-summary")).toHaveLength(2))
+    await act(async () => matching("usage-summary")[1].respond({ requests: 0, cost: "0", total_tokens: "0" }))
+    expect(screen.queryByText("previous model request")).not.toBeInTheDocument()
+  })
+
+  it("refreshes the summary when applying the same filters from a later records page", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_780_000_000_000)
+    try {
+      mount(<UsagePage />)
+      await completeInitial()
+      fireEvent.click(screen.getByText("second page"))
+      await waitFor(() => expect(matching("usage-records")).toHaveLength(2))
+      expect(matching("usage-summary")).toHaveLength(1)
+      fireEvent.click(screen.getByText("apply"))
+      await waitFor(() => expect(matching("usage-summary")).toHaveLength(2))
+      expect(matching("usage-summary")[1].url.search).toBe(matching("usage-summary")[0].url.search)
+    } finally { clock.mockRestore() }
+  })
   it("cancels obsolete usage filters and inactive views, and sends provider filters to the API", async () => {
     const { unmount } = mount(<UsagePage />)
     await completeInitial()
@@ -143,14 +172,14 @@ describe("observability request lifetimes", () => {
     const secondSummary = matching("usage-summary")[2]
 
     fireEvent.click(screen.getByRole("radio", { name: "usage.view.quotas" }))
-    await waitFor(() => expect(matching("credential-cycles/query")).toHaveLength(1))
+    await waitFor(() => expect(matching("credential-cycles/page")).toHaveLength(1))
     expect(secondRecords.signal.aborted).toBe(true)
     expect(secondSummary.signal.aborted).toBe(true)
-    const history = matching("credential-cycles/query")[0]
+    const history = matching("credential-cycles/page")[0]
     expect(history.body?.provider_id).toBe(7)
     expect(history.body?.credential_id).toBe(9)
-    expect(history.body?.include_history).toBe(false)
-    expect(history.body?.include_estimate).toBe(false)
+    expect(history.body?.limit).toBe(10)
+    expect(history.body?.cursor).toBeNull()
 
     fireEvent.click(screen.getByRole("radio", { name: "usage.view.records" }))
     await waitFor(() => expect(history.signal.aborted).toBe(true))

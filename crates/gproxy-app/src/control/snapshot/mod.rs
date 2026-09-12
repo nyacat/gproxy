@@ -43,7 +43,7 @@ pub(crate) struct SnapshotControl {
     /// Decrypted credentials, keyed by id. Every path that changes a stored
     /// credential ends in `reload`, which drops the whole map; a rotation
     /// this instance performs forgets its own entry immediately.
-    credential_records: Arc<Mutex<HashMap<i64, CredentialRecord>>>,
+    credential_records: Arc<Mutex<CredentialCache>>,
     health_persisted_at: Arc<Mutex<HashMap<(gproxy_channel_api::CredentialId, String), i64>>>,
     /// Last successful probe persist per credential. Response-header snapshots
     /// only hit the store when this is older than [`PROBE_STALE_SECONDS`].
@@ -53,6 +53,28 @@ pub(crate) struct SnapshotControl {
     reload_generation: Arc<Mutex<ReloadGeneration>>,
     #[cfg(all(test, not(target_arch = "wasm32")))]
     reload_pause: Arc<Mutex<Option<reload_tests::Pause>>>,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    credential_read_pause: Arc<Mutex<Option<reload_tests::Pause>>>,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    credential_rotation_pause: Arc<Mutex<Option<reload_tests::Pause>>>,
+}
+
+#[derive(Default)]
+struct CredentialCache {
+    /// A database read may finish after a reload or rotation invalidates it.
+    /// The epoch and records share a lock so checking it and publishing a read
+    /// cannot race another invalidation.
+    epoch: u64,
+    records: HashMap<i64, CredentialRecord>,
+}
+
+impl CredentialCache {
+    fn invalidate(&mut self) {
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .expect("credential epoch exhausted");
+    }
 }
 
 #[derive(Default)]
@@ -89,6 +111,10 @@ impl SnapshotControl {
             reload_generation: Arc::default(),
             #[cfg(all(test, not(target_arch = "wasm32")))]
             reload_pause: Arc::default(),
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            credential_read_pause: Arc::default(),
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            credential_rotation_pause: Arc::default(),
         })
     }
 
@@ -120,13 +146,12 @@ impl SnapshotControl {
         if current_generation.published > generation {
             return Ok(());
         }
+        let mut credentials = self.credential_records.lock().expect("credential cache");
         self.oauth_keys.store(Arc::new(oauth_keys));
         self.snapshot.store(compiled);
         self.credential_health.store(Arc::new(health));
-        self.credential_records
-            .lock()
-            .expect("credential cache")
-            .clear();
+        credentials.records.clear();
+        credentials.invalidate();
         current_generation.published = generation;
         Ok(())
     }
@@ -135,6 +160,7 @@ impl SnapshotControl {
         self.credential_records
             .lock()
             .expect("credential cache")
+            .records
             .get(&id)
             .cloned()
     }
@@ -145,6 +171,7 @@ impl SnapshotControl {
         self.credential_records
             .lock()
             .expect("credential cache")
+            .records
             .get(&id)
             .map(|record| record.version)
             .or_else(|| {
@@ -158,18 +185,54 @@ impl SnapshotControl {
             })
     }
 
-    pub(crate) fn cache_credential(&self, record: &CredentialRecord) {
-        self.credential_records
-            .lock()
-            .expect("credential cache")
-            .insert(record.id.0, record.clone());
+    pub(crate) fn credential_for_load(&self, id: i64) -> (Option<CredentialRecord>, u64) {
+        let cache = self.credential_records.lock().expect("credential cache");
+        (cache.records.get(&id).cloned(), cache.epoch)
+    }
+
+    /// Publish a record loaded from storage only when no reload/rotation
+    /// invalidated the read while it was in flight. Parallel reads also cannot
+    /// replace a credential whose version is newer than their result.
+    pub(crate) fn cache_credential_if_current(
+        &self,
+        record: &CredentialRecord,
+        epoch: u64,
+    ) -> bool {
+        let mut cache = self.credential_records.lock().expect("credential cache");
+        if cache.epoch != epoch
+            || cache
+                .records
+                .get(&record.id.0)
+                .is_some_and(|cached| cached.version > record.version)
+        {
+            return false;
+        }
+        cache.records.insert(record.id.0, record.clone());
+        true
     }
 
     pub(crate) fn forget_credential(&self, id: i64) {
-        self.credential_records
-            .lock()
-            .expect("credential cache")
-            .remove(&id);
+        let mut cache = self.credential_records.lock().expect("credential cache");
+        cache.records.remove(&id);
+        cache.invalidate();
+    }
+
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) async fn pause_credential_read(&self) {
+        let pause = self.credential_read_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            let _ = pause.read.send(());
+            let _ = pause.resume.await;
+        }
+    }
+
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) async fn pause_credential_rotation(&self) {
+        let pause = self.credential_rotation_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            let _ = pause.read.send(());
+            let _ = pause.resume.await;
+        }
     }
 
     /// Whether an unchanged health observation is worth persisting again:

@@ -5,6 +5,122 @@ use gproxy_store::records::{
 };
 
 #[tokio::test]
+async fn cycle_pages_preserve_disabled_usage_and_validate_cursor_limits() {
+    let state = state().await;
+    seed_admin_key(&state).await;
+    for window in ["primary", "weekly"] {
+        state
+            .store
+            .observe_credential_quota_cycle(&CredentialQuotaObservation {
+                credential_id: 7,
+                window_key: window.into(),
+                label: None,
+                period_start: Some(0),
+                period_end: Some(100),
+                observed_at: 10,
+                boundary_source: QuotaBoundarySource::Upstream,
+                boundary_confidence: QuotaBoundaryConfidence::Exact,
+                sample: gproxy_core::QuotaSample {
+                    source: gproxy_core::QuotaSampleSource::Unknown,
+                    started_at_ms: 10_000,
+                    received_at_ms: 10_000,
+                },
+                scope: gproxy_core::QuotaScope::All,
+                reset_behavior: gproxy_core::QuotaResetBehavior::Periodic,
+                unit: None,
+                upstream_used: None,
+                upstream_limit: None,
+                used_percent: Some(10.into()),
+            })
+            .await
+            .unwrap();
+    }
+    state
+        .store
+        .record_usage(&gproxy_store::records::UsageInput {
+            upstream_started_at_ms: Some(11_000),
+            request_id: "cycle-page-usage".into(),
+            at: 12,
+            provider_id: 1,
+            credential_id: 7,
+            organization_id: None,
+            team_id: None,
+            user_id: None,
+            user_key_id: None,
+            operation: Some("generate_content".into()),
+            upstream_model: "page-model".into(),
+            input_tokens: 3,
+            output_tokens: 2,
+            cached_input_tokens: 0,
+            metrics: serde_json::json!({}),
+            dimensions: serde_json::json!({}),
+            cost: 1.into(),
+            usage_source: "upstream".into(),
+            ended: "complete".into(),
+            latency_ms: 1,
+        })
+        .await
+        .unwrap();
+    let parts = admin_parts(Method::POST, "/admin/api/credential-cycles/page");
+    let first = crate::dispatch(
+        &state,
+        &parts,
+        Bytes::from_static(br#"{"from":0,"to":100,"limit":1}"#),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first: crate::dto::CredentialCyclePageDto = serde_json::from_slice(first.body()).unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert!(!first.items[0].metrics.as_object().unwrap().is_empty());
+    assert_eq!(first.items[0].models[0].model, "page-model");
+    assert!(first.items[0].observations.is_empty());
+    assert!(first.items[0].estimate.is_none());
+    state
+        .store
+        .set_setting(&SettingInput {
+            key: gproxy_store::records::ENABLE_USAGE.into(),
+            value: serde_json::json!(false),
+        })
+        .await
+        .unwrap();
+    let body = serde_json::to_vec(
+        &serde_json::json!({"from":0,"to":100,"limit":1,"cursor":first.next_cursor}),
+    )
+    .unwrap();
+    let next = crate::dispatch(&state, &parts, Bytes::from(body))
+        .await
+        .unwrap();
+    assert_eq!(next.status(), StatusCode::OK);
+    let next: crate::dto::CredentialCyclePageDto = serde_json::from_slice(next.body()).unwrap();
+    assert_eq!(next.items.len(), 1);
+    assert_ne!(next.items[0].id, first.items[0].id);
+    assert!(next.next_cursor.is_none());
+    assert_eq!(next.items[0].metrics, serde_json::json!({}));
+    assert!(next.items[0].models.is_empty());
+    assert_eq!(
+        next.items[0].estimate.as_ref().unwrap().reason.as_deref(),
+        Some("usage_disabled")
+    );
+    assert_eq!(next.items[0].used_percent.as_deref(), Some("10"));
+    assert!(state.store.audit_events(100).await.unwrap().is_empty());
+    for invalid in [
+        serde_json::json!({"from":0,"to":100,"limit":0}),
+        serde_json::json!({"from":0,"to":100,"limit":101}),
+        serde_json::json!({"from":0,"to":100,"cursor":{"id":0,"last_observed_at":10}}),
+    ] {
+        let response = crate::dispatch(
+            &state,
+            &parts,
+            Bytes::from(serde_json::to_vec(&invalid).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
 async fn usage_record_pages_can_skip_counts_without_changing_legacy_totals_or_filters() {
     let state = state().await;
     seed_admin_key(&state).await;

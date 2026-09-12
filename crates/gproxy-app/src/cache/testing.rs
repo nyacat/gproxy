@@ -20,6 +20,7 @@ pub(crate) struct Faults {
 struct Pause {
     operation: &'static str,
     prefix: String,
+    after: bool,
     entered: std::sync::Arc<tokio::sync::Notify>,
     resume: std::sync::Arc<tokio::sync::Notify>,
 }
@@ -52,15 +53,58 @@ impl Faults {
         std::sync::Arc<tokio::sync::Notify>,
         std::sync::Arc<tokio::sync::Notify>,
     ) {
+        self.pause_at(operation, prefix, true)
+    }
+
+    pub(crate) fn pause_before(
+        &self,
+        operation: &'static str,
+        prefix: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        self.pause_at(operation, prefix, false)
+    }
+
+    fn pause_at(
+        &self,
+        operation: &'static str,
+        prefix: &str,
+        after: bool,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
         let entered = std::sync::Arc::new(tokio::sync::Notify::new());
         let resume = std::sync::Arc::new(tokio::sync::Notify::new());
         *self.pause.lock().unwrap() = Some(Pause {
             operation,
             prefix: prefix.into(),
+            after,
             entered: entered.clone(),
             resume: resume.clone(),
         });
         (entered, resume)
+    }
+
+    async fn wait_if_paused(&self, operation: &str, key: &str, after: bool) {
+        let pause = {
+            let mut pause = self.pause.lock().unwrap();
+            if pause.as_ref().is_some_and(|pause| {
+                pause.operation == operation
+                    && key.starts_with(&pause.prefix)
+                    && pause.after == after
+            }) {
+                pause.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.resume.notified().await;
+        }
     }
 
     pub(crate) fn ttl(&self, key: &str) -> Option<Option<Duration>> {
@@ -95,24 +139,12 @@ impl Faults {
     ) -> BoxFuture<'a, Result<T, Error>> {
         Box::pin(async move {
             self.check(operation, key, false)?;
+            self.wait_if_paused(operation, key, false).await;
             let result = execute().await?;
             if let Some(ttl) = ttl {
                 self.ttls.lock().unwrap().insert(key.into(), ttl);
             }
-            let pause = {
-                let mut pause = self.pause.lock().unwrap();
-                if pause.as_ref().is_some_and(|pause| {
-                    pause.operation == operation && key.starts_with(&pause.prefix)
-                }) {
-                    pause.take()
-                } else {
-                    None
-                }
-            };
-            if let Some(pause) = pause {
-                pause.entered.notify_one();
-                pause.resume.notified().await;
-            }
+            self.wait_if_paused(operation, key, true).await;
             self.check(operation, key, true)?;
             Ok(result)
         })

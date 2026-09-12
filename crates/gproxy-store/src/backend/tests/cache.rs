@@ -40,6 +40,15 @@ async fn redis_cache_operations_are_atomic() {
     assert_eq!(first.incr(&lease, 1, None).await.expect("first lease"), 1);
     assert_eq!(second.incr(&lease, 1, None).await.expect("second lease"), 2);
     first.delete(&lease).await.expect("remove refresh lease");
+
+    // Exercise Upstash's actual HTTP encoding/decoding against Redis too.
+    // This catches JSON number rounding independently of native RESP replies.
+    let rest = RedisRestBridge::start(&url).await;
+    exercise_atomicity(Arc::new(crate::UpstashCache::new(
+        rest.url.clone(),
+        "cache-test-token".into(),
+    )))
+    .await;
 }
 
 #[tokio::test]
@@ -71,12 +80,45 @@ async fn exercise_atomicity(cache: SharedCache) {
 
     let lease = format!("{prefix}:lease");
     cache.delete(&lease).await.expect("clear lease");
+    assert!(
+        cache
+            .compare_and_swap(&lease, None, None, None)
+            .await
+            .unwrap()
+    );
     let left = cache.compare_and_swap(&lease, None, Some(b"left".to_vec()), None);
     let right = cache.compare_and_swap(&lease, None, Some(b"right".to_vec()), None);
     let (left, right) = tokio::join!(left, right);
     assert_ne!(
         left.expect("left contender"),
         right.expect("right contender")
+    );
+    assert!(
+        !cache
+            .compare_and_swap(&lease, None, None, None)
+            .await
+            .unwrap()
+    );
+    cache
+        .set(
+            &lease,
+            b"expires".to_vec(),
+            Some(std::time::Duration::from_millis(1)),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while cache.get(&lease).await.unwrap().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        cache
+            .compare_and_swap(&lease, None, None, None)
+            .await
+            .unwrap()
     );
     cache.delete(&counter).await.expect("remove counter");
     cache.delete(&lease).await.expect("remove lease");
@@ -170,8 +212,86 @@ async fn exercise_atomicity(cache: SharedCache) {
     assert_eq!(cache.incr(&used, 0, None).await.unwrap(), 9);
     cache.delete(&used).await.unwrap();
     cache.delete(&pending).await.unwrap();
+    exercise_counter_bounds(cache.clone(), &prefix).await;
     exercise_reservation_state(cache.clone(), &prefix).await;
     exercise_reservation_bounds(cache, &prefix).await;
+}
+
+async fn exercise_counter_bounds(cache: SharedCache, prefix: &str) {
+    let counter = format!("{prefix}:exact-counter");
+    let state = format!("{prefix}:exact-counter-state");
+    let ready = b"ready".to_vec();
+    let updated = b"updated".to_vec();
+    let cases = [
+        (9_007_199_254_740_992, 1),
+        (-9_007_199_254_740_992, -1),
+        (i64::MAX - 1, 1),
+        (i64::MIN + 1, -1),
+        (i64::MAX, i64::MIN),
+        (i64::MIN, i64::MAX),
+        (0, i64::MAX),
+        (0, i64::MIN),
+    ];
+    for guarded in [false, true] {
+        for (current, by) in cases {
+            cache.delete(&counter).await.unwrap();
+            cache.seed_counter(&counter, current, None).await.unwrap();
+            cache.set(&state, ready.clone(), None).await.unwrap();
+            let next = if guarded {
+                cache
+                    .compare_incr_and_set(&counter, by, &state, ready.clone(), updated.clone())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            } else {
+                cache.incr(&counter, by, None).await.unwrap()
+            };
+            assert_eq!(next, current.checked_add(by).unwrap());
+            assert_eq!(cache.incr(&counter, 0, None).await.unwrap(), next);
+            assert_eq!(
+                cache.get(&state).await.unwrap(),
+                Some(if guarded {
+                    updated.clone()
+                } else {
+                    ready.clone()
+                })
+            );
+        }
+        for (current, by) in [(i64::MAX, 1), (i64::MIN, -1)] {
+            cache.delete(&counter).await.unwrap();
+            cache.seed_counter(&counter, current, None).await.unwrap();
+            cache.set(&state, ready.clone(), None).await.unwrap();
+            let result = if guarded {
+                cache
+                    .compare_incr_and_set(&counter, by, &state, ready.clone(), updated.clone())
+                    .await
+            } else {
+                cache.incr(&counter, by, None).await.map(Some)
+            };
+            assert!(result.is_err(), "counter overflow must fail: {result:?}");
+            assert_eq!(cache.incr(&counter, 0, None).await.unwrap(), current);
+            assert_eq!(cache.get(&state).await.unwrap(), Some(ready.clone()));
+            assert_eq!(
+                cache
+                    .compare_incr_and_set(&counter, by, &state, updated.clone(), ready.clone())
+                    .await
+                    .unwrap(),
+                None,
+                "a stale state must not evaluate the overflowing counter"
+            );
+        }
+    }
+    for (current, floor) in [(1, -2), (-2, -3), (-10, -1), (i64::MAX, i64::MIN)] {
+        cache.delete(&counter).await.unwrap();
+        cache.seed_counter(&counter, current, None).await.unwrap();
+        cache.raise_counter(&counter, floor, None).await.unwrap();
+        assert_eq!(
+            cache.incr(&counter, 0, None).await.unwrap(),
+            current.max(floor)
+        );
+    }
+    cache.delete(&counter).await.unwrap();
+    cache.delete(&state).await.unwrap();
 }
 
 async fn exercise_reservation_state(cache: SharedCache, prefix: &str) {
@@ -479,20 +599,113 @@ async fn exercise_reservation_bounds(cache: SharedCache, prefix: &str) {
             } else {
                 pending_value
             };
-            // Subtract before observing the result because existing Redis
-            // incr replies cannot represent every large integer in Lua.
-            if expected_pending == i64::MIN {
-                assert_eq!(cache.incr(&pending, i64::MAX, None).await.unwrap(), -1);
-                assert_eq!(cache.incr(&pending, 1, None).await.unwrap(), 0);
-            } else {
-                assert_eq!(
-                    cache.incr(&pending, -expected_pending, None).await.unwrap(),
-                    0
-                );
-            }
+            assert_eq!(
+                cache.incr(&pending, 0, None).await.unwrap(),
+                expected_pending
+            );
         }
     }
     for key in [&used, &pending, &state] {
         cache.delete(key).await.unwrap();
     }
+}
+
+struct RedisRestBridge {
+    url: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RedisRestBridge {
+    async fn start(redis_url: &str) -> Self {
+        let connection =
+            redis::aio::ConnectionManager::new(redis::Client::open(redis_url).unwrap())
+                .await
+                .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut requests = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.unwrap();
+                        requests.spawn(redis_rest_request(stream, connection.clone()));
+                    }
+                    Some(result) = requests.join_next() => result.unwrap(),
+                }
+            }
+        });
+        Self { url, task }
+    }
+}
+
+impl Drop for RedisRestBridge {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn redis_rest_request(
+    stream: tokio::net::TcpStream,
+    mut connection: redis::aio::ConnectionManager,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let mut reader = BufReader::new(stream);
+    let mut length = None;
+    loop {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).await.unwrap() > 0);
+        if line == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            length = Some(value.trim().parse::<usize>().unwrap());
+        }
+    }
+    let mut body = vec![0; length.expect("JSON request has content length")];
+    reader.read_exact(&mut body).await.unwrap();
+    let arguments: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    let mut command = redis::cmd(arguments[0].as_str().unwrap());
+    for argument in &arguments[1..] {
+        let value = match argument {
+            serde_json::Value::String(value) => value.clone(),
+            serde_json::Value::Number(number) => {
+                // REST servers may parse JSON through IEEE-754 numbers. Only
+                // small control arguments such as key counts may use numbers.
+                let integer = number.as_i64().expect("integer Redis argument");
+                assert!(integer.unsigned_abs() <= 9_007_199_254_740_992);
+                integer.to_string()
+            }
+            _ => panic!("unexpected Redis argument: {argument}"),
+        };
+        command.arg(value);
+    }
+    let response = match command.query_async::<redis::Value>(&mut connection).await {
+        Ok(value) => {
+            let result = match value {
+                redis::Value::Nil => serde_json::Value::Null,
+                redis::Value::Int(value) => serde_json::json!(value),
+                redis::Value::BulkString(value) => {
+                    serde_json::json!(String::from_utf8(value).unwrap())
+                }
+                redis::Value::SimpleString(value) => serde_json::json!(value),
+                redis::Value::Boolean(false) => serde_json::Value::Null,
+                redis::Value::Boolean(true) => serde_json::json!(1),
+                redis::Value::Okay => serde_json::json!("OK"),
+                other => panic!("unexpected Redis response: {other:?}"),
+            };
+            serde_json::json!({"result": result})
+        }
+        Err(error) => serde_json::json!({"error": error.to_string()}),
+    };
+    let response = serde_json::to_vec(&response).unwrap();
+    reader
+        .get_mut()
+        .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).as_bytes())
+        .await
+        .unwrap();
+    reader.get_mut().write_all(&response).await.unwrap();
 }

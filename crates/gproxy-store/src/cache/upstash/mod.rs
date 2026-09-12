@@ -116,15 +116,15 @@ impl CacheBackend for UpstashCache {
         ttl: Option<Duration>,
     ) -> BoxFuture<'a, Result<i64, Error>> {
         Box::pin(async move {
-            let script = "local e=redis.call('EXISTS',KEYS[1]); local v=redis.call('INCRBY',KEYS[1],ARGV[1]); if e==0 and tonumber(ARGV[2])>0 then redis.call('PEXPIRE',KEYS[1],ARGV[2]); end; return v";
             self.eval(
-                script,
+                super::spend::INCR_SCRIPT,
                 &[key],
-                vec![json!(by), json!(ttl_millis(ttl))],
+                vec![json!(by.to_string()), json!(ttl_millis(ttl))],
                 "increment",
             )
             .await?
-            .as_i64()
+            .as_str()
+            .and_then(|value| value.parse().ok())
             .ok_or_else(|| error("Upstash", "increment"))
         })
     }
@@ -138,13 +138,16 @@ impl CacheBackend for UpstashCache {
         state: Vec<u8>,
     ) -> BoxFuture<'a, Result<Option<i64>, Error>> {
         Box::pin(async move {
-            let script = "if redis.call('GET',KEYS[2])~=ARGV[2] then return false end; local v=redis.call('INCRBY',KEYS[1],ARGV[1]); if v==0 then redis.call('PEXPIRE',KEYS[1],3600000) else redis.call('PERSIST',KEYS[1]) end; redis.call('SET',KEYS[2],ARGV[3]); return v";
             let encode = |value| base64::engine::general_purpose::STANDARD.encode(value);
             let result = self
                 .eval(
-                    script,
+                    super::spend::COMPARE_INCR_SCRIPT,
                     &[counter_key, state_key],
-                    vec![json!(by), json!(encode(expected)), json!(encode(state))],
+                    vec![
+                        json!(by.to_string()),
+                        json!(encode(expected)),
+                        json!(encode(state)),
+                    ],
                     "compare increment",
                 )
                 .await?;
@@ -152,7 +155,8 @@ impl CacheBackend for UpstashCache {
                 Ok(None)
             } else {
                 result
-                    .as_i64()
+                    .as_str()
+                    .and_then(|value| value.parse().ok())
                     .map(Some)
                     .ok_or_else(|| error("Upstash", "compare increment"))
             }
@@ -191,7 +195,12 @@ impl CacheBackend for UpstashCache {
         ttl: Option<Duration>,
     ) -> BoxFuture<'a, Result<bool, Error>> {
         Box::pin(async move {
-            let mut command = vec![json!("SET"), json!(key), json!(value), json!("NX")];
+            let mut command = vec![
+                json!("SET"),
+                json!(key),
+                json!(value.to_string()),
+                json!("NX"),
+            ];
             if ttl_millis(ttl) > 0 {
                 command.extend([json!("PX"), json!(ttl_millis(ttl))]);
             }
@@ -277,7 +286,7 @@ impl CacheBackend for UpstashCache {
             self.eval(
                 super::spend::RAISE_SCRIPT,
                 &[key],
-                vec![json!(floor), json!(ttl_millis(ttl))],
+                vec![json!(floor.to_string()), json!(ttl_millis(ttl))],
                 "raise counter",
             )
             .await?;

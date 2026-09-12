@@ -48,28 +48,55 @@ fn observation(credential_id: i64, received_at_ms: i64) -> CredentialQuotaObserv
 }
 
 #[test]
-fn coalescing_keeps_latest_per_source_and_credential_version() {
+fn coalescing_keeps_latest_per_source_and_credential() {
     let queue = QuotaObserveQueue::default();
     queue.push(1, observation(7, 20));
     queue.push(1, observation(7, 10));
-    queue.push(2, observation(7, 30));
+    queue.push(1, observation(8, 30));
     queue.push_entries(7, 1, vec![entry("first", "shared", 20)]);
     queue.push_entries(7, 1, vec![entry("first", "shared", 10)]);
     queue.push_entries(7, 1, vec![entry("second", "shared", 15)]);
-    queue.push_entries(7, 2, vec![entry("first", "shared", 30)]);
+    queue.push_entries(8, 1, vec![entry("first", "shared", 30)]);
     let mut pending = queue.take();
     assert_eq!(pending.len(), 2);
-    let first = pending.remove(&(7, 1)).unwrap();
+    let first = pending.remove(&7).unwrap();
     assert_eq!(first.observations["window"].sample.received_at_ms, 20);
     assert_eq!(first.entries.len(), 2);
     assert_eq!(
         first.entries[&("first".into(), "shared".into())].observed_at_ms,
         20
     );
-    let second = pending.remove(&(7, 2)).unwrap();
+    let second = pending.remove(&8).unwrap();
     assert_eq!(second.observations["window"].sample.received_at_ms, 30);
     assert_eq!(second.entries.len(), 1);
     assert!(queue.is_empty());
+}
+
+#[test]
+fn rotation_discards_pending_old_versions_even_when_their_responses_arrive_later() {
+    let queue = QuotaObserveQueue::default();
+    for version in 1..=1024 {
+        queue.push(version, observation(7, version as i64));
+        queue.push_entries(7, version, vec![entry("current", "shared", version as i64)]);
+    }
+    queue.push(1, observation(8, 5));
+    let mut stale = observation(7, 10_000);
+    stale.window_key = "obsolete".into();
+    queue.push(1, stale);
+    queue.push_entries(7, 1, vec![entry("obsolete", "shared", 10_000)]);
+
+    let pending = queue.take();
+    assert_eq!(pending.len(), 2, "one pending version per credential");
+    let batch = &pending[&7];
+    assert_eq!(batch.credential_version, 1024);
+    assert_eq!(batch.observations.len(), 1);
+    assert_eq!(batch.observations["window"].sample.received_at_ms, 1024);
+    assert_eq!(batch.entries.len(), 1);
+    assert_eq!(
+        batch.entries[&("current".into(), "shared".into())].observed_at_ms,
+        1024
+    );
+    assert_eq!(pending[&8].credential_version, 1);
 }
 
 #[tokio::test]

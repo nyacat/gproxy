@@ -1,4 +1,5 @@
 mod map;
+pub(super) mod pages;
 pub(super) mod records;
 
 use std::collections::BTreeMap;
@@ -297,17 +298,7 @@ async fn read_cycles(
                 })
                 .collect::<Vec<_>>();
             if usage_disabled {
-                for cycle in &mut values {
-                    cycle.metrics = serde_json::json!({});
-                    cycle.models.clear();
-                    cycle.estimate = Some(crate::dto::CycleEstimateDto {
-                        tokens: None,
-                        cost: None,
-                        from_ms: None,
-                        to_ms: None,
-                        reason: Some("usage_disabled".into()),
-                    });
-                }
+                map::hide_local_usage(&mut values);
             }
             response::json(StatusCode::OK, &values)
         }

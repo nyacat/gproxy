@@ -1,4 +1,4 @@
-use gproxy_core::{ControlPlane, RoutingMode};
+use gproxy_core::{ControlPlane, CredentialId, CredentialStore, RoutingMode};
 use tokio::sync::oneshot;
 
 pub(super) struct Pause {
@@ -42,4 +42,119 @@ async fn an_older_reload_cannot_overwrite_a_completed_mutation() {
         .resolve(Some("new-exact-route"), &RoutingMode::Aggregated, None)
         .unwrap();
     assert_eq!(plan.targets[0].upstream_model, "upstream-model");
+}
+
+#[tokio::test]
+async fn credential_load_rechecks_a_read_that_finished_after_reload() {
+    let fixture = crate::tests::setup::fixture().await;
+    fixture.app.shutdown();
+    fixture.app.drain_background().await;
+    let host = &fixture.app.inner.host;
+    let control = &host.services.control;
+    let id = CredentialId(fixture.credential);
+    let old_version = host
+        .services
+        .store
+        .credential(id.0)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    let (read, read_done) = oneshot::channel();
+    let (resume, resumed) = oneshot::channel();
+    *control.credential_read_pause.lock().unwrap() = Some(Pause {
+        read,
+        resume: resumed,
+    });
+    let reading_host = host.clone();
+    let loading = tokio::spawn(async move { reading_host.load(id).await });
+    read_done.await.unwrap();
+    let replacement = serde_json::json!({"api_key": "replacement"});
+    let envelope = host.services.cipher.seal(&replacement).unwrap();
+    host.services
+        .store
+        .persist_credential_rotation(id.0, &envelope, old_version)
+        .await
+        .unwrap();
+    control.reload().await.unwrap();
+    resume.send(()).unwrap();
+    let record = loading.await.unwrap().unwrap();
+    assert_eq!(record.version, old_version + 1);
+    assert_eq!(record.secret, replacement);
+    assert_eq!(host.load(id).await.unwrap().secret, replacement);
+}
+
+#[tokio::test]
+async fn cancelled_rotation_invalidates_a_concurrent_old_cache_fill() {
+    let fixture = crate::tests::setup::fixture().await;
+    fixture.app.shutdown();
+    fixture.app.drain_background().await;
+    let host = &fixture.app.inner.host;
+    let control = &host.services.control;
+    let id = CredentialId(fixture.credential);
+    let original = host.load(id).await.unwrap();
+    let invalidation = crate::invalidation::current(&host.services.cache)
+        .await
+        .unwrap();
+    let replacement = serde_json::json!({"api_key": "rotated"});
+    let (read, read_done) = oneshot::channel();
+    let (resume, resumed) = oneshot::channel();
+    *control.credential_rotation_pause.lock().unwrap() = Some(Pause {
+        read,
+        resume: resumed,
+    });
+    let rotating_host = host.clone();
+    let secret = replacement.clone();
+    let rotating = tokio::spawn(async move {
+        rotating_host
+            .persist_rotation(id, secret, original.version)
+            .await
+    });
+    read_done.await.unwrap();
+    assert_eq!(host.load(id).await.unwrap().version, original.version);
+    rotating.abort();
+    assert!(rotating.await.unwrap_err().is_cancelled());
+    resume.send(()).unwrap();
+    fixture.app.drain_background().await;
+    let record = host.load(id).await.unwrap();
+    assert_eq!(record.version, original.version + 1);
+    assert_eq!(record.secret, replacement);
+    assert_eq!(control.known_credential_version(id.0), Some(record.version));
+    assert!(
+        crate::invalidation::current(&host.services.cache)
+            .await
+            .unwrap()
+            > invalidation
+    );
+}
+
+#[tokio::test]
+async fn authoritative_credential_load_observes_peer_rotation_and_revocation_without_polling() {
+    let fixture = crate::tests::setup::fixture().await;
+    fixture.app.shutdown();
+    fixture.app.drain_background().await;
+    let host = &fixture.app.inner.host;
+    let id = CredentialId(fixture.credential);
+    let cached = host.load(id).await.unwrap();
+    // A different instance can update the shared database while this one has
+    // no invalidation poll (as on Edge during an active refresh wait).
+    let replacement = serde_json::json!({"api_key": "peer-token"});
+    let envelope = host.services.cipher.seal(&replacement).unwrap();
+    host.services
+        .store
+        .persist_credential_rotation(id.0, &envelope, cached.version)
+        .await
+        .unwrap();
+    assert_eq!(host.load(id).await.unwrap().version, cached.version);
+    let current = host.load_current(id).await.unwrap();
+    assert_eq!(current.version, cached.version + 1);
+    assert_eq!(current.secret, replacement);
+    assert_eq!(host.load(id).await.unwrap().secret, replacement);
+    assert_eq!(
+        host.services.control.known_credential_version(id.0),
+        Some(current.version)
+    );
+    host.services.store.delete_credential(id.0).await.unwrap();
+    assert!(host.load_current(id).await.is_err());
+    assert!(host.load(id).await.is_err());
 }

@@ -3,7 +3,7 @@ use crate::schema::{Dialect, SchemaVersion};
 
 // Historical self DDL is deliberately frozen here. The same version number
 // represented different migrations in upstream and self installations.
-const SELF_INDEX: &[&str] = &[
+pub(super) const SELF_INDEX: &[&str] = &[
     "ALTER TABLE credential_quota_cycles ADD COLUMN needs_rebuild INTEGER NOT NULL DEFAULT 0",
     "CREATE INDEX ix_credential_quota_cycles_rebuild ON credential_quota_cycles(needs_rebuild,id)",
     "CREATE INDEX ix_credential_quota_cycles_credential_rebuild ON credential_quota_cycles(credential_id,needs_rebuild,id)",
@@ -196,7 +196,7 @@ async fn verify_activity(executor: &dyn Executor, old_lifecycle: bool) {
             .iter()
             .map(|row| row.i64("version").unwrap())
             .collect::<Vec<_>>(),
-        (1..=13).collect::<Vec<_>>()
+        (1..=SchemaVersion::LATEST.number()).collect::<Vec<_>>()
     );
     // Both upstream snapshot tables are required regardless of the old lineage.
     execute(
@@ -369,4 +369,6 @@ async fn partially_completed_upstream_reconciliation_preserves_existing_snapshot
         }
     }
 }
+mod history_index;
+mod interruption;
 mod postgres;

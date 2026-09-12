@@ -19,6 +19,31 @@ pub struct CredentialQuotaCycleQuery {
     pub history: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialQuotaCycleCursor {
+    pub last_observed_at: i64,
+    pub id: i64,
+}
+
+/// A page of cycle summaries. Historical observations and estimates are read
+/// separately after a caller selects a cycle.
+#[derive(Debug, Clone)]
+pub struct CredentialQuotaCyclePageQuery {
+    pub from: i64,
+    pub to: i64,
+    pub credential_id: Option<i64>,
+    pub provider_id: Option<i64>,
+    pub window_key: Option<String>,
+    pub cursor: Option<CredentialQuotaCycleCursor>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct CredentialQuotaCyclePage {
+    pub items: Vec<CredentialQuotaCycleRecord>,
+    pub next_cursor: Option<CredentialQuotaCycleCursor>,
+}
+
 /// Additive options for bounded console reads. The legacy query keeps its
 /// full-cycle history semantics when these options are omitted.
 #[derive(Debug, Clone, Default)]

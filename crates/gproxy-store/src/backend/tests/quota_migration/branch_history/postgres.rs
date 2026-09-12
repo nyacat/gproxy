@@ -109,3 +109,13 @@ async fn postgres_main_v10_upgrade_preserves_snapshots() {
         assert_eq!(entries[0].text("entry_json").unwrap(), "{\"keep\":2}");
     }
 }
+
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via GPROXY_TEST_POSTGRES_DSN"]
+async fn postgres_v13_history_index_upgrade_retries_partial_ddl() {
+    let executor = executor().await;
+    // The first two indexes were committed, while the remaining indexes and version
+    // marker have not yet committed. Both the partial and repeated runs retain
+    // the old replay payloads and attempt identities.
+    super::history_index::upgrade(executor.as_ref(), Dialect::Postgres, 2).await;
+}

@@ -35,7 +35,14 @@ impl Store {
                 .quota_window(window_id)
                 .await?
                 .ok_or(StoreError::QuotaWindowMissing(window_id))?;
-            let cost_used = existing.cost_used + delta;
+            let cost_used =
+                existing
+                    .cost_used
+                    .checked_add(delta)
+                    .ok_or_else(|| StoreError::InvalidData {
+                        field: "cost_used",
+                        message: "quota cost exceeds Decimal range".into(),
+                    })?;
             let result = self
                 .backend()
                 .batch(vec![

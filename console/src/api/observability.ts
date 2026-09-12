@@ -2,6 +2,8 @@ import type { AuditEventDto } from "@/generated/AuditEventDto"
 import type { ChannelDto } from "@/generated/ChannelDto"
 import type { CredentialQuotaCycleDto } from "@/generated/CredentialQuotaCycleDto"
 import type { CredentialCycleReadRequest } from "@/generated/CredentialCycleReadRequest"
+import type { CredentialCyclePageRequest } from "@/generated/CredentialCyclePageRequest"
+import type { CredentialCyclePageDto } from "@/generated/CredentialCyclePageDto"
 import type { QuotaWindowDto } from "@/generated/QuotaWindowDto"
 import type { TlsPresetDto } from "@/generated/TlsPresetDto"
 import type { UsageQueryDto } from "@/generated/UsageQueryDto"
@@ -47,6 +49,9 @@ export const credentialCycles = (from: number, to: number, credentialId?: number
     { signal: options.signal },
   )
 export type CycleRead = Pick<CredentialCycleReadRequest, "from" | "to"> & Partial<CredentialCycleReadRequest>
+export type CyclePageRead = Pick<CredentialCyclePageRequest, "from" | "to"> & Partial<CredentialCyclePageRequest>
+export const credentialCyclePage = (request: CyclePageRead, signal?: AbortSignal) =>
+  api<CredentialCyclePageDto>("/admin/api/credential-cycles/page", { ...json("POST", request), signal })
 export const queryCredentialCycles = (request: CycleRead, signal?: AbortSignal, view: "overview" | "providers" | "quota-history" | "quota-details" = "quota-history") =>
   api<Array<CredentialQuotaCycleDto>>("/admin/api/credential-cycles/query", {
     ...json("POST", request), signal,

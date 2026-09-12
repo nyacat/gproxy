@@ -139,11 +139,18 @@ async fn seed_legacy_schema(executor: &dyn Executor, dialect: Dialect, progress:
     crate::migration::migrate_to(executor, dialect, SchemaVersion::OwnedRows)
         .await
         .unwrap();
-    let mut statements =
-        crate::schema::migration_statements(SchemaVersion::QuotaRebuildIndex, dialect)
-            .into_iter()
-            .map(Statement::plain)
-            .collect::<Vec<_>>();
+    // Version 8 belonged to a released self schema. Keep that DDL frozen,
+    // rather than recreating it from today's canonical rebuild migration.
+    let mut statements = branch_history::SELF_INDEX
+        .iter()
+        .map(|sql| {
+            Statement::plain(if dialect == Dialect::Postgres {
+                sql.replace(" INTEGER", " BIGINT")
+            } else {
+                (*sql).to_owned()
+            })
+        })
+        .collect::<Vec<_>>();
     statements.extend([
         Statement::plain("INSERT INTO schema_migrations(version,applied_at) VALUES(8,0)"),
         Statement::plain("INSERT INTO permissions(subject_kind,subject_id,allowed) VALUES('user',1,1)"),

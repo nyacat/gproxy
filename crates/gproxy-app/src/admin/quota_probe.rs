@@ -6,7 +6,7 @@ use gproxy_admin::{
     dto::{QuotaProbeResponse, QuotaProbeWindowDto, QuotaResetCreditsDto},
 };
 use gproxy_channel_api::{QuotaQueryMode, QuotaSnapshot, QuotaSupport, QuotaValue};
-use gproxy_core::{CacheBackend, Host};
+use gproxy_core::Host;
 use std::time::Duration;
 
 pub(crate) async fn run(
@@ -49,32 +49,22 @@ async fn refresh(
     automatic: bool,
 ) -> Result<String, AdminError> {
     let (provider, version, sources) = super::quota_snapshot::sources(app, id).await?;
-    let cache = &app.inner.host.services.cache;
     let lease_key = format!("quota:probe:{id}:lease");
     let mut owner = vec![0; 16];
     getrandom::fill(&mut owner).map_err(internal)?;
-    let mut acquired = false;
+    let mut acquired = None;
     for _ in 0..240 {
-        if cache
-            .compare_and_swap(
-                &lease_key,
-                None,
-                Some(owner.clone()),
-                Some(Duration::from_secs(300)),
-            )
-            .await
-            .map_err(internal)?
+        if let Some(guard) =
+            lease::Guard::try_acquire(app, lease_key.clone(), &owner, Duration::from_secs(300))
+                .await?
         {
-            acquired = true;
+            acquired = Some(guard);
             break;
         }
         app.inner.host.wait(Duration::from_millis(500)).await;
     }
-    if !acquired {
-        return Err(AdminError::Conflict(
-            "quota refresh is still running".into(),
-        ));
-    }
+    let guard =
+        acquired.ok_or_else(|| AdminError::Conflict("quota refresh is still running".into()))?;
     let result = async {
         let saved = app
             .inner
@@ -109,10 +99,7 @@ async fn refresh(
         Ok(raw)
     }
     .await;
-    cache
-        .compare_and_swap(&lease_key, Some(owner), None, None)
-        .await
-        .map_err(internal)?;
+    guard.release().await?;
     result
 }
 

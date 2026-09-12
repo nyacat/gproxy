@@ -13,7 +13,7 @@ impl Codec {
         let kind = value
             .get("type")
             .and_then(Value::as_str)
-            .expect("type-less events are routed to the legacy decoder")
+            .ok_or_else(|| ChannelError::Decode("ClaudeWeb event type must be a string".into()))?
             .to_owned();
         let index = value.get("index").and_then(Value::as_u64);
         if kind == "content_block_start" {
@@ -32,7 +32,10 @@ impl Codec {
                 _ => {}
             }
         }
-        if self.skipped_result == index {
+        if self
+            .skipped_result
+            .is_some_and(|result| Some(result) == index)
+        {
             if kind == "content_block_stop" {
                 self.skipped_result = None;
             }

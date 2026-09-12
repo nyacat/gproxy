@@ -1,11 +1,56 @@
 use rust_decimal::Decimal;
 
-use super::{boundary, row};
+use super::{boundary, metrics, row};
 use crate::query::runtime;
-use crate::records::{CredentialQuotaCycleRecord, CredentialQuotaPressure};
+use crate::records::{
+    CredentialQuotaCycleCursor, CredentialQuotaCyclePage, CredentialQuotaCyclePageQuery,
+    CredentialQuotaCycleRecord, CredentialQuotaPressure,
+};
 use crate::{Store, StoreError};
 
 impl Store {
+    pub async fn credential_quota_cycle_page(
+        &self,
+        query: &CredentialQuotaCyclePageQuery,
+    ) -> Result<CredentialQuotaCyclePage, StoreError> {
+        if !(1..=100).contains(&query.limit) {
+            return Err(StoreError::InvalidData {
+                field: "limit",
+                message: "quota cycle page limit must be between 1 and 100".into(),
+            });
+        }
+        if query.from >= query.to {
+            return Ok(CredentialQuotaCyclePage {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let limit = query.limit;
+        let mut rows = self
+            .backend()
+            .execute(runtime::select_credential_quota_cycle_page(query, limit)?)
+            .await?
+            .rows;
+        let has_more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
+        let mut items = rows
+            .into_iter()
+            .map(row::parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        for item in &mut items {
+            metrics::hydrate(item, false, &[]);
+        }
+        let next_cursor = if has_more {
+            items.last().map(|cycle| CredentialQuotaCycleCursor {
+                last_observed_at: cycle.last_observed_at,
+                id: cycle.id,
+            })
+        } else {
+            None
+        };
+        Ok(CredentialQuotaCyclePage { items, next_cursor })
+    }
+
     pub async fn credential_quota_window_states(
         &self,
         credential: Option<i64>,

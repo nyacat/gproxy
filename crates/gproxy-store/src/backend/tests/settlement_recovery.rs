@@ -37,15 +37,16 @@ async fn postgres_settlement_replay_migration_progress_completion_and_pagination
     }
 
     {
-        // Opening an existing v10 database must install the v11 table, default
+        // Opening an existing v11 database must install the v12 table, default
         // pending state, and pending index before any recovery write is issued.
         let store = crate::Store::open(config.clone()).await.unwrap();
         assert_eq!(
             store
                 .backend()
-                .execute(Statement::plain(
-                    "SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 11",
-                ))
+                .execute(Statement::plain(format!(
+                    "SELECT COUNT(*) AS count FROM schema_migrations WHERE version = {}",
+                    SchemaVersion::SettlementRecovery.number(),
+                )))
                 .await
                 .unwrap()
                 .rows[0]

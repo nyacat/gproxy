@@ -45,7 +45,7 @@ pub use envelope::{
     BufferedResponse, ResponseCollector, ResponseStream, SseDecoder, SseFrame, synthesize_error,
     synthesize_keepalive, synthesize_response,
 };
-pub use error::TransformError;
+pub use error::{StreamTransformError, TransformError};
 pub use gproxy_protocol as protocol;
 
 pub fn can_transform(source: OperationKey, target: OperationKey) -> bool {

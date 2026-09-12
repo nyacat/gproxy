@@ -20,10 +20,11 @@ pub enum SchemaVersion {
     QuotaRebuildIndex = 11,
     SettlementRecovery = 12,
     QuotaActivityLifecycle = 13,
+    QuotaHistoryIndex = 14,
 }
 
 impl SchemaVersion {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Initial,
         Self::QuotaObservations,
         Self::ModelMetadata,
@@ -37,8 +38,9 @@ impl SchemaVersion {
         Self::QuotaRebuildIndex,
         Self::SettlementRecovery,
         Self::QuotaActivityLifecycle,
+        Self::QuotaHistoryIndex,
     ];
-    pub const LATEST: Self = Self::QuotaActivityLifecycle;
+    pub const LATEST: Self = Self::QuotaHistoryIndex;
 
     pub const fn number(self) -> i64 {
         self as i64

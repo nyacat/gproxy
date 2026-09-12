@@ -228,6 +228,72 @@ fn modern_web_stream_without_message_start_gets_a_canonical_start() {
 }
 
 #[test]
+fn modern_web_stream_preserves_message_identity_and_terminal_reason() {
+    let mut codec = Codec::new(
+        SessionState {
+            conversation: "conversation-1".into(),
+            model: "claude-opus-4-8".into(),
+            message_id: "msg-fallback".into(),
+            input_tokens: 8,
+        },
+        false,
+    );
+    let mut output = codec
+        .push(Bytes::from_static(
+            b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-upstream\",\"content\":[]}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":2}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+        ))
+        .unwrap()
+        .frames;
+    output.extend(
+        codec
+            .finish(gproxy_channel_api::StreamEnd::Complete)
+            .unwrap(),
+    );
+    let events = output
+        .iter()
+        .flat_map(|frame| std::str::from_utf8(&frame.0).unwrap().lines())
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str::<Value>(data).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events[0]["message"]["id"], "msg-upstream");
+    assert_eq!(events[0]["message"]["usage"]["input_tokens"], 8);
+    assert_eq!(events[2]["delta"]["stop_reason"], "max_tokens");
+    assert_eq!(events[2]["usage"]["output_tokens"], 2);
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[3]["type"], "message_stop");
+}
+
+#[test]
+fn malformed_web_event_type_returns_an_error_after_the_completed_prefix() {
+    for invalid_type in [Value::Null, json!(42), json!({"type":"nested"})] {
+        let mut codec = Codec::new(
+            SessionState {
+                conversation: "conversation-1".into(),
+                model: "claude-opus-4-8".into(),
+                message_id: "msg-fallback".into(),
+                input_tokens: 8,
+            },
+            false,
+        );
+        let wire = format!(
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"text\":\"visible\"}}}}\n\ndata: {}\n\n",
+            json!({"type":invalid_type})
+        );
+        let error = codec
+            .push(Bytes::from(wire))
+            .err()
+            .expect("invalid event type");
+        assert!(error.to_string().contains("event type must be a string"));
+        assert!(
+            error
+                .frames
+                .iter()
+                .any(|frame| { std::str::from_utf8(&frame.0).unwrap().contains("visible") })
+        );
+    }
+}
+
+#[test]
 fn web_codec_keeps_completed_frames_when_a_later_event_is_malformed() {
     let codec = || {
         Codec::new(

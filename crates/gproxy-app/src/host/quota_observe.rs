@@ -10,12 +10,13 @@ use super::AppHost;
 
 #[derive(Default)]
 pub(crate) struct QuotaObserveQueue {
-    latest: Mutex<HashMap<(i64, u64), QuotaBatch>>,
+    latest: Mutex<HashMap<i64, QuotaBatch>>,
     inflight: AtomicBool,
 }
 
 #[derive(Default)]
 struct QuotaBatch {
+    credential_version: u64,
     observations: HashMap<String, CredentialQuotaObservation>,
     entries: HashMap<(String, String), QuotaEntry>,
 }
@@ -23,9 +24,11 @@ struct QuotaBatch {
 impl QuotaObserveQueue {
     fn push(&self, credential_version: u64, observation: CredentialQuotaObservation) {
         let mut pending = self.latest.lock().expect("quota observe queue");
-        let batch = pending
-            .entry((observation.credential_id, credential_version))
-            .or_default();
+        let Some(batch) =
+            batch_for_version(&mut pending, observation.credential_id, credential_version)
+        else {
+            return;
+        };
         if batch
             .observations
             .get(&observation.window_key)
@@ -42,9 +45,9 @@ impl QuotaObserveQueue {
             return;
         }
         let mut pending = self.latest.lock().expect("quota observe queue");
-        let batch = pending
-            .entry((credential_id, credential_version))
-            .or_default();
+        let Some(batch) = batch_for_version(&mut pending, credential_id, credential_version) else {
+            return;
+        };
         for entry in entries {
             let key = (entry.source_id.clone(), entry.id.clone());
             if batch
@@ -57,13 +60,37 @@ impl QuotaObserveQueue {
         }
     }
 
-    fn take(&self) -> HashMap<(i64, u64), QuotaBatch> {
+    fn take(&self) -> HashMap<i64, QuotaBatch> {
         std::mem::take(&mut *self.latest.lock().expect("quota observe queue"))
     }
 
     fn is_empty(&self) -> bool {
         self.latest.lock().expect("quota observe queue").is_empty()
     }
+}
+
+fn batch_for_version(
+    pending: &mut HashMap<i64, QuotaBatch>,
+    credential_id: i64,
+    credential_version: u64,
+) -> Option<&mut QuotaBatch> {
+    let batch = pending.entry(credential_id).or_insert_with(|| QuotaBatch {
+        credential_version,
+        ..Default::default()
+    });
+    // A newer credential invalidates all older readings. Keep only its batch
+    // while storage is busy, rather than retaining one map per past rotation.
+    // A late response from an older version cannot repopulate that backlog.
+    if credential_version < batch.credential_version {
+        return None;
+    }
+    if credential_version > batch.credential_version {
+        *batch = QuotaBatch {
+            credential_version,
+            ..Default::default()
+        };
+    }
+    Some(batch)
 }
 
 pub(super) fn enqueue(
@@ -134,8 +161,8 @@ async fn drain(host: AppHost) {
             }
             continue;
         }
-        for ((credential_id, credential_version), batch) in pending {
-            persist(&host, credential_id, credential_version, batch).await;
+        for (credential_id, batch) in pending {
+            persist(&host, credential_id, batch.credential_version, batch).await;
         }
     }
 }

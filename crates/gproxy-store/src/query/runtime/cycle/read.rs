@@ -96,6 +96,63 @@ pub(crate) fn select_credential_quota_cycle_history_limited(
 const CYCLES_PER_WINDOW: u64 = 100;
 const CYCLE_ROWS: u64 = 5_000;
 
+pub(crate) fn select_credential_quota_cycle_page(
+    filter: &crate::records::CredentialQuotaCyclePageQuery,
+    limit: u32,
+) -> Result<Statement, StoreError> {
+    // Page over narrow keys before reading tracking and metrics JSON. The
+    // cursor uses the whole ordering key so equal receipt times cannot skip
+    // cycles, and does not impose the legacy per-window history cap.
+    let mut ids = Query::select();
+    ids.columns(["id", "last_observed_at"].map(Alias::new))
+        .from(Alias::new("credential_quota_cycles"))
+        .and_where(Expr::col(Alias::new("last_observed_at")).gte(filter.from))
+        .and_where(Expr::col(Alias::new("accounting_start_ms")).lt(filter.to.saturating_mul(1_000)))
+        .order_by(Alias::new("last_observed_at"), Order::Desc)
+        .order_by(Alias::new("id"), Order::Desc)
+        .limit(u64::from(limit) + 1);
+    if let Some(credential_id) = filter.credential_id {
+        ids.and_where(Expr::col(Alias::new("credential_id")).eq(credential_id));
+    }
+    if let Some(provider_id) = filter.provider_id {
+        let mut credentials = Query::select();
+        credentials
+            .column(Alias::new("id"))
+            .from(Alias::new("credentials"))
+            .and_where(Expr::col(Alias::new("provider_id")).eq(provider_id));
+        ids.and_where(Expr::col(Alias::new("credential_id")).in_subquery(credentials));
+    }
+    if let Some(window_key) = &filter.window_key {
+        ids.and_where(Expr::col(Alias::new("window_key")).eq(window_key));
+    }
+    if let Some(cursor) = filter.cursor {
+        ids.and_where(
+            Expr::tuple(["last_observed_at", "id"].map(|column| Expr::col(Alias::new(column)))).lt(
+                Expr::tuple([Expr::val(cursor.last_observed_at), Expr::val(cursor.id)]),
+            ),
+        );
+    }
+    let mut query = Query::select();
+    query
+        .from_subquery(ids, Alias::new("page"))
+        .inner_join(
+            Alias::new("credential_quota_cycles"),
+            Expr::col((Alias::new("credential_quota_cycles"), Alias::new("id")))
+                .equals((Alias::new("page"), Alias::new("id"))),
+        )
+        .columns(
+            COLUMNS
+                .iter()
+                .map(|column| (Alias::new("credential_quota_cycles"), Alias::new(*column))),
+        )
+        .order_by(
+            (Alias::new("page"), Alias::new("last_observed_at")),
+            Order::Desc,
+        )
+        .order_by((Alias::new("page"), Alias::new("id")), Order::Desc);
+    Statement::query(&query)
+}
+
 pub(crate) fn select_credential_quota_cycles(
     credential_id: Option<i64>,
     from: i64,

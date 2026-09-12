@@ -3,7 +3,7 @@ use gproxy_protocol::StreamFraming;
 
 use super::super::json_array::{JsonArrayDecoder, JsonArrayEncoder};
 use super::super::{SseDecoder, SseFrame};
-use crate::TransformError;
+use crate::{StreamTransformError, TransformError};
 
 pub(super) enum FrameDecoder {
     Sse(SseDecoder),
@@ -31,14 +31,17 @@ impl FrameDecoder {
         }
     }
 
-    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, TransformError> {
+    pub(super) fn push(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<SseFrame>, StreamTransformError<SseFrame>> {
         match self {
             Self::Sse(decoder) => decoder.push(chunk),
             Self::JsonArray(decoder) => decoder.push(chunk),
         }
     }
 
-    pub(super) fn finish(&mut self) -> Result<Vec<SseFrame>, TransformError> {
+    pub(super) fn finish(&mut self) -> Result<Vec<SseFrame>, StreamTransformError<SseFrame>> {
         match self {
             Self::Sse(decoder) => Ok(decoder.finish()?.into_iter().collect()),
             Self::JsonArray(decoder) => decoder.finish(),
@@ -62,7 +65,7 @@ impl FrameEncoder {
         }
     }
 
-    pub(super) fn push(&mut self, chunks: Vec<Bytes>) -> Result<Vec<Bytes>, TransformError> {
+    pub(super) fn push(&mut self, chunks: Vec<Bytes>) -> Result<Vec<Bytes>, StreamTransformError> {
         match self {
             Self::Sse => Ok(chunks),
             Self::JsonArray {
@@ -72,8 +75,23 @@ impl FrameEncoder {
             } => {
                 let mut output = Vec::new();
                 for chunk in chunks {
-                    for frame in decoder.push(&chunk)? {
-                        encode_array_frame(encoder, done, frame, &mut output)?;
+                    let (frames, failure) = match decoder.push(&chunk) {
+                        Ok(frames) => (frames, None),
+                        Err(error) => (error.frames, Some(error.error)),
+                    };
+                    for frame in frames {
+                        if let Err(error) = encode_array_frame(encoder, done, frame, &mut output) {
+                            return Err(StreamTransformError {
+                                error,
+                                frames: output,
+                            });
+                        }
+                    }
+                    if let Some(error) = failure {
+                        return Err(StreamTransformError {
+                            error,
+                            frames: output,
+                        });
                     }
                 }
                 Ok(output)
@@ -81,7 +99,7 @@ impl FrameEncoder {
         }
     }
 
-    pub(super) fn finish(&mut self) -> Result<Vec<Bytes>, TransformError> {
+    pub(super) fn finish(&mut self) -> Result<Vec<Bytes>, StreamTransformError> {
         match self {
             Self::Sse => Ok(Vec::new()),
             Self::JsonArray {
@@ -90,10 +108,23 @@ impl FrameEncoder {
                 done,
             } => {
                 let mut output = Vec::new();
-                if let Some(frame) = decoder.finish()? {
-                    encode_array_frame(encoder, done, frame, &mut output)?;
+                if let Some(frame) = decoder.finish()?
+                    && let Err(error) = encode_array_frame(encoder, done, frame, &mut output)
+                {
+                    return Err(StreamTransformError {
+                        error,
+                        frames: output,
+                    });
                 }
-                output.push(encoder.finish()?);
+                match encoder.finish() {
+                    Ok(frame) => output.push(frame),
+                    Err(error) => {
+                        return Err(StreamTransformError {
+                            error,
+                            frames: output,
+                        });
+                    }
+                }
                 Ok(output)
             }
         }

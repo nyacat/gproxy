@@ -11,6 +11,8 @@ class GproxyDownstreamSocket {
     this.sequence = Promise.resolve();
     if ("binaryType" in socket) socket.binaryType = "arraybuffer";
     socket.addEventListener("message", (event) => {
+      // A failed Blob read must reach the Rust pump and leave the sequence
+      // fulfilled, so later close events can still release the socket.
       this.sequence = this.sequence.then(async () => {
         if (typeof event.data === "string") this.push(["text", event.data]);
         else if (event.data instanceof ArrayBuffer) {
@@ -22,7 +24,7 @@ class GproxyDownstreamSocket {
         } else if (typeof event.data?.arrayBuffer === "function") {
           this.push(["binary", new Uint8Array(await event.data.arrayBuffer())]);
         } else this.push(["error", null]);
-      });
+      }).catch(() => this.push(["error", null]));
     });
     socket.addEventListener("error", () => {
       this.sequence = this.sequence.then(() => this.push(["error", null]));

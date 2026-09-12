@@ -202,6 +202,179 @@ async fn cycle_statistics_share_reads_and_handle_equal_timestamp_page_boundaries
 }
 
 #[tokio::test]
+async fn quota_estimates_normalize_legacy_usage_metrics_and_dimensions() {
+    use sea_query::{Alias, Expr, ExprTrait, Query};
+    use serde_json::json;
+
+    for remote in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-estimate.db");
+        let (store, _) = if remote {
+            super::libsql_store(path).await.unwrap()
+        } else {
+            super::native_store(path).await.unwrap()
+        };
+        seed(&store, 1, 1).await;
+        for (legacy_dimensions, dimensions, incomplete) in [
+            (
+                json!({"quota_attribution": "session"}),
+                json!({"quota_attribution": "request"}),
+                false,
+            ),
+            (json!({"quota_attribution": "session"}), json!({}), true),
+            (json!({"usage_incomplete": "true"}), json!({}), true),
+        ] {
+            let metrics = json!({
+                "quantities": {"cache_creation_5m_tokens": "999"},
+                "cache_creation_5m_tokens": "3",
+                "dimensions": legacy_dimensions,
+            });
+            store
+                .backend()
+                .execute(
+                    Statement::query(
+                        Query::update()
+                            .table(Alias::new("usage_rows"))
+                            .value(Alias::new("metrics_json"), metrics.to_string())
+                            .value(Alias::new("dimensions_json"), dimensions.to_string())
+                            .and_where(Expr::col(Alias::new("request_id")).eq("quota-read-1")),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let detail = store
+                .usage_by_request("quota-read-1")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(detail.usage.metrics["cache_creation_5m_tokens"], "3");
+            for history in [false, true] {
+                let values = store
+                    .credential_quota_statistics(&CredentialQuotaCycleQuery {
+                        credential_id: Some(1),
+                        provider_id: None,
+                        from: 0,
+                        to: 1_000,
+                        calculate: true,
+                        history,
+                    })
+                    .await
+                    .expect("quota estimates must accept the same legacy rows as usage details");
+                let estimate = values[0].cycle.estimate.as_ref().unwrap();
+                if incomplete {
+                    assert_eq!(estimate.reason.as_deref(), Some("incomplete_usage"));
+                    assert_eq!(estimate.tokens, None);
+                } else {
+                    assert_eq!(estimate.reason, None);
+                    assert_eq!(estimate.tokens, Some(200.into()));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn cycle_estimation_and_attribution_handle_decimal_overflow_without_partial_writes() {
+    use rust_decimal::Decimal;
+    use sea_query::{Alias, Expr, ExprTrait, Query};
+    use serde_json::json;
+
+    for remote in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cycle-overflow.db");
+        let (store, _) = if remote {
+            super::libsql_store(path).await.unwrap()
+        } else {
+            super::native_store(path).await.unwrap()
+        };
+        seed(&store, 1, 1).await;
+        store
+            .backend()
+            .execute(
+                Statement::query(
+                    Query::update()
+                        .table(Alias::new("usage_rows"))
+                        .value(Alias::new("cost"), Decimal::MAX.to_string())
+                        .and_where(Expr::col(Alias::new("request_id")).eq("quota-read-1")),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let values = store
+            .credential_quota_statistics(&CredentialQuotaCycleQuery {
+                credential_id: Some(1),
+                provider_id: None,
+                from: 0,
+                to: 1_000,
+                calculate: true,
+                history: true,
+            })
+            .await
+            .unwrap();
+        let estimate = values[0].cycle.estimate.as_ref().unwrap();
+        assert_eq!(estimate.reason.as_deref(), Some("estimate_overflow"));
+        assert_eq!(estimate.cost, None);
+
+        // The usage is durable already. Rebuilding the cycle can accumulate
+        // MAX once, but attributing another cost unit must not panic or add a
+        // link without its corresponding metric update.
+        store.repair_credential_quota(1, 501).await.unwrap();
+        let cycle_id = values[0].cycle.id;
+        let before = store
+            .backend()
+            .execute(crate::query::runtime::read_credential_quota_cycle(cycle_id).unwrap())
+            .await
+            .unwrap()
+            .rows
+            .pop()
+            .unwrap();
+        let metrics: serde_json::Value =
+            serde_json::from_str(before.text("metrics_json").unwrap()).unwrap();
+        assert_eq!(metrics["cost"], json!(Decimal::MAX.to_string()));
+        let mut next = store
+            .usage_by_request("quota-read-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .usage;
+        next.request_id = "overflow-attribution".into();
+        next.cost = Decimal::ONE;
+        assert!(matches!(
+            store.record_usage(&next).await,
+            Err(StoreError::InvalidData {
+                field: "metrics",
+                ..
+            })
+        ));
+        let after = store
+            .backend()
+            .execute(crate::query::runtime::read_credential_quota_cycle(cycle_id).unwrap())
+            .await
+            .unwrap()
+            .rows
+            .pop()
+            .unwrap();
+        assert_eq!(after, before);
+        let usage = store
+            .usage_by_request(&next.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .backend()
+                .execute(crate::query::runtime::read_cycle_usage_link(cycle_id, usage.id).unwrap())
+                .await
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via GPROXY_TEST_POSTGRES_DSN"]
 async fn postgres_cycle_statistics_share_reads() -> Result<(), StoreError> {
     let store = Store::open(crate::BackendConfig::Postgres {

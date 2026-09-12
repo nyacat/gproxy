@@ -265,3 +265,104 @@ fn code_assist_keeps_canonical_prefix_and_tail_metadata_when_decoding_fails() {
         assert!(decoder.recover_tail().usage.is_none());
     }
 }
+
+#[test]
+fn gemini_keeps_valid_prefix_and_usage_before_later_invalid_events() {
+    let event = json!({
+        "candidates":[{"content":{"role":"model","parts":[{"text":"visible"}]}}],
+        "usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":2,"totalTokenCount":6}
+    });
+    for framing in [StreamFraming::Sse, StreamFraming::JsonArray] {
+        for invalid in [
+            "{",
+            r#"{"candidates":"invalid"}"#,
+            r#"{"candidates":[{"index":-1}],"usageMetadata":{"promptTokenCount":99,"candidatesTokenCount":99,"totalTokenCount":198}}"#,
+        ] {
+            let (prefix, wire) = match framing {
+                StreamFraming::Sse => {
+                    let prefix = format!("data: {event}\n\n");
+                    let wire = format!("{prefix}data: {invalid}\n\n");
+                    (prefix, wire)
+                }
+                StreamFraming::JsonArray => {
+                    let prefix = format!("[{event},");
+                    let wire = format!("{prefix}{invalid}]");
+                    (prefix, wire)
+                }
+                _ => unreachable!(),
+            };
+            for split in 0..=wire.len() {
+                let mut decoder = crate::AiStudioChannel
+                    .stream_decoder(StreamCtx {
+                        key: OperationKey::content(
+                            Operation::StreamGenerateContent,
+                            Kind::GeminiGenerateContent,
+                        ),
+                        framing,
+                        request_body: &Bytes::from_static(b"{}"),
+                        response_headers: &http::HeaderMap::new(),
+                    })
+                    .unwrap();
+                let mut delivered = Vec::new();
+                let mut failed = false;
+                for chunk in [&wire.as_bytes()[..split], &wire.as_bytes()[split..]] {
+                    let frames = match decoder.push(Bytes::copy_from_slice(chunk)) {
+                        Ok(frames) => frames,
+                        Err(error) => {
+                            failed = true;
+                            error.frames
+                        }
+                    };
+                    for frame in frames {
+                        delivered.extend_from_slice(&frame.0);
+                    }
+                    if failed {
+                        break;
+                    }
+                }
+                assert!(failed, "{framing:?} split={split} invalid={invalid}");
+                assert_eq!(delivered, prefix.as_bytes(), "{framing:?} split={split}");
+                let usage = decoder.recover_tail().usage.unwrap();
+                assert_eq!((usage.input_tokens, usage.output_tokens), (4, 2));
+                assert!(decoder.recover_tail().usage.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn gemini_retains_a_complete_final_event_when_eof_validation_fails() {
+    let event = json!({
+        "candidates":[{"content":{"role":"model","parts":[{"text":"tail"}]}}],
+        "usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}
+    });
+    for framing in [StreamFraming::Sse, StreamFraming::JsonArray] {
+        let wire = match framing {
+            StreamFraming::Sse => format!("data: {event}"),
+            StreamFraming::JsonArray => format!("[{event}"),
+            _ => unreachable!(),
+        };
+        let mut decoder = crate::AiStudioChannel
+            .stream_decoder(StreamCtx {
+                key: OperationKey::content(
+                    Operation::StreamGenerateContent,
+                    Kind::GeminiGenerateContent,
+                ),
+                framing,
+                request_body: &Bytes::from_static(b"{}"),
+                response_headers: &http::HeaderMap::new(),
+            })
+            .unwrap();
+        assert!(decoder.push(Bytes::from(wire.clone())).unwrap().is_empty());
+        let error = decoder.finish(StreamEnd::Complete).unwrap_err();
+        let output = error
+            .frames
+            .into_iter()
+            .flat_map(|frame| frame.0.to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(output, wire.as_bytes());
+        let usage = decoder.recover_tail().usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (5, 3));
+        assert!(decoder.recover_tail().usage.is_none());
+    }
+}

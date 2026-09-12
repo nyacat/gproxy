@@ -53,7 +53,16 @@ pub(super) async fn run(state: &impl State, body: &Bytes) -> Result<Response<Byt
                 secret: user_key_secrets.get(&value.id).cloned().map(Into::into),
             })
             .collect(),
-        quotas: snapshot.quotas.iter().map(identity::map::quota).collect(),
+        // Session keys are omitted from exports, so their dependent quotas
+        // must also be omitted to keep the exported reference graph valid.
+        quotas: snapshot
+            .quotas
+            .iter()
+            .filter(|quota| {
+                quota.subject_kind != "user_key" || !oauth_keys.contains(&quota.subject_id)
+            })
+            .map(identity::map::quota)
+            .collect(),
         price_rules: snapshot
             .price_rules
             .iter()

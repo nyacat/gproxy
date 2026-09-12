@@ -49,6 +49,16 @@ pub struct CredentialRecord {
 pub trait CredentialStore {
     fn load<'a>(&'a self, id: CredentialId) -> BoxFuture<'a, Result<CredentialRecord, StoreError>>;
 
+    /// Read the authoritative current row, bypassing any process-local
+    /// credential cache. Refresh waiters use this after another instance may
+    /// have rotated a token; the default keeps existing embedders compatible.
+    fn load_current<'a>(
+        &'a self,
+        id: CredentialId,
+    ) -> BoxFuture<'a, Result<CredentialRecord, StoreError>> {
+        self.load(id)
+    }
+
     /// Persist rotated secret material, atomically, guarded by `version`.
     /// Claude rotates the refresh token on every refresh: losing this write
     /// bricks the credential, which is why the method is not optional and

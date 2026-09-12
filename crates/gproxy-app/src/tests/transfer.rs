@@ -391,6 +391,107 @@ async fn import_checks_late_values_duplicate_ids_and_every_secret_before_writing
 }
 
 #[tokio::test]
+async fn import_checks_decrypted_credential_shape_before_writing() {
+    let (_source_directory, source) = transfer_app().await;
+    let (_destination_directory, destination) = transfer_app().await;
+    let mut request = transfer_export(&source).await;
+    request.export.data.credentials[0].secret = Some(
+        source
+            .inner
+            .host
+            .services
+            .cipher
+            .seal(&json!(["not a credential object"]))
+            .unwrap()
+            .into(),
+    );
+    assert_preflight_failure(&destination, &request).await;
+}
+
+#[tokio::test]
+async fn import_reseals_primary_and_quota_authorization_together() {
+    let (_source_directory, source) = transfer_app().await;
+    let (_destination_directory, destination) = transfer_app().await;
+    let provider_id = setup::id(
+        source
+            .mutate(crate::ControlMutation::Provider(
+                gproxy_store::records::ProviderInput {
+                    name: "quota-transfer-provider".into(),
+                    label: None,
+                    channel: "openrouter".into(),
+                    settings: json!({}),
+                    credential_strategy: "round_robin".into(),
+                    proxy_url: None,
+                    tls_fingerprint: None,
+                    enabled: true,
+                },
+            ))
+            .await
+            .unwrap(),
+    );
+    let response = source
+        .admin_dispatch(
+            &admin_parts(http::Method::POST, "/admin/api/credentials"),
+            Bytes::from(
+                json!({
+                    "provider_id": provider_id,
+                    "kind": "api_key",
+                    "secret": {"api_key": "primary-inference-key"},
+                    "quota_secret": {"quota_api_key": "management-query-key"},
+                    "enabled": true,
+                    "weight": 100
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        http::StatusCode::CREATED,
+        "{:?}",
+        response.body()
+    );
+    let request = exported_request(&source).await;
+    let response = import_request(&destination, &request).await;
+    assert_eq!(
+        response.status(),
+        http::StatusCode::OK,
+        "{:?}",
+        response.body()
+    );
+    let snapshot = destination
+        .inner
+        .host
+        .services
+        .store
+        .control_snapshot()
+        .await
+        .unwrap();
+    let credential = snapshot.credentials.first().unwrap();
+    let secret = gproxy_admin::State::reveal_credential_secret(&destination, credential.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        secret,
+        json!({
+            "api_key": "primary-inference-key",
+            "quota_api_key": "management-query-key",
+            "quota_channel": "openrouter"
+        })
+    );
+    let quota = gproxy_admin::State::credential_quota_snapshot(&destination, credential.id)
+        .await
+        .unwrap();
+    assert!(
+        quota
+            .sources
+            .iter()
+            .any(|source| { source.capability.support == gproxy_channel_api::QuotaSupport::Ready })
+    );
+}
+
+#[tokio::test]
 async fn import_default_rule_set_keeps_source_configuration_with_remapped_owner() {
     let (_source_directory, source) = transfer_app().await;
     let (_destination_directory, destination) = transfer_app().await;
@@ -530,6 +631,96 @@ async fn config_only_import_skips_omitted_secrets_and_their_quotas() {
     assert!(stored.credentials.is_empty());
     assert!(stored.quotas.is_empty());
     assert_eq!(stored.user_keys.len(), 1);
+}
+
+#[tokio::test]
+async fn export_omits_oauth_key_quotas_and_imports_persistent_key_quotas() {
+    let (_source_directory, source) = transfer_app().await;
+    let (_destination_directory, destination) = transfer_app().await;
+    transfer_export(&source).await;
+    let mut key_ids = Vec::new();
+    for label in ["session key", "persistent key"] {
+        let key_id = setup::id(
+            source
+                .mutate(crate::ControlMutation::UserKey {
+                    user_id: 1,
+                    api_key: setup::random_key(),
+                    label: Some(label.into()),
+                    expires_at: None,
+                    enabled: true,
+                })
+                .await
+                .unwrap(),
+        );
+        source
+            .inner
+            .host
+            .services
+            .store
+            .insert_quota(&gproxy_store::records::QuotaInput {
+                subject_kind: "user_key".into(),
+                subject_id: key_id,
+                quota_total: Some(rust_decimal::Decimal::ONE),
+                quota_daily: None,
+                quota_weekly: None,
+                quota_monthly: None,
+                quota_5h: None,
+                quota_7d: None,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        key_ids.push(key_id);
+    }
+    source
+        .inner
+        .host
+        .services
+        .store
+        .insert_oauth_grant(&gproxy_store::records::OAuthGrantInput {
+            user_id: 1,
+            user_key_id: key_ids[0],
+            provider_id: None,
+            client_id: gproxy_channel_api::CODEX_OAUTH_CLIENT_ID.into(),
+            scopes: "openid profile offline_access".into(),
+            chatgpt_user_id: "transfer-user".into(),
+            chatgpt_account_id: "transfer-account".into(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+
+    let request = exported_request(&source).await;
+    assert_eq!(
+        import_request(&destination, &request).await.status(),
+        http::StatusCode::OK,
+        "the server's own export must not reference omitted session keys"
+    );
+    assert!(
+        !request
+            .export
+            .data
+            .user_keys
+            .iter()
+            .any(|key| key.config.id == key_ids[0])
+    );
+    assert_eq!(request.export.data.quotas.len(), 1);
+    assert_eq!(request.export.data.quotas[0].subject_id, key_ids[1]);
+    let imported = destination
+        .inner
+        .host
+        .services
+        .store
+        .control_snapshot()
+        .await
+        .unwrap();
+    let key = imported
+        .user_keys
+        .iter()
+        .find(|key| key.label.as_deref() == Some("persistent key"))
+        .unwrap();
+    assert_eq!(imported.quotas.len(), 1);
+    assert_eq!(imported.quotas[0].subject_id, key.id);
 }
 
 #[tokio::test]

@@ -68,12 +68,15 @@ pub(super) fn calculate_totals(
         unavailable("insufficient_samples", sample)
     } else {
         let factor = Decimal::ONE_HUNDRED / growth.expect("positive growth");
-        CycleEstimate {
-            tokens: Some(tokens * factor),
-            cost: Some(cost * factor),
-            reason: None,
-            from_ms: Some(sample.baseline_at_ms),
-            to_ms: Some(sample.observed_at_ms),
+        match (tokens.checked_mul(factor), cost.checked_mul(factor)) {
+            (Some(tokens), Some(cost)) => CycleEstimate {
+                tokens: Some(tokens),
+                cost: Some(cost),
+                reason: None,
+                from_ms: Some(sample.baseline_at_ms),
+                to_ms: Some(sample.observed_at_ms),
+            },
+            _ => unavailable("estimate_overflow", sample),
         }
     }
 }

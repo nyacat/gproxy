@@ -116,6 +116,30 @@ pub(super) const TABLES: &[TableSpec] = &[
                 unique: false,
                 added_in: Some(SchemaVersion::QuotaRebuildIndex),
             },
+            IndexSpec {
+                name: "ix_credential_quota_cycles_observed",
+                columns: &["last_observed_at", "id"],
+                unique: false,
+                added_in: Some(SchemaVersion::QuotaHistoryIndex),
+            },
+            IndexSpec {
+                name: "ix_credential_quota_cycles_credential_observed",
+                columns: &["credential_id", "last_observed_at", "id"],
+                unique: false,
+                added_in: Some(SchemaVersion::QuotaHistoryIndex),
+            },
+            IndexSpec {
+                name: "ix_credential_quota_cycles_credential_window_observed",
+                columns: &["credential_id", "window_key", "last_observed_at", "id"],
+                unique: false,
+                added_in: Some(SchemaVersion::QuotaHistoryIndex),
+            },
+            IndexSpec {
+                name: "ix_credential_quota_cycles_window_observed",
+                columns: &["window_key", "last_observed_at", "id"],
+                unique: false,
+                added_in: Some(SchemaVersion::QuotaHistoryIndex),
+            },
         ],
     },
     TableSpec {

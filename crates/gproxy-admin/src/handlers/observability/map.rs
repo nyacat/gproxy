@@ -63,6 +63,20 @@ pub(super) fn credential_cycle(value: &CredentialQuotaCycleRecord) -> Credential
     value.into()
 }
 
+pub(super) fn hide_local_usage(cycles: &mut [CredentialQuotaCycleDto]) {
+    for cycle in cycles {
+        cycle.metrics = serde_json::json!({});
+        cycle.models.clear();
+        cycle.estimate = Some(crate::dto::CycleEstimateDto {
+            tokens: None,
+            cost: None,
+            from_ms: None,
+            to_ms: None,
+            reason: Some("usage_disabled".into()),
+        });
+    }
+}
+
 impl From<&CredentialQuotaCycleRecord> for CredentialQuotaCycleDto {
     fn from(value: &CredentialQuotaCycleRecord) -> Self {
         CredentialQuotaCycleDto {

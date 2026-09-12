@@ -16,11 +16,12 @@ pub(super) struct UsageSample {
 
 impl UsageSample {
     pub(super) fn parse(row: &crate::backend::Row) -> Result<Self, StoreError> {
-        let json = |field| {
-            serde_json::from_str::<serde_json::Value>(row.text(field)?)
-                .map_err(|error| StoreError::Database(error.to_string()))
-        };
-        let dimensions = json("dimensions_json")?;
+        // `usage_rows.metrics_json` still contains the v2 envelope for rows
+        // written by older self builds. Keep estimation on the same read
+        // boundary as usage details and summaries; parsing it directly as a
+        // flat Decimal map would reject valid historical rows (and lose the
+        // envelope's dimensions used to mark session attribution).
+        let (metrics, dimensions) = crate::store::usage::read_usage_payload(row)?;
         Ok(Self {
             at: row.i64("upstream_started_at_ms")?,
             model: row.text("upstream_model")?.into(),
@@ -34,7 +35,7 @@ impl UsageSample {
                 .text("cost")?
                 .parse()
                 .map_err(|error: rust_decimal::Error| StoreError::Database(error.to_string()))?,
-            metrics: serde_json::from_value(json("metrics_json")?)
+            metrics: serde_json::from_value(metrics)
                 .map_err(|error| StoreError::Database(error.to_string()))?,
             session: dimensions
                 .get("usage_incomplete")
@@ -97,7 +98,8 @@ impl UsageIndex {
         for usage in usages {
             // Extreme sums or decimal rescaling must retain the legacy
             // per-window behavior, not lose small values during subtraction.
-            let before = global.cost;
+            let before_cost = global.cost;
+            let before_tokens = global.total_tokens();
             global.add_values(
                 usage.input,
                 usage.output,
@@ -105,12 +107,24 @@ impl UsageIndex {
                 usage.cost,
                 usage.metrics.clone(),
             )?;
-            if global.cost.checked_sub(before) != Some(usage.cost) {
-                return Err(StoreError::Database(
-                    "quota estimate prefix loses decimal precision".into(),
-                ));
+            let tokens = [
+                "cache_creation_5m_tokens",
+                "cache_creation_30m_tokens",
+                "cache_creation_1h_tokens",
+            ]
+            .iter()
+            .filter_map(|name| usage.metrics.get(*name))
+            .try_fold(
+                Decimal::from(usage.input) + Decimal::from(usage.output),
+                |sum, value| exact_sum(sum, *value),
+            )?;
+            exact_sum(before_cost, usage.cost)?;
+            if exact_sum(before_tokens, tokens)? != global.total_tokens() {
+                return Err(prefix_precision_error());
             }
             let (totals, values) = models.entry(usage.model.clone()).or_default();
+            let before_cost = totals.cost;
+            let before_tokens = totals.total_tokens();
             totals.add_values(
                 usage.input,
                 usage.output,
@@ -118,6 +132,10 @@ impl UsageIndex {
                 usage.cost,
                 usage.metrics.clone(),
             )?;
+            exact_sum(before_cost, usage.cost)?;
+            if exact_sum(before_tokens, tokens)? != totals.total_tokens() {
+                return Err(prefix_precision_error());
+            }
             let sessions = values.last().map_or(0, |p| p.sessions) + u64::from(usage.session);
             let prefix = Prefix {
                 at: usage.at,
@@ -172,14 +190,14 @@ impl UsageIndex {
                 .sessions
                 .checked_add(right.sessions - left.sessions)
                 .ok_or_else(overflow)?;
-            total.tokens = total
-                .tokens
-                .checked_add(right.tokens.checked_sub(left.tokens).ok_or_else(overflow)?)
-                .ok_or_else(overflow)?;
-            total.cost = total
-                .cost
-                .checked_add(right.cost.checked_sub(left.cost).ok_or_else(overflow)?)
-                .ok_or_else(overflow)?;
+            total.tokens = exact_sum(
+                total.tokens,
+                right.tokens.checked_sub(left.tokens).ok_or_else(overflow)?,
+            )?;
+            total.cost = exact_sum(
+                total.cost,
+                right.cost.checked_sub(left.cost).ok_or_else(overflow)?,
+            )?;
         }
         Ok(total)
     }
@@ -231,6 +249,18 @@ impl UsageIndex {
         }
         Ok(())
     }
+}
+
+fn prefix_precision_error() -> StoreError {
+    StoreError::Database("quota estimate prefix loses decimal precision".into())
+}
+
+fn exact_sum(left: Decimal, right: Decimal) -> Result<Decimal, StoreError> {
+    let sum = left.checked_add(right).ok_or_else(prefix_precision_error)?;
+    if sum.checked_sub(left) != Some(right) || sum.checked_sub(right) != Some(left) {
+        return Err(prefix_precision_error());
+    }
+    Ok(sum)
 }
 
 pub(super) fn calculate(
@@ -349,5 +379,33 @@ mod tests {
         usages[0].input = u64::MAX;
         usages[1].model = "other-model".into();
         assert!(UsageIndex::new(&usages).is_err());
+    }
+
+    #[test]
+    fn prefix_rejects_rounding_of_small_token_windows() {
+        let usages = [
+            sample(
+                1,
+                Decimal::ZERO,
+                "10000000000000000000000000000".parse().unwrap(),
+            ),
+            sample(2, Decimal::ZERO, Decimal::new(25, 2)),
+        ];
+        assert!(UsageIndex::new(&usages).is_err());
+        let small = UsageIndex::new(&usages[1..]).unwrap();
+        assert_eq!(
+            small
+                .totals(2, 3, &gproxy_core::QuotaScope::All)
+                .unwrap()
+                .tokens,
+            Decimal::new(525, 2)
+        );
+        assert!(
+            exact_sum(
+                Decimal::new(25, 2),
+                "10000000000000000000000000000".parse().unwrap()
+            )
+            .is_err()
+        );
     }
 }
