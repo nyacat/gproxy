@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 0 ]]; then
-  echo "用法: $0（可通过 IMAGE 环境变量设置镜像标签）" >&2
+  echo "用法: $0（IMAGE=仓库:名称，生成 名称-commit-id 和 latest 标签）" >&2
   exit 2
 fi
 
@@ -19,11 +19,27 @@ if [[ "$(git branch --show-current)" != self ]]; then
   exit 1
 fi
 
-image="${IMAGE:-gproxy:self}"
+repository="${IMAGE:-gproxy:self}"
+tag_name="self"
+if [[ "${repository##*/}" == *:* ]]; then
+  tag_name="${repository##*:}"
+  repository="${repository%:*}"
+fi
+if [[ -z "$repository" || "$repository" == *@* || ! "$tag_name" =~ ^[[:alnum:]_][[:alnum:]_.-]*$ ]]; then
+  echo "IMAGE 必须是镜像仓库或 仓库:名称，不能使用 digest 或空名称。" >&2
+  exit 2
+fi
 build_hash="$(git rev-parse --short=12 HEAD)"
 if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
   build_hash+="-dirty"
 fi
+version_tag="$tag_name-$build_hash"
+if [[ ${#version_tag} -gt 128 ]]; then
+  echo "生成的镜像标签超过 Docker 的 128 字符限制。" >&2
+  exit 2
+fi
+image="$repository:$version_tag"
+latest_image="$repository:latest"
 archive="$script_dir/gproxy-self.tar.zst"
 builder=""
 archive_tmp="$(mktemp "$archive.tmp.XXXXXX")"
@@ -41,7 +57,7 @@ trap 'exit 143' TERM
 
 # 独立 builder 的缓存随 builder 一起删除，不清理其他项目的缓存。
 builder="$(docker buildx create --name "gproxy-self-$$-$RANDOM" --driver docker-container)"
-echo "构建 $image（build $build_hash，linux/amd64，通用 x86-64，release：O3 / fat LTO / 单 codegen unit）"
+echo "构建 $image 和 $latest_image（linux/amd64，通用 x86-64，release：O3 / fat LTO / 单 codegen unit）"
 # 在这里覆盖 Cargo release 配置，优化参数通过 build args 传入 Docker 内的 Cargo。
 # 固定通用 x86-64 指令集，兼容本地 7302、远端 7C13 和其他 x86_64 CPU。
 # 直接导出 Docker tar 流，不向本地 Docker 导入应用镜像。
@@ -63,6 +79,7 @@ docker buildx build \
   --build-arg CARGO_PROFILE_RELEASE_INCREMENTAL=false \
   --build-arg 'RUSTFLAGS=-C target-cpu=x86-64' \
   --tag "$image" \
+  --tag "$latest_image" \
   --output type=docker,dest=- \
   . | zstd -T0 -f -o "$archive_tmp"
 
