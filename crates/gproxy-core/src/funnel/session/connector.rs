@@ -58,26 +58,15 @@ impl Connector {
 
     pub(super) async fn prepare<H: Host>(
         &self,
-        host: &H,
-        force_refresh: bool,
+        host: &crate::Shared<H>,
     ) -> Result<Prepared, CoreError> {
-        let credential = if force_refresh {
-            crate::execution::credential::refresh_now(
-                host,
-                self.channel.as_ref(),
-                self.target.credential,
-                &self.target.provider,
-            )
-            .await?
-        } else {
-            crate::execution::credential::load_fresh(
-                host,
-                self.channel.as_ref(),
-                self.target.credential,
-                &self.target.provider,
-            )
-            .await?
-        };
+        let credential = crate::execution::credential::load_fresh_shared(
+            host,
+            self.channel.clone(),
+            self.target.credential,
+            &self.target.provider,
+        )
+        .await?;
         let mut prepared = (self.prepare)(SessionPrepareCtx {
             request_body: &self.request_body,
             request_headers: &self.request_headers,

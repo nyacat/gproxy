@@ -42,13 +42,8 @@ pub(super) async fn run<H: Host>(
         if channel.local_models(&current.secret).is_none() {
             continue;
         }
-        let Ok(fresh) = super::credential::load_fresh(
-            core.host.as_ref(),
-            channel,
-            target.credential,
-            &target.provider,
-        )
-        .await
+        let Ok(fresh) =
+            super::credential::load_fresh(core, channel, target.credential, &target.provider).await
         else {
             continue;
         };

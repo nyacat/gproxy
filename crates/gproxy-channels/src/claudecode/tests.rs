@@ -416,7 +416,7 @@ fn refresh_uses_profile_and_preserves_rotating_secret_fields() {
     let future = ClaudeCodeChannel
         .refresh(&secret, &settings, &http)
         .unwrap();
-    let refreshed = ready(future).unwrap();
+    let refreshed = ready(future).unwrap().secret;
     assert_eq!(refreshed["access_token"], "fresh");
     assert_eq!(refreshed["refresh_token"], "rotated");
     assert_eq!(refreshed["account_uuid"], "account");
@@ -446,6 +446,218 @@ fn refresh_uses_profile_and_preserves_rotating_secret_fields() {
     );
 }
 
+#[test]
+fn refresh_uses_token_identity_and_short_expiry_without_immediate_retry() {
+    let http = MockHttp::new(
+        StatusCode::OK,
+        br#"{"access_token":"fresh","refresh_token":"rotated","expires_in":60,"account":{"uuid":"acct-new","email_address":"new@example.com"},"organization":{"uuid":"org-new"}}"#,
+    );
+    let secret = json!({
+        "access_token":"stale",
+        "refresh_token":"old-refresh",
+        "account_uuid":"acct-old",
+        "organization_uuid":"org-old",
+        "device_id":"fixed-device"
+    });
+    let result = ready(
+        ClaudeCodeChannel
+            .refresh(&secret, &json!({}), &http)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result.secret["account_uuid"], "acct-new");
+    assert_eq!(result.secret["user_email"], "new@example.com");
+    assert_eq!(result.secret["organization_uuid"], "org-new");
+    assert_eq!(result.secret["device_id"], "fixed-device");
+    assert_eq!(result.secret["refresh_token"], "rotated");
+    assert!(result.secret["expires_at_ms"].as_i64().unwrap() > super::auth::unix_now_ms());
+    assert!(
+        ClaudeCodeChannel
+            .refresh_due(&result.secret)
+            .is_some_and(|due| due > super::auth::unix_now_ms() / 1_000)
+    );
+}
+
+#[test]
+fn refresh_without_valid_expiry_keeps_rotation_but_clears_stale_deadline() {
+    for expires_in in [
+        None,
+        Some(Value::Null),
+        Some(json!(0)),
+        Some(json!(-1)),
+        Some(json!("3600")),
+        Some(json!(i64::MAX)),
+    ] {
+        let mut response = json!({"access_token":"fresh","refresh_token":"rotated"});
+        if let Some(value) = expires_in {
+            response["expires_in"] = value;
+        }
+        let http = MockHttp::new(StatusCode::OK, response.to_string().as_bytes());
+        let secret = json!({
+            "access_token":"stale", "refresh_token":"old-refresh", "expires_at_ms":1,
+            "token_received_at_ms":1, "device_id":"fixed-device"
+        });
+        let result = ready(
+            ClaudeCodeChannel
+                .refresh(&secret, &json!({}), &http)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.secret["access_token"], "fresh");
+        assert_eq!(result.secret["refresh_token"], "rotated");
+        assert!(result.secret.get("expires_at_ms").is_none());
+        assert!(result.secret.get("refresh_at_ms").is_none());
+        assert!(result.secret["token_received_at_ms"].as_i64().unwrap() > 1);
+        assert!(ClaudeCodeChannel.refresh_due(&result.secret).is_none());
+    }
+}
+
+#[test]
+fn authcode_login_records_identity_without_inventing_expiry() {
+    let http = MockHttp::new(
+        StatusCode::OK,
+        br#"{"access_token":"fresh","refresh_token":"refresh","account":{"uuid":"acct-1","email_address":"user@example.com"},"organization":{"uuid":"org-1"}}"#,
+    );
+    let login = ClaudeCodeChannel.login().unwrap();
+    let result = ready(login.adapter.authcode_exchange(
+        &http,
+        gproxy_channel_api::AuthCodeExchangeCtx {
+            provider_settings: &json!({}),
+            code: "code",
+            verifier: "verifier",
+            redirect_uri: super::auth::DEFAULT_REDIRECT_URI,
+            extra: None,
+        },
+    ))
+    .unwrap();
+    assert!(result.secret.get("expires_at_ms").is_none());
+    assert!(result.secret["token_received_at_ms"].as_i64().unwrap() > 0);
+    assert_eq!(result.secret["account_uuid"], "acct-1");
+    assert_eq!(result.secret["organization_uuid"], "org-1");
+    assert_eq!(result.secret["user_email"], "user@example.com");
+}
+
+#[test]
+fn refresh_due_requires_a_usable_refresh_source() {
+    let now = super::auth::unix_now_ms();
+    let mut secret = json!({"access_token":"valid", "expires_at_ms":now + 60_000});
+    assert!(ClaudeCodeChannel.refresh_due(&secret).is_none());
+    for invalid in [Value::Null, json!(""), json!(" \t\n ")] {
+        secret["refresh_token"] = invalid.clone();
+        secret["cookie"] = invalid;
+        assert!(ClaudeCodeChannel.refresh_due(&secret).is_none());
+    }
+    secret["refresh_token"] = json!("refresh");
+    assert!(ClaudeCodeChannel.refresh_due(&secret).unwrap() < now / 1_000);
+    secret["refresh_token"] = Value::Null;
+    secret["cookie"] = json!("sessionKey=sk-ant-sid01-example");
+    assert!(ClaudeCodeChannel.refresh_due(&secret).unwrap() < now / 1_000);
+    secret["access_token"] = Value::Null;
+    assert_eq!(ClaudeCodeChannel.refresh_due(&secret), Some(i64::MIN));
+}
+
+#[test]
+fn consecutive_refreshes_send_the_rotated_token_and_keep_the_original_device_identity() {
+    for device in [
+        Value::Null,
+        json!(""),
+        json!(" \t\n "),
+        json!("fixed-device"),
+    ] {
+        let secret = json!({
+            "access_token":"old-access",
+            "refresh_token":"old-refresh",
+            "device_id":device,
+            "scopes":["user:inference"],
+            "quota_api_key":"quota-key"
+        });
+        let device = super::auth::device_id(&secret);
+        let first = MockHttp::new(
+            StatusCode::OK,
+            br#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#,
+        );
+        let refreshed = ready(super::auth::refresh(&secret, &first)).unwrap();
+        assert_eq!(
+            refreshed.refresh_token,
+            gproxy_channel_api::RefreshTokenStatus::Updated
+        );
+        assert_eq!(refreshed.secret["device_id"], device);
+        assert_eq!(refreshed.secret["scopes"], secret["scopes"]);
+        assert_eq!(refreshed.secret["quota_api_key"], "quota-key");
+
+        let second = MockHttp::new(
+            StatusCode::OK,
+            br#"{"access_token":"final-access","expires_in":3600}"#,
+        );
+        let final_secret = ready(super::auth::refresh(&refreshed.secret, &second)).unwrap();
+        assert_eq!(
+            final_secret.refresh_token,
+            gproxy_channel_api::RefreshTokenStatus::NotReturned
+        );
+        assert_eq!(final_secret.secret["refresh_token"], "new-refresh");
+        assert_eq!(final_secret.secret["device_id"], device);
+        let captured = second.captured.lock().unwrap();
+        let body: Value = serde_json::from_slice(&captured.as_ref().unwrap().body).unwrap();
+        assert_eq!(body["refresh_token"], "new-refresh");
+        assert_eq!(body["client_id"], super::auth::CLIENT_ID);
+    }
+}
+
+#[test]
+fn refresh_errors_do_not_include_upstream_response_or_transport_details() {
+    let secret = json!({"refresh_token":"saved-refresh"});
+    for (status, body) in [
+        (
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":"invalid_grant","refresh_token":"sensitive-upstream-value"}"#.as_slice(),
+        ),
+        (
+            StatusCode::OK,
+            br#"{"access_token":"sensitive-upstream-value" broken}"#,
+        ),
+    ] {
+        let http = MockHttp::new(status, body);
+        let error = match ready(super::auth::refresh(&secret, &http)) {
+            Ok(_) => panic!("invalid refresh response accepted"),
+            Err(error) => error,
+        };
+        assert!(!error.to_string().contains("sensitive-upstream-value"));
+        assert!(!error.to_string().contains("saved-refresh"));
+    }
+    struct FailedHttp;
+    impl SimpleHttp for FailedHttp {
+        fn send<'a>(
+            &'a self,
+            _request: http::Request<Bytes>,
+        ) -> BoxFuture<'a, Result<http::Response<Bytes>, gproxy_channel_api::ChannelError>>
+        {
+            Box::pin(async {
+                Err(gproxy_channel_api::ChannelError::Refresh(
+                    "transport exposed saved-refresh".into(),
+                ))
+            })
+        }
+    }
+    let Err(error) = ready(super::auth::refresh(&secret, &FailedHttp)) else {
+        panic!("transport error accepted")
+    };
+    assert!(!error.to_string().contains("saved-refresh"));
+    let login = ClaudeCodeChannel.login().unwrap();
+    let Err(error) = ready(login.adapter.authcode_exchange(
+        &FailedHttp,
+        gproxy_channel_api::AuthCodeExchangeCtx {
+            provider_settings: &json!({}),
+            code: "code",
+            verifier: "verifier",
+            redirect_uri: super::auth::DEFAULT_REDIRECT_URI,
+            extra: None,
+        },
+    )) else {
+        panic!("login transport error accepted")
+    };
+    assert!(!error.to_string().contains("saved-refresh"));
+}
+
 struct Captured {
     uri: String,
     headers: HeaderMap,
@@ -460,11 +672,11 @@ struct MockHttp {
 }
 
 impl MockHttp {
-    fn new(status: StatusCode, response: &'static [u8]) -> Self {
+    fn new(status: StatusCode, response: &[u8]) -> Self {
         Self {
             captured: Mutex::new(None),
             status,
-            response: Bytes::from_static(response),
+            response: Bytes::copy_from_slice(response),
         }
     }
 }

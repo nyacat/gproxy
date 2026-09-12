@@ -235,6 +235,18 @@
       "secretInvalid": "不是合法的 JSON。",
       "secretRequired": "请至少填写一个凭据字段。",
       "manual": "手动填写凭据字段",
+      "oauthRefresh": {
+        "action": "刷新 OAuth 令牌",
+        "pending": "正在刷新 OAuth 令牌…",
+        "error": "无法刷新 OAuth 令牌，请重试。",
+        "outcomes": {
+          "updated": "OAuth 令牌已刷新，并已保存上游返回的新 refresh token。",
+          "unchanged": "OAuth 令牌已刷新；refresh token 没有变化。",
+          "not_returned": "OAuth 令牌已刷新，但上游未返回新的 refresh token，已保留原 token。",
+          "not_applicable": "OAuth 令牌已刷新。",
+          "updated_elsewhere": "此凭据已被其他请求更新。"
+        }
+      },
       "weight": "流量权重",
       "rpm": "每分钟请求数",
       "tpm": "每分钟 Token 数",

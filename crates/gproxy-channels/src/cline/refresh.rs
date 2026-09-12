@@ -20,7 +20,7 @@ pub(super) fn refresh<'a>(
     secret: &'a Value,
     settings: &'a Value,
     http: &'a dyn SimpleHttp,
-) -> BoxFuture<'a, Result<Value, ChannelError>> {
+) -> BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>> {
     let request = refresh_request(secret, settings);
     let request = match request {
         Ok(request) => request,
@@ -56,7 +56,10 @@ fn refresh_request(secret: &Value, settings: &Value) -> Result<http::Request<Byt
         .map_err(|error| ChannelError::Refresh(error.to_string()))
 }
 
-fn rotate(secret: &Value, response: &Value) -> Result<Value, ChannelError> {
+fn rotate(
+    secret: &Value,
+    response: &Value,
+) -> Result<gproxy_channel_api::RefreshResult, ChannelError> {
     if response.get("success").and_then(Value::as_bool) != Some(true) {
         return Err(ChannelError::Refresh(
             "Cline refresh response was not successful".into(),
@@ -69,6 +72,7 @@ fn rotate(secret: &Value, response: &Value) -> Result<Value, ChannelError> {
     let access = data
         .get("accessToken")
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|token| !token.is_empty())
         .ok_or_else(|| ChannelError::Refresh("Cline response missing accessToken".into()))?;
     let mut output = secret.clone();
@@ -77,18 +81,11 @@ fn rotate(secret: &Value, response: &Value) -> Result<Value, ChannelError> {
         .ok_or_else(|| ChannelError::Refresh("Cline secret must be an object".into()))?;
     root.insert("api_key".into(), Value::String(access.into()));
     root.insert("access_token".into(), Value::String(access.into()));
-    if let Some(refresh) = data
-        .get("refreshToken")
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())
-    {
-        root.insert("refresh_token".into(), Value::String(refresh.into()));
-    }
     if let Some(info) = data.get("userInfo").and_then(Value::as_object) {
         copy(info, root, "clineUserId", "user_id");
         copy(info, root, "email", "email");
     }
-    Ok(output)
+    crate::shared::refresh::oauth(output, data.get("refreshToken").and_then(Value::as_str))
 }
 
 fn copy(

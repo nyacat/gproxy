@@ -235,6 +235,18 @@
       "secretInvalid": "不是合法的 JSON。",
       "secretRequired": "請至少填寫一個憑證欄位。",
       "manual": "手動填寫憑證欄位",
+      "oauthRefresh": {
+        "action": "重新整理 OAuth 權杖",
+        "pending": "正在重新整理 OAuth 權杖…",
+        "error": "無法重新整理 OAuth 權杖，請重試。",
+        "outcomes": {
+          "updated": "OAuth 權杖已重新整理，並已儲存上游回傳的新 refresh token。",
+          "unchanged": "OAuth 權杖已重新整理；refresh token 沒有變更。",
+          "not_returned": "OAuth 權杖已重新整理，但上游未回傳新的 refresh token，已保留原 token。",
+          "not_applicable": "OAuth 權杖已重新整理。",
+          "updated_elsewhere": "此憑證已由其他請求更新。"
+        }
+      },
       "weight": "流量權重",
       "rpm": "每分鐘請求數",
       "tpm": "每分鐘 Token 數",

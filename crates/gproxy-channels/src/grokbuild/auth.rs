@@ -29,7 +29,7 @@ pub(super) fn refresh<'a>(
     secret: &'a Value,
     settings: &'a Value,
     http: &'a dyn SimpleHttp,
-) -> BoxFuture<'a, Result<Value, ChannelError>> {
+) -> BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>> {
     let request = match build_refresh(secret, settings) {
         Ok(request) => request,
         Err(error) => return Box::pin(async move { Err(error) }),
@@ -70,7 +70,10 @@ fn build_refresh(secret: &Value, settings: &Value) -> Result<http::Request<Bytes
         .map_err(|error| ChannelError::Refresh(error.to_string()))
 }
 
-fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
+fn rotate(
+    secret: &Value,
+    token: &Value,
+) -> Result<gproxy_channel_api::RefreshResult, ChannelError> {
     let access = field(token, "access_token")
         .ok_or_else(|| ChannelError::Refresh("access_token missing".into()))?;
     let expires = token
@@ -82,9 +85,6 @@ fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
         .as_object_mut()
         .ok_or_else(|| ChannelError::Refresh("secret must be an object".into()))?;
     object.insert("access_token".into(), Value::String(access.into()));
-    if let Some(refresh) = field(token, "refresh_token") {
-        object.insert("refresh_token".into(), Value::String(refresh.into()));
-    }
     if let Some(id_token) = field(token, "id_token") {
         if let Some(subject) = jwt_claim(id_token, "sub") {
             object.insert("sub".into(), Value::String(subject));
@@ -102,7 +102,7 @@ fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
                 .saturating_mul(1_000),
         ),
     );
-    Ok(output)
+    crate::shared::refresh::oauth(output, token.get("refresh_token").and_then(Value::as_str))
 }
 
 pub(super) fn apply(

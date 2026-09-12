@@ -67,6 +67,7 @@ impl<H: Host> ResponsesBridge<H> {
                 Ok(prepared) => prepared,
                 Err(
                     crate::CoreError::CredentialCoolingDown { .. }
+                    | crate::CoreError::CredentialRefreshCoolingDown { .. }
                     | crate::CoreError::NoCredentials
                     | crate::CoreError::Unsupported
                     | crate::CoreError::Channel(

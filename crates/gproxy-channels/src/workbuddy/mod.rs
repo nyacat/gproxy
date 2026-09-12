@@ -99,12 +99,18 @@ impl Channel for WorkBuddyChannel {
         refresh::due(secret)
     }
 
+    fn can_refresh(&self, secret: &Value) -> bool {
+        crate::shared::refresh::can_refresh(secret)
+    }
+
     fn refresh<'a>(
         &'a self,
         secret: &'a Value,
         settings: &'a Value,
         http: &'a dyn SimpleHttp,
-    ) -> Option<BoxFuture<'a, Result<Value, gproxy_channel_api::ChannelError>>> {
+    ) -> Option<
+        BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, gproxy_channel_api::ChannelError>>,
+    > {
         Some(refresh::refresh(secret, settings, http))
     }
 }

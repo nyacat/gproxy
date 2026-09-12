@@ -119,3 +119,29 @@ pub(super) async fn read(app: &AppHandle, id: i64) -> Result<QuotaSnapshot, Admi
         entries: saved.entries,
     })
 }
+
+pub(super) async fn read_versioned(
+    app: &AppHandle,
+    id: i64,
+) -> Result<(u64, QuotaSnapshot), AdminError> {
+    let store = &app.inner.host.services.store;
+    for _ in 0..3 {
+        let before = store
+            .credential(id)
+            .await?
+            .ok_or(AdminError::NotFound)?
+            .version;
+        let snapshot = read(app, id).await?;
+        let after = store
+            .credential(id)
+            .await?
+            .ok_or(AdminError::NotFound)?
+            .version;
+        if before == after {
+            return Ok((after, snapshot));
+        }
+    }
+    Err(AdminError::Conflict(
+        "credential changed repeatedly while reading quota results".into(),
+    ))
+}

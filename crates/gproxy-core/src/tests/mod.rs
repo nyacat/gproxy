@@ -3,6 +3,7 @@ mod channel;
 mod channel_session;
 mod channels;
 mod credential_budget;
+mod credential_refresh;
 mod health_recovery;
 mod memory;
 mod model_metadata;

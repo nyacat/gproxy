@@ -6,10 +6,36 @@ use gproxy_channel_api::{
 };
 
 pub struct QuotaSourceProbeResult {
+    pub credential_version: u64,
     pub entries: Vec<QuotaEntry>,
     pub reset_credits: Option<QuotaResetCredits>,
     pub raw: String,
     pub observed_at_ms: i64,
+}
+
+pub struct PreparedQuotaSource {
+    query: PreparedQuotaQuery,
+}
+
+enum PreparedQuotaQuery {
+    Subscription(crate::quota::PreparedQuotaProbe),
+    Pages {
+        record: crate::CredentialRecord,
+        provider: ProviderRef,
+        channel: std::sync::Arc<dyn gproxy_channel_api::Channel>,
+        source_id: String,
+        query_secret: serde_json::Value,
+        request: http::Request<bytes::Bytes>,
+    },
+}
+
+impl PreparedQuotaSource {
+    pub fn credential_version(&self) -> u64 {
+        match &self.query {
+            PreparedQuotaQuery::Subscription(probe) => probe.record.version,
+            PreparedQuotaQuery::Pages { record, .. } => record.version,
+        }
+    }
 }
 
 impl<H: Host> Core<H> {
@@ -40,12 +66,28 @@ impl<H: Host> Core<H> {
         expected_version: u64,
         source_id: &str,
     ) -> Result<QuotaSourceProbeResult, CoreError> {
+        let prepared = self
+            .prepare_quota_source(provider, credential, expected_version, source_id)
+            .await?;
+        self.execute_quota_source(prepared).await
+    }
+
+    pub async fn prepare_quota_source(
+        &self,
+        provider: &ProviderRef,
+        credential: CredentialId,
+        expected_version: u64,
+        source_id: &str,
+    ) -> Result<PreparedQuotaSource, CoreError> {
         let channel = self
             .channels
-            .get(&provider.channel)
+            .shared(&provider.channel)
             .ok_or_else(|| CoreError::UnknownProvider("channel is not registered".into()))?;
-        let record = self.host.credentials().load(credential).await?;
-        if record.version != expected_version || record.channel != provider.channel {
+        let record = self.host.credentials().load_current(credential).await?;
+        if record.version != expected_version {
+            return Err(CoreError::CredentialVersionConflict);
+        }
+        if record.id != credential || record.channel != provider.channel {
             return Err(CoreError::Unsupported);
         }
         let query_secret = scoped_secret(&provider.channel, &record.secret);
@@ -61,45 +103,94 @@ impl<H: Host> Core<H> {
             return Err(CoreError::Unsupported);
         }
         if source_id == "subscription" {
-            let result = self
-                .quota_probe_version(
+            let prepared = self
+                .prepare_quota_probe(
                     &provider.channel,
                     provider,
                     credential,
                     Some(expected_version),
                 )
                 .await?;
-            if result.observations.is_empty() && result.reset_credits.is_none() {
-                return Err(CoreError::UpstreamExhausted(
-                    "quota endpoint returned no valid quota data".into(),
-                ));
-            }
-            let observed_at_ms = crate::quota::now_ms();
-            return Ok(QuotaSourceProbeResult {
-                entries: result
-                    .observations
-                    .iter()
-                    .map(|value| QuotaEntry::from_window(value, observed_at_ms))
-                    .collect(),
-                reset_credits: result.reset_credits,
-                raw: result.raw,
-                observed_at_ms,
+            return Ok(PreparedQuotaSource {
+                query: PreparedQuotaQuery::Subscription(prepared),
             });
         }
+        // Other sources retain their existing, source-specific authentication.
+        // In particular, independent quota keys/cookies must not trigger an
+        // OAuth refresh of the inference credential.
+        let mut request = channel
+            .prepare_quota_source_page(source_id, &query_secret, &provider.settings, None)?
+            .ok_or(CoreError::Unsupported)?;
+        crate::fingerprint::apply_request(&mut request, provider)?;
+        let query_secret = query_secret.into_owned();
+        Ok(PreparedQuotaSource {
+            query: PreparedQuotaQuery::Pages {
+                record,
+                provider: provider.clone(),
+                channel,
+                source_id: source_id.into(),
+                query_secret,
+                request,
+            },
+        })
+    }
+
+    pub async fn execute_quota_source(
+        &self,
+        prepared: PreparedQuotaSource,
+    ) -> Result<QuotaSourceProbeResult, CoreError> {
+        let (record, provider, channel, source_id, query_secret, request) = match prepared.query {
+            PreparedQuotaQuery::Subscription(probe) => {
+                let result = self.execute_quota_probe(probe).await?;
+                if result.observations.is_empty() && result.reset_credits.is_none() {
+                    return Err(CoreError::UpstreamExhausted(
+                        "quota endpoint returned no valid quota data".into(),
+                    ));
+                }
+                let observed_at_ms = crate::quota::now_ms();
+                return Ok(QuotaSourceProbeResult {
+                    credential_version: result.credential_version,
+                    entries: result
+                        .observations
+                        .iter()
+                        .map(|value| QuotaEntry::from_window(value, observed_at_ms))
+                        .collect(),
+                    reset_credits: result.reset_credits,
+                    raw: result.raw,
+                    observed_at_ms,
+                });
+            }
+            PreparedQuotaQuery::Pages {
+                record,
+                provider,
+                channel,
+                source_id,
+                query_secret,
+                request,
+            } => (record, provider, channel, source_id, query_secret, request),
+        };
+        self.check_quota_credential(&record).await?;
+        let mut first = Some(request);
         let mut entries = Vec::new();
         let mut cursor = None;
         let mut cursors = std::collections::HashSet::new();
         let mut ids = std::collections::HashSet::new();
         for _ in 0..100 {
-            let mut request = channel
-                .prepare_quota_source_page(
-                    source_id,
-                    &query_secret,
-                    &provider.settings,
-                    cursor.as_deref(),
-                )?
-                .ok_or(CoreError::Unsupported)?;
-            crate::fingerprint::apply_request(&mut request, provider)?;
+            let request = if let Some(request) = first.take() {
+                request
+            } else {
+                self.check_quota_credential(&record).await?;
+                let mut request = channel
+                    .prepare_quota_source_page(
+                        &source_id,
+                        &query_secret,
+                        &provider.settings,
+                        cursor.as_deref(),
+                    )?
+                    .ok_or(CoreError::Unsupported)?;
+                crate::fingerprint::apply_request(&mut request, &provider)?;
+                request
+            };
             let response = self.host.transport().send(request).await?;
             let (parts, mut stream) = response.into_parts();
             if !parts.status.is_success() {
@@ -129,7 +220,7 @@ impl<H: Host> Core<H> {
                 body.extend_from_slice(&chunk);
             }
             let page = channel
-                .parse_quota_source_page(source_id, parts.status, &parts.headers, &body)
+                .parse_quota_source_page(&source_id, parts.status, &parts.headers, &body)
                 .map_err(|_| {
                     CoreError::UpstreamExhausted("quota endpoint returned invalid data".into())
                 })?;
@@ -155,6 +246,7 @@ impl<H: Host> Core<H> {
                 }
                 None => {
                     return Ok(QuotaSourceProbeResult {
+                        credential_version: record.version,
                         entries,
                         reset_credits: None,
                         raw: String::new(),

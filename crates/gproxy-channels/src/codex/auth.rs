@@ -1,3 +1,5 @@
+use base64::Engine as _;
+use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use gproxy_channel_api::{BoxFuture, ChannelError, SimpleHttp};
 use http::header::{AUTHORIZATION, HeaderName, HeaderValue};
@@ -47,17 +49,26 @@ pub(super) fn account_id(secret: &Value) -> Option<&str> {
 }
 
 pub(super) fn refresh_due(secret: &Value) -> Option<i64> {
-    if secret_string(secret, "access_token").is_none() {
+    secret_string(secret, "refresh_token")?;
+    let Some(access) = secret_string(secret, "access_token") else {
         return Some(i64::MIN);
-    }
-    let expires_at_ms = secret.get("expires_at_ms")?.as_i64()?;
-    (expires_at_ms != 0).then(|| expires_at_ms / 1000 - EXPIRY_SKEW_SECONDS)
+    };
+    let expires_at_ms = secret
+        .get("expires_at_ms")
+        .and_then(Value::as_i64)
+        .filter(|expires| *expires > 0)
+        .or_else(|| access_expiry(access))?;
+    Some(crate::shared::oauth_expiry::refresh_due(
+        secret,
+        expires_at_ms,
+        EXPIRY_SKEW_SECONDS * 1_000,
+    ))
 }
 
 pub(super) fn refresh<'a>(
     secret: &'a Value,
     http: &'a dyn SimpleHttp,
-) -> BoxFuture<'a, Result<Value, ChannelError>> {
+) -> BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>> {
     let request = (|| {
         let refresh_token = secret_string(secret, "refresh_token")
             .ok_or_else(|| ChannelError::Refresh("refresh_token missing".into()))?;
@@ -66,12 +77,12 @@ pub(super) fn refresh<'a>(
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
         }))
-        .map_err(|error| ChannelError::Refresh(error.to_string()))?;
+        .map_err(|_| ChannelError::Refresh("invalid refresh request".into()))?;
         let mut request = http::Request::post(TOKEN_URL)
             .header(http::header::CONTENT_TYPE, "application/json")
             .header(http::header::ACCEPT, "application/json")
             .body(Bytes::from(body))
-            .map_err(|error| ChannelError::Refresh(error.to_string()))?;
+            .map_err(|_| ChannelError::Refresh("invalid token endpoint request".into()))?;
         request
             .extensions_mut()
             .insert(super::profile::CLIENT_PROFILE.clone());
@@ -83,19 +94,17 @@ pub(super) fn refresh<'a>(
     };
     let send = http.send(request);
     Box::pin(async move {
-        let response = send.await?;
+        let response = send
+            .await
+            .map_err(|_| ChannelError::Refresh("token endpoint request failed".into()))?;
         if !response.status().is_success() {
-            let snippet: String = String::from_utf8_lossy(response.body())
-                .chars()
-                .take(256)
-                .collect();
             return Err(ChannelError::Refresh(format!(
-                "token endpoint {}: {snippet}",
+                "token endpoint returned {}",
                 response.status()
             )));
         }
         let token: Value = serde_json::from_slice(response.body())
-            .map_err(|error| ChannelError::Refresh(format!("invalid token response: {error}")))?;
+            .map_err(|_| ChannelError::Refresh("invalid token response".into()))?;
         rotate(secret, &token)
     })
 }
@@ -172,108 +181,85 @@ pub(super) fn apply_headers(
     Ok(())
 }
 
-fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
+fn rotate(
+    secret: &Value,
+    token: &Value,
+) -> Result<gproxy_channel_api::RefreshResult, ChannelError> {
     let access = secret_string(token, "access_token")
         .ok_or_else(|| ChannelError::Refresh("token response missing access_token".into()))?;
-    let expires_in = token
-        .get("expires_in")
-        .and_then(Value::as_i64)
-        .unwrap_or(3_600)
-        .max(0);
+    let received_at_ms = unix_now_ms();
+    let expires_at_ms = crate::shared::oauth_expiry::from_lifetime(
+        received_at_ms,
+        token.get("expires_in").and_then(Value::as_i64),
+    )
+    .or_else(|| access_expiry(access));
     let mut output = secret.clone();
     let object = output
         .as_object_mut()
         .ok_or_else(|| ChannelError::Refresh("secret must be a JSON object".into()))?;
     object.insert("access_token".into(), Value::String(access.into()));
-    if let Some(refresh) = secret_string(token, "refresh_token") {
-        object.insert("refresh_token".into(), Value::String(refresh.into()));
-    }
-    if let Some(id_token) = secret_string(token, "id_token") {
+    if let Some(id_token) = secret_string(token, "id_token")
+        && let Some(claims) = jwt_claims(id_token)
+    {
         object.insert("id_token".into(), Value::String(id_token.into()));
-        if let Some(account_id) = account_id_from_jwt(id_token) {
-            object.insert("account_id".into(), Value::String(account_id));
+        if let Some(account_id) = claims
+            .get("https://api.openai.com/auth")
+            .and_then(|auth| secret_string(auth, "chatgpt_account_id"))
+        {
+            object.insert("account_id".into(), Value::String(account_id.into()));
         }
-        if let Some(email) = email_from_jwt(id_token) {
-            object.insert("user_email".into(), Value::String(email));
+        if let Some(email) = secret_string(&claims, "email").or_else(|| {
+            claims
+                .get("https://api.openai.com/profile")
+                .and_then(|profile| secret_string(profile, "email"))
+        }) {
+            object.insert("user_email".into(), Value::String(email.into()));
+        } else {
+            object.remove("user_email");
         }
-        if let Some(fedramp) = fedramp_from_jwt(id_token) {
-            object.insert("chatgpt_account_is_fedramp".into(), Value::Bool(fedramp));
-        }
+        // A fresh ID token is authoritative for this optional claim. Keeping
+        // an old true value would keep sending the FedRAMP routing header.
+        let fedramp = claims
+            .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_is_fedramp")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        object.insert("chatgpt_account_is_fedramp".into(), Value::Bool(fedramp));
     }
-    object.insert(
-        "expires_at_ms".into(),
-        Value::from(unix_now_ms().saturating_add(expires_in.saturating_mul(1_000))),
-    );
-    Ok(output)
+    crate::shared::oauth_expiry::apply(object, received_at_ms, expires_at_ms);
+    crate::shared::refresh::oauth(output, token.get("refresh_token").and_then(Value::as_str))
 }
 
 pub(super) fn login_secret(token: &Value) -> Result<Value, ChannelError> {
     rotate(&serde_json::json!({}), token)
+        .map(|result| result.secret)
         .map_err(|_| ChannelError::Login("invalid token response".into()))
 }
 
-fn account_id_from_jwt(token: &str) -> Option<String> {
-    let claims = jwt_claims(token)?;
-    claims
-        .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
-fn email_from_jwt(token: &str) -> Option<String> {
-    let claims = jwt_claims(token)?;
-    claims
-        .get("email")
-        .or_else(|| {
-            claims
-                .get("https://api.openai.com/profile")
-                .and_then(|profile| profile.get("email"))
-        })
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
-fn fedramp_from_jwt(token: &str) -> Option<bool> {
+fn access_expiry(token: &str) -> Option<i64> {
     jwt_claims(token)?
-        .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_is_fedramp")
-        .and_then(Value::as_bool)
+        .get("exp")?
+        .as_i64()
+        .filter(|seconds| *seconds >= 0)?
+        .checked_mul(1_000)
 }
 
 fn jwt_claims(token: &str) -> Option<Value> {
-    let payload = token.split('.').nth(1)?;
-    let decoded = base64_url_decode(payload)?;
-    serde_json::from_slice(&decoded).ok()
-}
-
-fn base64_url_decode(value: &str) -> Option<Vec<u8>> {
-    let mut output = Vec::with_capacity(value.len() * 3 / 4);
-    let mut accumulator = 0_u32;
-    let mut bits = 0_u8;
-    for byte in value.bytes().filter(|byte| *byte != b'=') {
-        accumulator = (accumulator << 6) | u32::from(base64_value(byte)?);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((accumulator >> bits) as u8);
-            accumulator &= (1_u32 << bits).saturating_sub(1);
-        }
+    // These claims only supply metadata and refresh timing. The upstream
+    // authenticates the bearer token; this is not a JWT verification boundary.
+    let mut segments = token.split('.');
+    if segments.next()?.is_empty() {
+        return None;
     }
-    Some(output)
-}
-
-fn base64_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'-' => Some(62),
-        b'_' => Some(63),
-        _ => None,
+    let payload = segments.next()?;
+    if segments.next()?.is_empty() || segments.next().is_some() {
+        return None;
     }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| URL_SAFE.decode(payload))
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    claims.is_object().then_some(claims)
 }
 
 fn secret_string<'a>(value: &'a Value, name: &str) -> Option<&'a str> {

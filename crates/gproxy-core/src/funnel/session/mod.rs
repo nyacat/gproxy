@@ -57,14 +57,7 @@ pub(super) async fn buffered<H: Host>(
         completed(&ctx, Some(outcome.0), "session setup failed");
         return outcome_response(&ctx, outcome);
     }
-    let installed = match install::open(
-        host.as_ref(),
-        channel.clone(),
-        control,
-        &ctx,
-        &parts.headers,
-    )
-    .await
+    let installed = match install::open(&host, channel.clone(), control, &ctx, &parts.headers).await
     {
         Ok(installed) => installed,
         Err(error) => {

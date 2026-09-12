@@ -114,6 +114,7 @@ pub struct QuotaProbeWindowDto {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct QuotaProbeResponse {
+    pub credential_version: u64,
     #[serde(default)]
     pub snapshot: gproxy_channel_api::QuotaSnapshot,
     pub windows: Vec<QuotaProbeWindowDto>,

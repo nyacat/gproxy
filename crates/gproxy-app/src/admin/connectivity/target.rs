@@ -10,6 +10,14 @@ pub(in crate::admin) fn resolve(
     app: &AppHandle,
     request: &ConnectivityTestRequest,
 ) -> Result<(ProviderRef, ConnectivityProxySourceDto), AdminError> {
+    resolve_from(app, request, &app.inner.host.services.control.current())
+}
+
+pub(in crate::admin) fn resolve_from(
+    app: &AppHandle,
+    request: &ConnectivityTestRequest,
+    snapshot: &gproxy_store::records::ControlSnapshot,
+) -> Result<(ProviderRef, ConnectivityProxySourceDto), AdminError> {
     let services = &app.inner.host.services;
     let settings = services.control.settings();
     if request.scope == ConnectivityScopeDto::Proxy {
@@ -49,7 +57,6 @@ pub(in crate::admin) fn resolve(
             source,
         ));
     }
-    let snapshot = services.control.current();
     let credential = request.credential_id.and_then(|id| {
         snapshot
             .credentials
@@ -93,7 +100,7 @@ pub(in crate::admin) fn resolve(
         ProviderRef {
             id: provider.id,
             name: provider.name.clone(),
-            channel: provider.channel.clone(),
+            channel: gproxy_channels::canonical_channel_id(&provider.channel).into(),
             settings: gproxy_channels::canonical_provider_settings(
                 &provider.channel,
                 &provider.settings,

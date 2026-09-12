@@ -34,10 +34,14 @@ pub enum CoreError {
     RateLimited { retry_after_secs: u32 },
     #[error("credential model is cooling down; retry after {retry_after_secs} seconds")]
     CredentialCoolingDown { retry_after_secs: u32 },
+    #[error("credential refresh is cooling down; retry after {retry_after_secs} seconds")]
+    CredentialRefreshCoolingDown { retry_after_secs: u32 },
     #[error("quota exceeded")]
     QuotaExceeded,
     #[error("no usable credential")]
     NoCredentials,
+    #[error("credential version has changed")]
+    CredentialVersionConflict,
     #[error("protocol transform failed: {0}")]
     Transform(String),
     #[error("all upstream attempts failed: {0}")]
@@ -62,8 +66,10 @@ impl CoreError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::UnknownRoute(_) | Self::UnknownProvider(_) => StatusCode::NOT_FOUND,
             Self::Unsupported => StatusCode::BAD_REQUEST,
+            Self::CredentialVersionConflict => StatusCode::CONFLICT,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::CredentialCoolingDown { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::CredentialRefreshCoolingDown { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::QuotaExceeded => StatusCode::PAYMENT_REQUIRED,
             Self::NoCredentials | Self::UpstreamExhausted(_) => StatusCode::BAD_GATEWAY,
             Self::Transform(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

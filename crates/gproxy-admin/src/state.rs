@@ -16,6 +16,36 @@ pub trait State: MaybeSend + MaybeSync {
         id: i64,
     ) -> BoxFuture<'_, Result<Option<crate::dto::QuotaCapabilitiesDto>, AdminError>>;
 
+    fn credential_refresh_supported(&self, id: i64) -> BoxFuture<'_, Result<bool, AdminError>> {
+        let _ = id;
+        Box::pin(async { Ok(false) })
+    }
+
+    fn credential_capabilities(
+        &self,
+        id: i64,
+    ) -> BoxFuture<'_, Result<(Option<crate::dto::QuotaCapabilitiesDto>, bool), AdminError>> {
+        Box::pin(async move {
+            Ok((
+                self.credential_quota_capabilities(id).await?,
+                self.credential_refresh_supported(id).await?,
+            ))
+        })
+    }
+
+    fn credential_refresh(
+        &self,
+        id: i64,
+        expected_version: u64,
+    ) -> BoxFuture<'_, Result<crate::dto::CredentialRefreshResponse, AdminError>> {
+        let _ = (id, expected_version);
+        Box::pin(async {
+            Err(AdminError::BadRequest(
+                "credential refresh is unavailable".into(),
+            ))
+        })
+    }
+
     fn seal_credential(&self, secret: &serde_json::Value)
     -> Result<CredentialEnvelope, AdminError>;
 

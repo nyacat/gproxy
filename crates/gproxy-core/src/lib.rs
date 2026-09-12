@@ -23,6 +23,7 @@ pub mod routing;
 pub mod usage;
 
 mod attempt;
+mod credential_refresh;
 mod execution;
 mod fingerprint;
 mod funnel;
@@ -61,6 +62,7 @@ pub use control::{
     FingerprintOverride, PRICING_SERVICE_TIERS, Plan, Pricing, PricingTier, ProviderRef, Target,
     TargetRules, UpstreamProxy, normalize_service_tier,
 };
+pub use credential_refresh::CredentialRefreshResult;
 pub use error::CoreError;
 pub use fingerprint::apply_request as apply_provider_transport;
 pub use host::{
@@ -69,5 +71,5 @@ pub use host::{
     UpstreamTransport, UsageSink, spend_fits,
 };
 pub use quota::QuotaProbeResult;
-pub use quota_source::QuotaSourceProbeResult;
+pub use quota_source::{PreparedQuotaSource, QuotaSourceProbeResult};
 pub use usage::{Ended, NormalizedUsage, SettledAttempt, Settlement, UsageSource};

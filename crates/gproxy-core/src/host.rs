@@ -70,13 +70,27 @@ pub trait CredentialStore {
         version: u64,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
-    /// Best-effort exclusive lease so concurrent requests refresh once.
-    /// Returns whether this caller holds the lease.
+    /// Exclusive ownership across the full upstream refresh and persistence.
+    /// Only the holder of the opaque owner token may renew or release it.
     fn lease_refresh<'a>(
         &'a self,
         id: CredentialId,
+        owner: &'a [u8],
         ttl: Duration,
     ) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    fn renew_refresh<'a>(
+        &'a self,
+        id: CredentialId,
+        owner: &'a [u8],
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    fn release_refresh<'a>(
+        &'a self,
+        id: CredentialId,
+        owner: &'a [u8],
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 }
 
 /// TTL-aware shared cache: affinity pins, refresh leases, counters.

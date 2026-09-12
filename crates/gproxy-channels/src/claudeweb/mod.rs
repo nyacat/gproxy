@@ -121,7 +121,7 @@ impl Channel for ClaudeWebChannel {
         secret: &'a Value,
         settings: &'a Value,
         http: &'a dyn SimpleHttp,
-    ) -> Option<BoxFuture<'a, Result<Value, ChannelError>>> {
+    ) -> Option<BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>>> {
         Some(auth::refresh(secret, settings, http))
     }
 

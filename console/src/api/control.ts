@@ -1,6 +1,7 @@
 import type { AliasDto } from "@/generated/AliasDto"
 import type { AliasWriteRequest } from "@/generated/AliasWriteRequest"
 import type { CredentialDto } from "@/generated/CredentialDto"
+import type { CredentialRefreshResponse } from "@/generated/CredentialRefreshResponse"
 import type { CredentialSecretResponse } from "@/generated/CredentialSecretResponse"
 import type { CredentialWriteRequest } from "@/generated/CredentialWriteRequest"
 import type { ModelAliasDto } from "@/generated/ModelAliasDto"
@@ -72,6 +73,8 @@ export const resetCredentialQuota = (id: number) =>
   api<QuotaResetResponse>(`/admin/api/credentials/${id}/quota-reset`, json("POST", {}))
 export const resetCredentialHealth = (id: number, model?: string) =>
   api<void>(`/admin/api/credentials/${id}/health-reset`, json("POST", { model }))
+export const refreshCredential = (id: number, version: number) =>
+  api<CredentialRefreshResponse>(`/admin/api/credentials/${id}/refresh`, json("POST", { version }))
 export const revealCredentialSecret = (id: number) =>
   api<CredentialSecretResponse>(`/admin/api/credentials/${id}/reveal`, json("POST", {}))
 

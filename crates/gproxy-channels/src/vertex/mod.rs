@@ -156,7 +156,9 @@ impl Channel for VertexChannel {
         secret: &'a Value,
         _provider_settings: &'a Value,
         http: &'a dyn SimpleHttp,
-    ) -> Option<BoxFuture<'a, Result<Value, gproxy_channel_api::ChannelError>>> {
+    ) -> Option<
+        BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, gproxy_channel_api::ChannelError>>,
+    > {
         Some(auth::refresh(secret, http))
     }
 }

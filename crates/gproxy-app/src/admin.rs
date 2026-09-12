@@ -1,4 +1,5 @@
 mod connectivity;
+mod credential_refresh;
 mod helpers;
 mod import;
 mod model_discover;
@@ -32,6 +33,25 @@ impl State for AppHandle {
         id: i64,
     ) -> BoxFuture<'_, Result<Option<QuotaCapabilitiesDto>, AdminError>> {
         Box::pin(quota_capabilities::read(self, id))
+    }
+
+    fn credential_refresh_supported(&self, id: i64) -> BoxFuture<'_, Result<bool, AdminError>> {
+        Box::pin(credential_refresh::supported(self, id))
+    }
+
+    fn credential_capabilities(
+        &self,
+        id: i64,
+    ) -> BoxFuture<'_, Result<(Option<QuotaCapabilitiesDto>, bool), AdminError>> {
+        Box::pin(quota_capabilities::read_all(self, id))
+    }
+
+    fn credential_refresh(
+        &self,
+        id: i64,
+        expected_version: u64,
+    ) -> BoxFuture<'_, Result<gproxy_admin::dto::CredentialRefreshResponse, AdminError>> {
+        Box::pin(credential_refresh::run(self, id, expected_version))
     }
 
     fn store(&self) -> &gproxy_store::Store {

@@ -28,7 +28,7 @@ pub(super) fn refresh_due(secret: &Value) -> Option<i64> {
 pub(super) fn refresh<'a>(
     secret: &'a Value,
     http: &'a dyn SimpleHttp,
-) -> BoxFuture<'a, Result<Value, ChannelError>> {
+) -> BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>> {
     let request = build_refresh(secret);
     let request = match request {
         Ok(request) => request,
@@ -140,7 +140,10 @@ struct Claims<'a> {
     exp: u64,
 }
 
-fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
+fn rotate(
+    secret: &Value,
+    token: &Value,
+) -> Result<gproxy_channel_api::RefreshResult, ChannelError> {
     let access = required(token, "access_token")?;
     let expires = token
         .get("expires_in")
@@ -156,7 +159,10 @@ fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
         "expires_at_ms".into(),
         Value::from(unix_now().saturating_add(expires).saturating_mul(1_000)),
     );
-    Ok(output)
+    Ok(gproxy_channel_api::RefreshResult {
+        secret: output,
+        refresh_token: gproxy_channel_api::RefreshTokenStatus::NotApplicable,
+    })
 }
 
 fn required<'a>(value: &'a Value, name: &str) -> Result<&'a str, ChannelError> {

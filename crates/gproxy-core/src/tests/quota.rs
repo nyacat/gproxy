@@ -117,7 +117,7 @@ fn console_billing_uses_cookie_and_never_exposes_page_or_payment_data() {
     let (credential, version) = {
         let mut state = host.state.lock().unwrap();
         state.credential.channel = "opencode".into();
-        state.credential.secret = json!({"api_key":"inference-fixture","quota_cookie":"auth=console-fixture; oc_locale=en","quota_workspace_id":"wrk_example","quota_channel":"opencode"});
+        state.credential.secret = json!({"api_key":"inference-fixture","access_token":"expired","refresh_token":"inference-refresh","expires_at_ms":1,"quota_cookie":"auth=console-fixture; oc_locale=en","quota_workspace_id":"wrk_example","quota_channel":"opencode"});
         (state.credential.id, state.credential.version)
     };
     let core = Core::new(
@@ -153,6 +153,160 @@ fn console_billing_uses_cookie_and_never_exposes_page_or_payment_data() {
             .contains_key(http::header::AUTHORIZATION)
     );
     assert!(result.raw.is_empty());
+    assert_eq!(result.credential_version, version);
+    assert_eq!(state.upstream_requests.len(), 1);
+    assert!(state.rotations.is_empty());
     assert!(state.health.is_empty());
     assert!(state.settlements.is_empty());
+}
+
+fn oauth_quota_fixture() -> (MemoryHost, Core<MemoryHost>, crate::ProviderRef) {
+    let host = MemoryHost::new(false);
+    {
+        let mut state = host.state.lock().unwrap();
+        state.credential.channel = "geminicli".into();
+        state.credential.secret = json!({"access_token":"expired", "refresh_token":"saved", "expires_at_ms":1, "project_id":"quota-project"});
+        state.scripted.push_back((
+            StatusCode::OK,
+            vec![Bytes::from_static(
+                br#"{"access_token":"refreshed","refresh_token":"rotated","expires_in":3600}"#,
+            )],
+        ));
+    }
+    let mut provider = target().provider;
+    provider.channel = "geminicli".into();
+    provider.settings =
+        json!({"base_url":"https://quota.test", "oauth_token_url":"https://token.test/token"});
+    let core = Core::new(
+        host.clone(),
+        ChannelRegistry::new([Box::new(gproxy_channels::GeminiCliChannel) as Box<dyn Channel>])
+            .unwrap(),
+    )
+    .unwrap();
+    (host, core, provider)
+}
+
+#[test]
+fn subscription_preparation_refreshes_once_and_exposes_the_version_before_quota_egress() {
+    let (host, core, provider) = oauth_quota_fixture();
+    let prepared =
+        block_on(core.prepare_quota_source(&provider, crate::CredentialId(7), 4, "subscription"))
+            .unwrap();
+    assert_eq!(prepared.credential_version(), 5);
+    {
+        let mut state = host.state.lock().unwrap();
+        assert_eq!(state.upstream_requests.len(), 1);
+        assert_eq!(state.upstream_requests[0].1, "https://token.test/token");
+        assert_eq!(state.credential.secret["refresh_token"], "rotated");
+        state.scripted.push_back((StatusCode::OK, vec![Bytes::from_static(br#"{"buckets":[{"modelId":"gemini-test","remainingFraction":0.5,"remainingAmount":50,"maxAmount":100}]}"#)]));
+    }
+    let result = block_on(core.execute_quota_source(prepared)).unwrap();
+    assert_eq!(result.credential_version, 5);
+    assert_eq!(result.entries.len(), 1);
+    let state = host.state.lock().unwrap();
+    assert_eq!(state.upstream_requests.len(), 2);
+    assert_eq!(
+        state.upstream_requests[1].0[http::header::AUTHORIZATION],
+        "Bearer refreshed"
+    );
+    assert_eq!(state.rotations, [4]);
+}
+
+#[test]
+fn quota_failure_after_refresh_still_has_a_prepared_current_version() {
+    let (host, core, provider) = oauth_quota_fixture();
+    let prepared =
+        block_on(core.prepare_quota_source(&provider, crate::CredentialId(7), 4, "subscription"))
+            .unwrap();
+    assert_eq!(prepared.credential_version(), 5);
+    host.state.lock().unwrap().scripted.push_back((
+        StatusCode::BAD_GATEWAY,
+        vec![Bytes::from_static(b"unavailable")],
+    ));
+    assert!(matches!(
+        block_on(core.execute_quota_source(prepared)),
+        Err(CoreError::UpstreamExhausted(_))
+    ));
+    let state = host.state.lock().unwrap();
+    assert_eq!(state.credential.version, 5);
+    assert_eq!(state.upstream_requests.len(), 2);
+    assert_eq!(
+        state.upstream_requests[1].0[http::header::AUTHORIZATION],
+        "Bearer refreshed"
+    );
+}
+
+#[test]
+fn a_prepared_quota_query_refuses_credentials_changed_before_egress() {
+    let (host, core, provider) = oauth_quota_fixture();
+    let prepared =
+        block_on(core.prepare_quota_source(&provider, crate::CredentialId(7), 4, "subscription"))
+            .unwrap();
+    {
+        let mut state = host.state.lock().unwrap();
+        state.credential.version = 6;
+        state.credential.secret["access_token"] = json!("other-account");
+    }
+    assert!(matches!(
+        block_on(core.execute_quota_source(prepared)),
+        Err(CoreError::CredentialVersionConflict)
+    ));
+    assert_eq!(host.state.lock().unwrap().upstream_requests.len(), 1);
+}
+
+#[test]
+fn unsupported_or_stale_quota_sources_do_not_start_a_token_refresh() {
+    let (host, core, provider) = oauth_quota_fixture();
+    assert!(matches!(
+        block_on(core.prepare_quota_source(&provider, crate::CredentialId(7), 3, "subscription")),
+        Err(CoreError::CredentialVersionConflict)
+    ));
+    assert!(matches!(
+        block_on(core.prepare_quota_source(&provider, crate::CredentialId(7), 4, "independent")),
+        Err(CoreError::Unsupported)
+    ));
+    assert!(host.state.lock().unwrap().upstream_requests.is_empty());
+}
+
+#[test]
+fn quota_reset_refreshes_expired_codex_authentication_and_sends_one_redemption() {
+    let host = MemoryHost::new(false);
+    {
+        let mut state = host.state.lock().unwrap();
+        state.credential.channel = "codex".into();
+        state.credential.secret =
+            json!({"access_token":"expired", "refresh_token":"saved", "expires_at_ms":1});
+        state.scripted.extend([
+            (
+                StatusCode::OK,
+                vec![Bytes::from_static(
+                    br#"{"access_token":"refreshed","refresh_token":"rotated","expires_in":3600}"#,
+                )],
+            ),
+            (
+                StatusCode::BAD_GATEWAY,
+                vec![Bytes::from_static(b"unavailable")],
+            ),
+        ]);
+    }
+    let core = Core::new(
+        host.clone(),
+        ChannelRegistry::new([Box::new(gproxy_channels::CodexChannel) as Box<dyn Channel>])
+            .unwrap(),
+    )
+    .unwrap();
+    let mut provider = target().provider;
+    provider.channel = "codex".into();
+    assert!(block_on(core.quota_reset("codex", &provider, crate::CredentialId(7))).is_err());
+    let state = host.state.lock().unwrap();
+    assert_eq!(state.upstream_requests.len(), 2);
+    assert_eq!(
+        state.upstream_requests[0].1,
+        "https://auth.openai.com/oauth/token"
+    );
+    assert_eq!(
+        state.upstream_requests[1].0[http::header::AUTHORIZATION],
+        "Bearer refreshed"
+    );
+    assert_eq!(state.rotations, [4]);
 }

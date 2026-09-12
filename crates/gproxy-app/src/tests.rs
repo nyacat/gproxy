@@ -13,6 +13,7 @@ mod postgres_redis;
 mod pressure;
 mod quota;
 mod quota_authorization;
+mod quota_oauth_refresh;
 mod quota_probe;
 mod routing;
 mod runtime_settings;

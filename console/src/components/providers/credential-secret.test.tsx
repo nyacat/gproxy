@@ -54,7 +54,7 @@ const channel: ChannelDto = {
   endpoint_kinds: [], traffic_policy: { request_headers: [], response_headers: [], request_query: [] },
 }
 const credential: CredentialDto = {
-  id: 7, provider_id: 3, label: "Example", kind: "api_key", quota_capabilities: null,
+  id: 7, provider_id: 3, label: "Example", kind: "api_key", quota_capabilities: null, refresh_supported: false,
   version: 1, enabled: true, weight: 100, rpm_limit: null, tpm_limit: null, proxy_url: null,
   tls_fingerprint: null, invalid_tls_fingerprint: null, tls_fingerprint_error: null,
   health: "unknown", health_observed_at: null, health_response_status: null, health_detail: null, model_health: [],

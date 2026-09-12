@@ -67,6 +67,7 @@ pub(in crate::handlers) fn credential(
         .collect();
     CredentialDto {
         quota_capabilities: None,
+        refresh_supported: false,
         id: value.id,
         provider_id: value.provider_id,
         label: value.label.clone(),

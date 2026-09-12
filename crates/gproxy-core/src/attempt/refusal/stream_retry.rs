@@ -39,6 +39,7 @@ impl<H: Host> Runner<H> {
                     CoreError::QuotaExceeded
                     | CoreError::RateLimited { .. }
                     | CoreError::CredentialCoolingDown { .. }
+                    | CoreError::CredentialRefreshCoolingDown { .. }
                     | CoreError::NoCredentials,
                 ) => return Ok(None),
                 Err(error) => return Err(error),

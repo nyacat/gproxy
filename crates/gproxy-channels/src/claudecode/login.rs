@@ -75,7 +75,10 @@ impl ChannelLogin for ClaudeCodeChannel {
             .extensions_mut()
             .insert(profile::CLIENT_PROFILE.clone());
         Box::pin(async move {
-            let response = http.send(request).await?;
+            let response = http
+                .send(request)
+                .await
+                .map_err(|_| ChannelError::Login("token endpoint request failed".into()))?;
             if !response.status().is_success() {
                 return Err(ChannelError::Login(format!(
                     "token endpoint returned {}",
@@ -106,25 +109,16 @@ impl ChannelLogin for ClaudeCodeChannel {
 fn login_secret(token: &Value) -> Result<Value, ChannelError> {
     let access = required(token, "access_token")?;
     let refresh = required(token, "refresh_token")?;
-    let expires_in = token
-        .get("expires_in")
-        .and_then(Value::as_i64)
-        .unwrap_or(3_600)
-        .max(0);
     let mut secret = json!({
         "access_token": access,
         "refresh_token": refresh,
-        "expires_at_ms": auth::unix_now_ms().saturating_add(expires_in.saturating_mul(1_000)),
         "device_id": auth::device_id(token),
     });
-    if let Some(scope) = token.get("scope").and_then(Value::as_str) {
-        secret["scopes"] = Value::Array(
-            scope
-                .split_whitespace()
-                .map(|value| Value::String(value.into()))
-                .collect(),
-        );
-    }
+    auth::update_token_metadata(
+        secret.as_object_mut().expect("login secret is an object"),
+        token,
+        auth::unix_now_ms(),
+    );
     Ok(secret)
 }
 
@@ -132,6 +126,7 @@ fn required<'a>(token: &'a Value, name: &str) -> Result<&'a str, ChannelError> {
     token
         .get(name)
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ChannelError::Login(format!("token response missing {name}")))
 }

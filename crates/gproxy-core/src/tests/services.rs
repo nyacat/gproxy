@@ -52,6 +52,12 @@ impl CredentialStore for MemoryHost {
         Box::pin(async move {
             let mut state = state.lock().expect("state lock");
             state.rotations.push(version);
+            if state.metadata_conflicts > 0 {
+                state.metadata_conflicts -= 1;
+                state.credential.version += 1;
+                state.credential.secret["quota_api_key"] = json!("new-quota-key");
+                return Err(StoreError("version conflict".into()));
+            }
             if state.conflict {
                 state.conflict = false;
                 state.credential.secret = json!({
@@ -64,6 +70,15 @@ impl CredentialStore for MemoryHost {
             if state.credential.version != version {
                 return Err(StoreError("version conflict".into()));
             }
+            let mut secret = secret;
+            if let Some(object) = secret.as_object_mut() {
+                object.retain(|key, _| !key.starts_with("quota_"));
+            }
+            if let Some(current) = state.credential.secret.as_object() {
+                for (key, value) in current.iter().filter(|(key, _)| key.starts_with("quota_")) {
+                    secret[key] = value.clone();
+                }
+            }
             state.credential.secret = secret;
             state.credential.version += 1;
             Ok(())
@@ -72,13 +87,61 @@ impl CredentialStore for MemoryHost {
 
     fn lease_refresh<'a>(
         &'a self,
-        _: CredentialId,
-        _: Duration,
+        id: CredentialId,
+        owner: &'a [u8],
+        ttl: Duration,
     ) -> BoxFuture<'a, Result<bool, StoreError>> {
         let mut state = self.state.lock().expect("state lock");
         state.lease_calls += 1;
         let acquired = !state.peer_refresh_on_wait;
-        Box::pin(async move { Ok(acquired) })
+        drop(state);
+        Box::pin(async move {
+            if acquired {
+                self.compare_and_swap(
+                    &format!("refresh:{}", id.0),
+                    None,
+                    Some(owner.to_vec()),
+                    Some(ttl),
+                )
+                .await
+            } else {
+                Ok(false)
+            }
+        })
+    }
+
+    fn renew_refresh<'a>(
+        &'a self,
+        id: CredentialId,
+        owner: &'a [u8],
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async move {
+            self.compare_and_swap(
+                &format!("refresh:{}", id.0),
+                Some(owner.to_vec()),
+                Some(owner.to_vec()),
+                Some(ttl),
+            )
+            .await
+        })
+    }
+
+    fn release_refresh<'a>(
+        &'a self,
+        id: CredentialId,
+        owner: &'a [u8],
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            self.compare_and_swap(
+                &format!("refresh:{}", id.0),
+                Some(owner.to_vec()),
+                None,
+                None,
+            )
+            .await
+            .map(|_| ())
+        })
     }
 }
 
@@ -357,13 +420,36 @@ impl UpstreamTransport for MemoryHost {
             if let Some(response) = super::refusal::scripted(&state, &request) {
                 return Ok(response);
             }
+            if request.uri().path() == "/refresh" {
+                state.lock().unwrap().refresh_calls += 1;
+                std::future::poll_fn(|_| {
+                    if state.lock().unwrap().refresh_pending {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(())
+                    }
+                })
+                .await;
+                if state.lock().unwrap().refresh_error {
+                    return Err(TransportError::Interrupted("refresh failed".into()));
+                }
+            }
             let realtime_call = request.uri().path() == "/v1/realtime/calls";
             let (status, bodies) = if request.uri().path() == "/refresh" {
                 (
                     http::StatusCode::OK,
-                    vec![Bytes::from_static(
-                        br#"{"access_token":"fresh","expires_at":9223372036854775807}"#,
-                    )],
+                    vec![
+                        state
+                            .lock()
+                            .unwrap()
+                            .refresh_body
+                            .clone()
+                            .unwrap_or_else(|| {
+                                Bytes::from_static(
+                                    br#"{"access_token":"fresh","expires_at":9223372036854775807}"#,
+                                )
+                            }),
+                    ],
                 )
             } else {
                 let path = request.uri().path().to_owned();

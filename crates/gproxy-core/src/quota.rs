@@ -8,16 +8,24 @@ use bytes::BytesMut;
 use futures_util::StreamExt;
 use gproxy_channel_api::{QuotaObservation, QuotaResetCredits, QuotaResetResult};
 
-use crate::host::{CredentialId, CredentialStore};
+use crate::host::{CredentialId, CredentialRecord, CredentialStore};
 use crate::{Core, CoreError, Host, ProviderRef, UpstreamTransport};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuotaProbeResult {
+    pub credential_version: u64,
     pub observations: Vec<QuotaObservation>,
     pub reset_credits: Option<QuotaResetCredits>,
     /// Verbatim usage-endpoint body, so an operator can inspect windows the
     /// channel parser does not (yet) extract.
     pub raw: String,
+}
+
+pub(crate) struct PreparedQuotaProbe {
+    pub(crate) record: CredentialRecord,
+    channel: std::sync::Arc<dyn gproxy_channel_api::Channel>,
+    request: http::Request<bytes::Bytes>,
+    credits_request: Option<http::Request<bytes::Bytes>>,
 }
 
 impl<H: Host> Core<H> {
@@ -38,17 +46,19 @@ impl<H: Host> Core<H> {
         provider: &ProviderRef,
         credential: CredentialId,
     ) -> Result<QuotaProbeResult, CoreError> {
-        self.quota_probe_version(channel, provider, credential, None)
-            .await
+        let prepared = self
+            .prepare_quota_probe(channel, provider, credential, None)
+            .await?;
+        self.execute_quota_probe(prepared).await
     }
 
-    pub(crate) async fn quota_probe_version(
+    pub(crate) async fn prepare_quota_probe(
         &self,
         channel: &str,
         provider: &ProviderRef,
         credential: CredentialId,
         expected_version: Option<u64>,
-    ) -> Result<QuotaProbeResult, CoreError> {
+    ) -> Result<PreparedQuotaProbe, CoreError> {
         if provider.channel != channel {
             return Err(CoreError::UnknownProvider(
                 "probe provider does not match channel".into(),
@@ -56,15 +66,29 @@ impl<H: Host> Core<H> {
         }
         let channel = self
             .channels
-            .get(channel)
+            .shared(channel)
             .ok_or_else(|| CoreError::UnknownProvider("channel is not registered".into()))?;
-        let record = self.host.credentials().load(credential).await?;
-        if expected_version.is_some_and(|version| record.version != version)
-            || record.channel != provider.channel
-        {
+        let record = self.host.credentials().load_current(credential).await?;
+        if expected_version.is_some_and(|version| record.version != version) {
+            return Err(CoreError::CredentialVersionConflict);
+        }
+        if record.id != credential || record.channel != provider.channel {
             return Err(CoreError::Unsupported);
         }
 
+        if !channel
+            .quota_capabilities(&record.secret)
+            .is_some_and(|capability| capability.probe)
+        {
+            return Err(CoreError::Unsupported);
+        }
+        let record = crate::execution::credential::load_fresh_shared(
+            &self.host,
+            channel.clone(),
+            credential,
+            provider,
+        )
+        .await?;
         if !channel
             .quota_capabilities(&record.secret)
             .is_some_and(|capability| capability.probe)
@@ -76,6 +100,30 @@ impl<H: Host> Core<H> {
             return Err(CoreError::Unsupported);
         };
         crate::fingerprint::apply_request(&mut request, provider)?;
+        let mut credits_request =
+            channel.prepare_quota_credits_probe(&record.secret, &provider.settings)?;
+        if let Some(request) = &mut credits_request {
+            crate::fingerprint::apply_request(request, provider)?;
+        }
+        Ok(PreparedQuotaProbe {
+            record,
+            channel,
+            request,
+            credits_request,
+        })
+    }
+
+    pub(crate) async fn execute_quota_probe(
+        &self,
+        prepared: PreparedQuotaProbe,
+    ) -> Result<QuotaProbeResult, CoreError> {
+        let PreparedQuotaProbe {
+            record,
+            channel,
+            request,
+            credits_request,
+        } = prepared;
+        self.check_quota_credential(&record).await?;
         let started_at_ms = now_ms();
         let (status, body) = self.buffered(request).await?;
         let received_at_ms = now_ms();
@@ -96,22 +144,20 @@ impl<H: Host> Core<H> {
         let mut reset_credits = channel.parse_quota_probe_credits(status, &body);
         // The dedicated credits endpoint carries per-credit expiry the usage
         // summary lacks; a failed detail call keeps the summary's count.
-        if let Some(mut request) =
-            channel.prepare_quota_credits_probe(&record.secret, &provider.settings)?
+        if let Some(request) = credits_request
+            && self.check_quota_credential(&record).await.is_ok()
+            && let Ok((status, body)) = self.buffered(request).await
+            && let Some(credits) = channel.parse_quota_probe_credits(status, &body)
         {
-            crate::fingerprint::apply_request(&mut request, provider)?;
-            if let Ok((status, body)) = self.buffered(request).await
-                && let Some(credits) = channel.parse_quota_probe_credits(status, &body)
-            {
-                reset_credits = Some(credits);
-            }
+            reset_credits = Some(credits);
         }
         if !observations.is_empty() {
             self.host
-                .observe_credential_quota(credential, record.version, observations.clone())
+                .observe_credential_quota(record.id, record.version, observations.clone())
                 .await;
         }
         Ok(QuotaProbeResult {
+            credential_version: record.version,
             observations,
             reset_credits,
             raw,
@@ -133,14 +179,26 @@ impl<H: Host> Core<H> {
             .channels
             .get(channel)
             .ok_or_else(|| CoreError::UnknownProvider("channel is not registered".into()))?;
-        let record = self.host.credentials().load(credential).await?;
-        let redeem_request_id = redeem_request_id()?;
+        let record = self.host.credentials().load_current(credential).await?;
+        if record.id != credential || record.channel != provider.channel {
+            return Err(CoreError::Unsupported);
+        }
         if !channel
             .quota_capabilities(&record.secret)
             .is_some_and(|capability| capability.reset)
         {
             return Err(CoreError::Unsupported);
         }
+        let record =
+            crate::execution::credential::load_fresh(self, channel, credential, provider).await?;
+        if !channel
+            .quota_capabilities(&record.secret)
+            .is_some_and(|capability| capability.reset)
+        {
+            return Err(CoreError::Unsupported);
+        }
+        self.check_quota_credential(&record).await?;
+        let redeem_request_id = redeem_request_id()?;
         let Some(mut request) =
             channel.prepare_quota_reset(&record.secret, &provider.settings, &redeem_request_id)?
         else {
@@ -153,6 +211,20 @@ impl<H: Host> Core<H> {
                 "quota reset returned an invalid {status} response"
             ))
         })
+    }
+
+    pub(crate) async fn check_quota_credential(
+        &self,
+        record: &CredentialRecord,
+    ) -> Result<(), CoreError> {
+        let current = self.host.credentials().load_current(record.id).await?;
+        if current.id != record.id
+            || current.version != record.version
+            || current.channel != record.channel
+        {
+            return Err(CoreError::CredentialVersionConflict);
+        }
+        Ok(())
     }
 
     pub(crate) async fn buffered(

@@ -93,7 +93,7 @@ pub(super) fn refresh<'a>(
     secret: &'a Value,
     settings: &'a Value,
     http: &'a dyn SimpleHttp,
-) -> BoxFuture<'a, Result<Value, ChannelError>> {
+) -> BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>> {
     let request = validation_request(secret, settings);
     let request = match request {
         Ok(request) => request,
@@ -108,7 +108,10 @@ pub(super) fn refresh<'a>(
                 response.status()
             )));
         }
-        super::bootstrap::merge(secret, response.body())
+        Ok(gproxy_channel_api::RefreshResult {
+            secret: super::bootstrap::merge(secret, response.body())?,
+            refresh_token: gproxy_channel_api::RefreshTokenStatus::NotApplicable,
+        })
     })
 }
 

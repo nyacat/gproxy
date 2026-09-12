@@ -1,4 +1,4 @@
-import { PencilIcon } from "lucide-react"
+import { PencilIcon, RefreshCwIcon } from "lucide-react"
 import { useId } from "react"
 import { useTranslation } from "react-i18next"
 import { toast } from "sonner"
@@ -7,6 +7,7 @@ import type { CredentialDto } from "@/generated/CredentialDto"
 import type { CredentialWriteRequest } from "@/generated/CredentialWriteRequest"
 import type { TlsPresetDto } from "@/generated/TlsPresetDto"
 import { CredentialDialog } from "@/components/providers/credential-dialog"
+import { useCredentialRefresh } from "@/components/providers/use-credential-refresh"
 import { EntityDeleteButton } from "@/components/entity-delete-button"
 import { Button } from "@/components/ui/button"
 import { Field, FieldLabel } from "@/components/ui/field"
@@ -16,6 +17,7 @@ export function CredentialRowActions({ credential, channel, presets, saving, onS
   const { t } = useTranslation()
   const switchId = useId()
   const name = credential.label ?? t("providers.credentials.unnamed", { id: credential.id })
+  const { refreshing, refresh } = useCredentialRefresh(credential)
   const setEnabled = async (enabled: boolean) => {
     try {
       await onSave({
@@ -40,17 +42,28 @@ export function CredentialRowActions({ credential, channel, presets, saving, onS
     <div className="flex items-center justify-end gap-2" onClick={(event) => event.stopPropagation()}>
       <Field orientation="horizontal" className="w-auto">
         <FieldLabel htmlFor={switchId} className="sr-only">{t("providers.credentials.enabled")}</FieldLabel>
-        <Switch id={switchId} size="sm" checked={credential.enabled} onCheckedChange={(value) => void setEnabled(value)} disabled={saving} />
+        <Switch id={switchId} size="sm" checked={credential.enabled} onCheckedChange={(value) => void setEnabled(value)} disabled={saving || refreshing} />
       </Field>
+      {credential.refresh_supported ? <Button
+        variant="outline"
+        size="icon-sm"
+        disabled={!credential.enabled || saving || refreshing}
+        aria-label={`${t(refreshing ? "providers.credentials.oauthRefresh.pending" : "providers.credentials.oauthRefresh.action")}: ${name}`}
+        title={t(refreshing ? "providers.credentials.oauthRefresh.pending" : "providers.credentials.oauthRefresh.action")}
+        onClick={refresh}
+      >
+        <RefreshCwIcon aria-hidden className={refreshing ? "animate-spin" : undefined} />
+      </Button> : null}
       <CredentialDialog
+        key={`${credential.id}:${credential.version}`}
         providerId={credential.provider_id}
         credential={credential}
         channel={channel}
         presets={presets}
         onSave={onSave}
-        trigger={<Button variant="outline" size="icon-sm" aria-label={`${t("common.actions.edit")}: ${name}`}><PencilIcon aria-hidden /></Button>}
+        trigger={<Button variant="outline" size="icon-sm" disabled={saving || refreshing} aria-label={`${t("common.actions.edit")}: ${name}`}><PencilIcon aria-hidden /></Button>}
       />
-      <EntityDeleteButton entity="credentials" id={credential.id} label={name} queryKeys={["credentials", "credential-cycles"]} />
+      <EntityDeleteButton entity="credentials" id={credential.id} label={name} queryKeys={["credentials", "credential-cycles"]} disabled={saving || refreshing} />
     </div>
   )
 }

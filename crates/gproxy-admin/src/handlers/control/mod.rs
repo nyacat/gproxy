@@ -37,7 +37,8 @@ pub(super) async fn list(
             })
             .collect::<Vec<_>>();
         for value in &mut values {
-            value.quota_capabilities = state.credential_quota_capabilities(value.id).await?;
+            (value.quota_capabilities, value.refresh_supported) =
+                state.credential_capabilities(value.id).await?;
         }
         return response::json(StatusCode::OK, &values);
     }
@@ -144,5 +145,21 @@ pub(super) async fn credential_secret(
     crate::response::json(
         http::StatusCode::OK,
         &crate::dto::CredentialSecretResponse { secret },
+    )
+}
+
+pub(super) async fn credential_refresh(
+    state: &impl State,
+    id: i64,
+    body: &Bytes,
+) -> Result<Response<Bytes>, AdminError> {
+    let request: crate::dto::CredentialRefreshRequest = super::util::parse(body).map_err(|_| {
+        AdminError::BadRequest(
+            "refresh request must contain only an unsigned integer version".into(),
+        )
+    })?;
+    response::json(
+        StatusCode::OK,
+        &state.credential_refresh(id, request.version).await?,
     )
 }

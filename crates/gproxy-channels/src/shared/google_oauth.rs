@@ -23,7 +23,7 @@ pub(crate) fn refresh<'a>(
     profile: &'static ClientProfile,
     default_client_id: &'static str,
     default_client_secret: &'static str,
-) -> BoxFuture<'a, Result<Value, ChannelError>> {
+) -> BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>> {
     let request = match build_refresh(
         secret,
         settings,
@@ -84,7 +84,10 @@ fn build_refresh(
     Ok(request)
 }
 
-fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
+fn rotate(
+    secret: &Value,
+    token: &Value,
+) -> Result<gproxy_channel_api::RefreshResult, ChannelError> {
     let access = field(token, "access_token")
         .ok_or_else(|| ChannelError::Refresh("access_token missing".into()))?;
     let mut output = secret.clone();
@@ -92,9 +95,6 @@ fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
         .as_object_mut()
         .ok_or_else(|| ChannelError::Refresh("secret must be an object".into()))?;
     object.insert("access_token".into(), Value::String(access.into()));
-    if let Some(refresh) = field(token, "refresh_token") {
-        object.insert("refresh_token".into(), Value::String(refresh.into()));
-    }
     if let Some(expires) = token.get("expires_in").and_then(Value::as_i64) {
         object.insert(
             "expires_at_ms".into(),
@@ -107,7 +107,7 @@ fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
     } else {
         object.remove("expires_at_ms");
     }
-    Ok(output)
+    crate::shared::refresh::oauth(output, token.get("refresh_token").and_then(Value::as_str))
 }
 
 fn required<'a>(value: &'a Value, name: &str) -> Result<&'a str, ChannelError> {
