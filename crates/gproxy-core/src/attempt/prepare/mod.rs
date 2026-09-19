@@ -225,6 +225,7 @@ pub(crate) async fn prepare<H: Host>(
     .await?;
     let target_framing = gproxy_protocol::default_framing(support.target.kind(), false);
     let facts = FunnelCtx {
+        activity: None,
         pricing_control: Some(std::sync::Arc::from(control.detached())),
         usage_channel: core.channels.shared(channel.descriptor().id),
         upstream_started_at_ms: None,

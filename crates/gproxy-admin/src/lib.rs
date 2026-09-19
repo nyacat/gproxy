@@ -5,6 +5,10 @@ mod credential_label;
 mod defaults;
 mod dispatch;
 pub mod dto;
+
+/// Host-generated correlation id; never taken from an untrusted request header.
+#[derive(Clone)]
+pub struct RequestId(pub String);
 mod error;
 mod handlers;
 mod portal;

@@ -98,7 +98,11 @@ impl RuntimeSettingsStatusDto {
     pub fn configured(effective: RuntimeSettingsDto) -> Self {
         Self {
             native_controls: cfg!(not(target_arch = "wasm32")),
-            log_filter: effective.log_level.as_str().into(),
+            log_filter: if effective.log_level == LogLevelDto::Debug {
+                "debug,tokio_postgres=info".into()
+            } else {
+                effective.log_level.as_str().into()
+            },
             effective,
             overrides: Vec::new(),
         }

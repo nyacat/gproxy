@@ -42,6 +42,10 @@ pub(in crate::handlers) async fn records(
     state: &impl State,
     parts: &Parts,
 ) -> Result<Response<Bytes>, AdminError> {
+    timed("usage.records", parts, records_inner(state, parts)).await
+}
+
+async fn records_inner(state: &impl State, parts: &Parts) -> Result<Response<Bytes>, AdminError> {
     let (query, filter) = query(parts)?;
     let page = query.page.unwrap_or(1);
     let page_size = query.page_size.unwrap_or(10);
@@ -51,9 +55,14 @@ pub(in crate::handlers) async fn records(
     {
         return Err(AdminError::BadRequest("invalid page or page_size".into()));
     }
-    let (records, total) = state
+    let (records, total, has_more) = state
         .store()
-        .usage_records(&filter, page, page_size)
+        .usage_records_page(
+            &filter,
+            page,
+            page_size,
+            query.include_total.unwrap_or(true),
+        )
         .await?;
     let items = records
         .into_iter()
@@ -88,6 +97,7 @@ pub(in crate::handlers) async fn records(
             total,
             page,
             page_size,
+            has_more,
         },
     )
 }
@@ -96,9 +106,37 @@ pub(in crate::handlers) async fn summary(
     state: &impl State,
     parts: &Parts,
 ) -> Result<Response<Bytes>, AdminError> {
-    let (_, filter) = query(parts)?;
-    let totals: UsageSummaryDto = state.store().usage_summary(&filter).await?.into();
-    response::json(StatusCode::OK, &totals)
+    timed("usage.summary", parts, async {
+        let (_, filter) = query(parts)?;
+        let totals: UsageSummaryDto = state.store().usage_summary(&filter).await?.into();
+        response::json(StatusCode::OK, &totals)
+    })
+    .await
+}
+
+async fn timed(
+    source: &'static str,
+    parts: &Parts,
+    future: impl Future<Output = Result<Response<Bytes>, AdminError>>,
+) -> Result<Response<Bytes>, AdminError> {
+    use tracing::Instrument;
+    let request_id = parts
+        .extensions
+        .get::<crate::RequestId>()
+        .map(|id| id.0.as_str())
+        .unwrap_or("unavailable");
+    async {
+        let mut timing = super::StatisticsTiming {
+            started: web_time::Instant::now(),
+            outcome: "cancelled",
+            source,
+        };
+        let result = future.await;
+        timing.outcome = if result.is_ok() { "ok" } else { "error" };
+        result
+    }
+    .instrument(tracing::info_span!("usage.read", source, request_id))
+    .await
 }
 
 pub(in crate::handlers) async fn delete(

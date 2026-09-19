@@ -14,9 +14,30 @@ pub(crate) async fn run(
     credential_id: i64,
     force: bool,
 ) -> Result<QuotaProbeResponse, AdminError> {
-    refresh(app, credential_id, force, !force).await
+    run_with_options(app, credential_id, force, false).await
 }
 
+pub(crate) async fn run_with_options(
+    app: &AppHandle,
+    credential_id: i64,
+    force: bool,
+    lightweight: bool,
+) -> Result<QuotaProbeResponse, AdminError> {
+    use tracing::Instrument;
+
+    let raw = refresh(app, credential_id, force, !force).await?;
+    response(app, credential_id, raw, lightweight)
+        .instrument(tracing::info_span!(
+            "quota.statistics",
+            source = "quota_probe.response",
+            credential_id,
+            lightweight
+        ))
+        .await
+}
+
+/// Maintenance repairs accounting in its own bounded sweep. It only needs to
+/// refresh source snapshots, so it never builds the administrator's statistics.
 pub(crate) async fn automatic(app: &AppHandle, credential_id: i64) -> Result<(), AdminError> {
     refresh(app, credential_id, false, true).await.map(|_| ())
 }
@@ -26,7 +47,7 @@ async fn refresh(
     id: i64,
     force: bool,
     automatic: bool,
-) -> Result<QuotaProbeResponse, AdminError> {
+) -> Result<String, AdminError> {
     let (provider, version, sources) = super::quota_snapshot::sources(app, id).await?;
     let cache = &app.inner.host.services.cache;
     let lease_key = format!("quota:probe:{id}:lease");
@@ -85,7 +106,7 @@ async fn refresh(
                 raw = body;
             }
         }
-        response(app, id, raw).await
+        Ok(raw)
     }
     .await;
     cache
@@ -95,7 +116,12 @@ async fn refresh(
     result
 }
 
-async fn response(app: &AppHandle, id: i64, raw: String) -> Result<QuotaProbeResponse, AdminError> {
+async fn response(
+    app: &AppHandle,
+    id: i64,
+    raw: String,
+    lightweight: bool,
+) -> Result<QuotaProbeResponse, AdminError> {
     let snapshot = super::quota_snapshot::read(app, id).await?;
     let mut response = QuotaProbeResponse {
         windows: windows(&snapshot),
@@ -114,12 +140,30 @@ async fn response(app: &AppHandle, id: i64, raw: String) -> Result<QuotaProbeRes
     };
     let store = &app.inner.host.services.store;
     let now = crate::quota_refresh::now();
-    if let Err(error) = store.repair_credential_quota(id, now).await {
+    // Repair can scan usage and cycle history. Overview requests only need
+    // persisted window summaries; maintenance and explicit details own repair.
+    if !lightweight && let Err(error) = store.repair_credential_quota(id, now).await {
         tracing::warn!(credential_id = id, error = %error, "quota accounting repair failed");
         response.local_error = true;
     }
-    match store.credential_quota_cycles(Some(id), 0, now + 1).await {
-        Ok(cycles) => response.cycles = cycles.iter().map(Into::into).collect(),
+    match store
+        .credential_quota_statistics_with_options(
+            &gproxy_store::records::CredentialQuotaCycleQuery {
+                credential_id: Some(id),
+                provider_id: None,
+                from: 0,
+                to: now + 1,
+                calculate: !lightweight && app.inner.host.services.control.settings().enable_usage,
+                history: false,
+            },
+            &gproxy_store::records::CredentialQuotaStatisticsOptions {
+                current_only: lightweight,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(cycles) => response.cycles = cycles.iter().map(|value| (&value.cycle).into()).collect(),
         Err(error) => {
             tracing::warn!(credential_id = id, error = %error, "quota local statistics unavailable");
             response.local_error = true;

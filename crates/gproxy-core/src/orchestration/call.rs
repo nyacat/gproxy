@@ -32,6 +32,7 @@ pub(super) async fn run<H: Host>(
     let headers = prepared.request.headers().clone();
     let body = prepared.request.body().clone();
     let mut facts = FunnelCtx {
+        activity: None,
         upstream_started_at_ms: Some(crate::quota::now_ms()),
         request_id,
         target,

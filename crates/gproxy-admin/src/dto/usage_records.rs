@@ -17,6 +17,10 @@ pub struct UsageRecordQueryDto {
     pub ended: Option<String>,
     pub page: Option<u64>,
     pub page_size: Option<u64>,
+    // Omit the full-range count when the caller already requests a summary.
+    // Defaults to true for existing API clients.
+    #[ts(optional)]
+    pub include_total: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -46,9 +50,10 @@ pub struct UsageRecordDto {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct UsageRecordPageDto {
     pub items: Vec<UsageRecordDto>,
-    pub total: u64,
+    pub total: Option<u64>,
     pub page: u64,
     pub page_size: u64,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

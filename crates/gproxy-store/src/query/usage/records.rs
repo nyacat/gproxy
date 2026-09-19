@@ -39,14 +39,31 @@ pub(crate) fn records(
     offset: u64,
     limit: u64,
 ) -> Result<Statement, StoreError> {
-    let mut query = filtered(filter);
-    query
-        .column(Alias::new("id"))
-        .columns(super::row::COLUMNS.iter().copied().map(Alias::new))
+    // Skip narrow index entries, then hydrate only the requested page. Deep
+    // offsets must not fetch metrics/dimensions and other wide fields per skip.
+    let mut ids = filtered(filter);
+    ids.column(Alias::new("id"))
+        .column(Alias::new("at"))
         .order_by(Alias::new("at"), Order::Desc)
         .order_by(Alias::new("id"), Order::Desc)
         .offset(offset)
         .limit(limit);
+    let mut query = Query::select();
+    query
+        .from_subquery(ids, Alias::new("page"))
+        .inner_join(
+            Alias::new("usage_rows"),
+            Expr::col((Alias::new("usage_rows"), Alias::new("id")))
+                .equals((Alias::new("page"), Alias::new("id"))),
+        )
+        .column((Alias::new("usage_rows"), Alias::new("id")))
+        .columns(
+            super::row::COLUMNS
+                .iter()
+                .map(|column| (Alias::new("usage_rows"), Alias::new(*column))),
+        )
+        .order_by((Alias::new("page"), Alias::new("at")), Order::Desc)
+        .order_by((Alias::new("page"), Alias::new("id")), Order::Desc);
     Statement::query(&query)
 }
 
@@ -58,16 +75,33 @@ pub(crate) fn count_filtered(filter: &UsageFilter) -> Result<Statement, StoreErr
 
 pub(crate) fn summary_rows(
     filter: &UsageFilter,
-    after: i64,
+    after: Option<(i64, i64)>,
     limit: u64,
 ) -> Result<Statement, StoreError> {
     let mut query = filtered(filter);
     query
         .column(Alias::new("id"))
-        .columns(super::row::COLUMNS.iter().copied().map(Alias::new))
-        .and_where(Expr::col(Alias::new("id")).gt(after))
+        .column(Alias::new("at"))
+        .columns(
+            [
+                "input_tokens",
+                "output_tokens",
+                "cached_input_tokens",
+                "metrics_json",
+                "cost",
+            ]
+            .into_iter()
+            .map(Alias::new),
+        )
+        .order_by(Alias::new("at"), Order::Asc)
         .order_by(Alias::new("id"), Order::Asc)
         .limit(limit);
+    if let Some((at, id)) = after {
+        query.and_where(
+            Expr::tuple(["at", "id"].map(|column| Expr::col(Alias::new(column))))
+                .gt(Expr::tuple([Expr::val(at), Expr::val(id)])),
+        );
+    }
     Statement::query(&query)
 }
 

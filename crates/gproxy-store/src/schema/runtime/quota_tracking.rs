@@ -33,6 +33,12 @@ pub(super) const TABLES: &[TableSpec] = &[
             Col::required("credential_id", Integer),
             Col::required("model", Text),
             Col::required("started_at_ms", Integer),
+            Col::optional("parent_request_id", Text).since(SchemaVersion::QuotaActivityLifecycle),
+            // Legacy rows without an exact settlement are unknown consumption,
+            // not evidence of either a running request or zero usage.
+            Col::required("state", Text)
+                .default("'unresolved'")
+                .since(SchemaVersion::QuotaActivityLifecycle),
         ],
         owns: &[],
         indexes: &[
@@ -41,6 +47,18 @@ pub(super) const TABLES: &[TableSpec] = &[
                 columns: &["request_id", "credential_id", "started_at_ms"],
                 unique: true,
                 added_in: None,
+            },
+            IndexSpec {
+                name: "ix_quota_activity_parent",
+                columns: &["parent_request_id", "state"],
+                unique: false,
+                added_in: Some(SchemaVersion::QuotaActivityLifecycle),
+            },
+            IndexSpec {
+                name: "ix_quota_activity_unresolved",
+                columns: &["credential_id", "state", "started_at_ms"],
+                unique: false,
+                added_in: Some(SchemaVersion::QuotaActivityLifecycle),
             },
             IndexSpec {
                 name: "ix_quota_activity_credential",

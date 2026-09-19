@@ -59,6 +59,22 @@ fn decimal(row: &Row, field: &'static str) -> Result<Option<rust_decimal::Decima
         .transpose()
 }
 
+pub(super) fn window(row: Row) -> Result<crate::records::CredentialQuotaWindowState, StoreError> {
+    Ok(crate::records::CredentialQuotaWindowState {
+        id: row.i64("id")?,
+        version: u64::try_from(row.i64("version")?).map_err(|error| invalid("version", error))?,
+        credential_id: row.i64("credential_id")?,
+        window_key: row.text("window_key")?.into(),
+        period_start: row.optional_i64("period_start")?,
+        period_end: row.optional_i64("period_end")?,
+        boundary_source: enum_value(&row, "boundary_source")?,
+        last_observed_at: row.i64("last_observed_at")?,
+        upstream_used: decimal(&row, "upstream_used")?,
+        upstream_limit: decimal(&row, "upstream_limit")?,
+        used_percent: decimal(&row, "used_percent")?,
+    })
+}
+
 fn enum_value<T: DeserializeOwned>(row: &Row, field: &'static str) -> Result<T, StoreError> {
     deserialize_enum(row.text(field)?, field)
 }

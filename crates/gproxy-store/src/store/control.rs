@@ -6,6 +6,20 @@ use crate::records::{
 use crate::{Store, StoreError};
 
 impl Store {
+    pub async fn setting(&self, key: &str) -> Result<Option<serde_json::Value>, StoreError> {
+        self.backend()
+            .execute(control::select_setting(key)?)
+            .await?
+            .rows
+            .into_iter()
+            .next()
+            .map(|row| {
+                serde_json::from_str(row.text("value_json")?)
+                    .map_err(|error| StoreError::Database(error.to_string()))
+            })
+            .transpose()
+    }
+
     pub async fn admin_credentials(&self) -> Result<Vec<CredentialAdminRecord>, StoreError> {
         self.backend()
             .execute(control::select_admin_credentials()?)
@@ -92,7 +106,9 @@ impl Store {
         id: i64,
         input: &crate::records::CredentialUpdateInput,
     ) -> Result<bool, StoreError> {
-        let mut statements = crate::query::runtime::quota_snapshot::clear(id)?;
+        let mut statements =
+            vec![crate::query::runtime::quota_snapshot::lock_credential_version(id, None)?];
+        statements.extend(crate::query::runtime::quota_snapshot::clear(id)?);
         statements.push(control::update_credential(id, input, None)?);
         let results = self.backend().batch(statements).await?;
         Ok(results
@@ -109,8 +125,16 @@ impl Store {
         expected_version: u64,
         preserve_health: bool,
     ) -> Result<bool, StoreError> {
-        let mut statements =
-            crate::query::runtime::quota_snapshot::clear_version(id, expected_version)?;
+        let mut statements = vec![
+            crate::query::runtime::quota_snapshot::lock_credential_version(
+                id,
+                Some(expected_version),
+            )?,
+        ];
+        statements.extend(crate::query::runtime::quota_snapshot::clear_version(
+            id,
+            expected_version,
+        )?);
         if preserve_health {
             statements.push(
                 crate::query::runtime::quota_snapshot::advance_health_version(

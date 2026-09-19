@@ -1,6 +1,21 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct CredentialCycleReadRequest {
+    pub from: i64,
+    pub to: i64,
+    pub credential_id: Option<i64>,
+    pub provider_id: Option<i64>,
+    pub cycle_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub include_history: bool,
+    #[serde(default)]
+    pub include_estimate: bool,
+    #[serde(default)]
+    pub current_only: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct QuotaCapabilitiesDto {
     pub probe: bool,

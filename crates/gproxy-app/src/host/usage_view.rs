@@ -52,7 +52,7 @@ impl UsageView for AppUsageView {
             self.host
                 .services
                 .store
-                .open_credential_quota_cycles(self.credential.0, unix_now())
+                .credential_quota_window_states(Some(self.credential.0), unix_now())
                 .await
                 .map_err(state_error)
                 .map(|cycles| {

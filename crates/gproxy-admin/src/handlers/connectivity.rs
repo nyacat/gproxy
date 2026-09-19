@@ -33,10 +33,33 @@ pub(super) async fn quota_probe(
 ) -> Result<Response<Bytes>, AdminError> {
     let query = util::query(parts);
     let force = util::value(&query, "force") == Some("true");
-    response::json(
-        StatusCode::OK,
-        &state.quota_probe(credential_id, force).await?,
-    )
+    let lightweight = util::value(&query, "lightweight")
+        .map(|v| v.parse::<bool>())
+        .transpose()
+        .map_err(|_| AdminError::BadRequest("lightweight must be true or false".into()))?
+        .unwrap_or(false);
+    use tracing::Instrument;
+    let request_id = parts
+        .extensions
+        .get::<crate::RequestId>()
+        .map_or("unavailable", |id| id.0.as_str());
+    let result = async {
+        if lightweight {
+            state.quota_probe_lightweight(credential_id, force).await
+        } else {
+            state.quota_probe(credential_id, force).await
+        }
+    }
+    .instrument(tracing::info_span!(
+        "quota.probe",
+        request_id,
+        credential_id,
+        force,
+        lightweight,
+        source = "admin.quota_probe"
+    ))
+    .await?;
+    response::json(StatusCode::OK, &result)
 }
 
 pub(super) async fn quota_reset(

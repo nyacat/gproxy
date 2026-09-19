@@ -2,12 +2,13 @@ use crate::records::{
     CredentialQuotaCycleRecord, CredentialQuotaObservation, CycleObservationRecord,
 };
 use crate::{StoreError, backend::Statement};
-use sea_query::{Alias, Expr, ExprTrait, OnConflict, Order, Query};
+use sea_query::{Alias, Expr, ExprTrait, OnConflict, Query};
 
 pub(crate) fn insert_cycle_observation(
     cycle: &CredentialQuotaCycleRecord,
     raw: &CredentialQuotaObservation,
     rejected: bool,
+    credential_version: Option<u64>,
 ) -> Result<Statement, StoreError> {
     let mut sample = CycleObservationRecord::from(cycle);
     sample.raw = Some(raw.clone());
@@ -37,6 +38,12 @@ pub(crate) fn insert_cycle_observation(
         .and_where(Expr::col(Alias::new("window_key")).eq(&cycle.window_key))
         .and_where(Expr::col(Alias::new("version")).eq(cycle.version))
         .and_where(Expr::col(Alias::new("tracking_json")).eq(tracking));
+    if let Some(version) = credential_version {
+        selected.and_where(super::super::quota_snapshot::credential_version_matches(
+            cycle.credential_id,
+            version,
+        )?);
+    }
     if cycle.id == 0 {
         selected.and_where(Expr::col(Alias::new("status")).eq("open"));
     } else {
@@ -64,6 +71,7 @@ pub(crate) fn insert_cycle_observation(
     Statement::query(&query)
 }
 
+#[cfg(test)]
 pub(crate) fn cycle_observations(
     cycle: &CredentialQuotaCycleRecord,
 ) -> Result<Statement, StoreError> {
@@ -75,7 +83,7 @@ pub(crate) fn cycle_observations(
         .and_where(
             Expr::col(Alias::new("observed_at_ms")).lte(cycle.tracking.sample.received_at_ms),
         )
-        .order_by(Alias::new("observed_at_ms"), Order::Asc)
-        .order_by(Alias::new("started_at_ms"), Order::Asc);
+        .order_by(Alias::new("observed_at_ms"), sea_query::Order::Asc)
+        .order_by(Alias::new("started_at_ms"), sea_query::Order::Asc);
     Statement::query(&query)
 }
