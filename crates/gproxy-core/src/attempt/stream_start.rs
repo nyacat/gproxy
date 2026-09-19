@@ -18,6 +18,22 @@ use super::{AttemptBody, Completed, Failure};
 const PREFIX_TIMEOUT: Duration = Duration::from_secs(30);
 const CLASSIFIER_BYTES: usize = 128 * 1024;
 const CAPTURE_BYTES: usize = 64 * 1024;
+/// Ceiling on one uncommitted prefix, as a share of the pool it draws from.
+///
+/// An upstream that streams keep-alive padding for the whole deadline without
+/// ever starting generation grows a single prefix until the pool is gone,
+/// turning one slow upstream into a local 503 for every other request. A
+/// quarter still admits the largest preamble a channel can legitimately send —
+/// instructions and tool schemas arrive before the first generation frame and
+/// run to megabytes — while leaving room for other inspections to start.
+const PREFIX_BUDGET_SHARE: usize = 4;
+/// Beyond this a bigger pool means more concurrent inspections, not a larger
+/// ceiling for one of them: no generation preamble is this large.
+const PREFIX_BYTES: usize = 32 * 1024 * 1024;
+
+fn prefix_limit(budget: &StreamStartBudget) -> usize {
+    PREFIX_BYTES.min(budget.limit() / PREFIX_BUDGET_SHARE)
+}
 
 /// HTTP 200 only opens a stream. Keep ownership until the channel proves
 /// generation started or reports a failure. Resource exhaustion is a local
@@ -211,6 +227,9 @@ async fn read_prefix(
         let eof = match upstream.next().await {
             Some(Ok(chunk)) => {
                 *chunks = chunks.saturating_add(1);
+                if prefix.as_slice().len().saturating_add(chunk.len()) > prefix_limit(budget) {
+                    return Err(CoreError::StreamStartOverloaded);
+                }
                 // Charge the transport fragment while copying it into owned
                 // prefix storage, as well as both allocations during growth.
                 let incoming = budget.reserve(chunk.len())?;
@@ -264,6 +283,53 @@ mod tests {
     use futures_util::FutureExt;
     use gproxy_channel_api::Channel;
     use gproxy_protocol::{ContentGenerationKind, Operation, OperationKey, StreamFraming};
+
+    fn codex_probe() -> Box<dyn StreamStart> {
+        gproxy_channels::CodexChannel
+            .stream_start(StreamCtx {
+                key: OperationKey::content(
+                    Operation::StreamGenerateContent,
+                    ContentGenerationKind::OpenAiResponses,
+                ),
+                framing: StreamFraming::Sse,
+                request_body: &Bytes::new(),
+                response_headers: &http::HeaderMap::new(),
+            })
+            .unwrap()
+    }
+
+    // An upstream that pads the whole deadline without starting generation is
+    // refused on its own account, instead of consuming the shared pool.
+    #[test]
+    fn one_request_cannot_spend_the_whole_shared_budget() {
+        let mut frame = b": keep-alive ".to_vec();
+        frame.resize(256 * 1024 - 2, b'.');
+        frame.extend_from_slice(b"\n\n");
+        let padding = Bytes::from(frame);
+        let mut upstream = Box::pin(futures_util::stream::poll_fn(move |_| {
+            std::task::Poll::Ready(Some(Ok(padding.clone())))
+        })) as ByteStream;
+        let mut probe = codex_probe();
+        let budget = StreamStartBudget::new(64 * 1024 * 1024);
+        let mut prefix = PrefixBuffer::new(&budget);
+        let mut chunks = 0;
+        assert!(matches!(
+            read_prefix(
+                &mut upstream,
+                probe.as_mut(),
+                &mut prefix,
+                &budget,
+                &mut chunks
+            )
+            .now_or_never()
+            .unwrap(),
+            Err(CoreError::StreamStartOverloaded)
+        ));
+        assert!(prefix.as_slice().len() <= prefix_limit(&budget));
+        assert!(budget.in_use() < budget.limit());
+        drop(prefix);
+        assert_eq!(budget.in_use(), 0);
+    }
 
     #[test]
     fn eof_is_not_polled_twice_and_failed_inspection_releases_the_prefix() {
