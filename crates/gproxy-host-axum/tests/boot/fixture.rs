@@ -54,13 +54,14 @@ impl Fixture {
         format!("http://{}{path}", self.server.local_addr())
     }
 
-    pub(crate) async fn shutdown(self) {
+    pub(crate) async fn shutdown(self) -> (gproxy_app::AppHandle, tempfile::TempDir) {
         self.server.shutdown().await.expect("stop axum host");
         let _ = self.stub_shutdown.send(());
         self.stub_task
             .await
             .expect("join stub server")
             .expect("stop stub server");
+        (self.app, self._directory)
     }
 }
 

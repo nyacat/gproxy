@@ -43,19 +43,24 @@ pub(super) fn schedule_expiry<H: Host>(
     let Some(spawner) = host.spawner() else {
         return;
     };
-    spawner.spawn(Box::pin(async move {
-        task_host.wait(Duration::from_secs(ttl_secs)).await;
-        let result = task_host
-            .continuations()
-            .expect("continuation capability was checked")
-            .take_generation(&key, &generation);
-        match result {
-            Ok(Some(expired)) => spawn_continuation(task_host, expired),
-            Ok(None) => {}
-            Err(error) => tracing::warn!(
-                error = %error,
-                "operation continuation expiry cleanup failed"
-            ),
-        }
-    }));
+    let delay_host = host.clone();
+    spawner.spawn_delayed(
+        Box::pin(async move {
+            delay_host.wait(Duration::from_secs(ttl_secs)).await;
+        }),
+        Box::pin(async move {
+            let result = task_host
+                .continuations()
+                .expect("continuation capability was checked")
+                .take_generation(&key, &generation);
+            match result {
+                Ok(Some(expired)) => spawn_continuation(task_host, expired),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "operation continuation expiry cleanup failed"
+                ),
+            }
+        }),
+    );
 }

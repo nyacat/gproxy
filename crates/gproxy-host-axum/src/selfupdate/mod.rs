@@ -5,9 +5,12 @@ mod extract;
 mod manifest;
 mod notes;
 mod swap;
+#[cfg(test)]
+mod tests;
 mod version;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use gproxy_admin::dto::{UpdateAppliedDto, UpdateStatusDto};
@@ -25,6 +28,9 @@ pub(crate) struct Manager {
     restart: Restart,
     channel: Option<String>,
     store_managed: bool,
+    executable: PathBuf,
+    operation: tokio::sync::Mutex<()>,
+    restart_requested: AtomicBool,
 }
 
 impl Manager {
@@ -40,6 +46,10 @@ impl Manager {
             restart: restart()?,
             channel: channel.map(str::to_owned),
             store_managed: crate::installation_kind() == "microsoft-store",
+            // Replacing a running executable changes current_exe() on Linux.
+            executable: std::env::current_exe()?,
+            operation: tokio::sync::Mutex::new(()),
+            restart_requested: AtomicBool::new(false),
         })
     }
 
@@ -72,7 +82,7 @@ impl Manager {
             channel,
             target,
             notes,
-            rollback_available: swap::rollback_available(),
+            rollback_available: swap::rollback_available(&self.executable),
             restart: self.restart.as_str().into(),
         })
     }
@@ -103,7 +113,7 @@ impl Manager {
                 android_apk::stage(&self.data_dir, &bytes)?;
             } else {
                 let staged = extract::binary(&bytes, &self.data_dir.join(".update"), &target)?;
-                swap::install(&staged)?;
+                swap::install(&self.executable, &staged)?;
             }
         }
         Ok((
@@ -121,6 +131,7 @@ impl Manager {
         path: &str,
         selected_channel: Option<&str>,
         settings: &gproxy_admin::dto::RuntimeSettingsDto,
+        app: &gproxy_app::AppHandle,
     ) -> Response<Bytes> {
         if self.store_managed {
             let error = Error::MicrosoftStore;
@@ -129,6 +140,23 @@ impl Manager {
                 serde_json::json!({"error": {"message": error.to_string()}}),
             );
         }
+        let _operation = if method == Method::POST
+            && matches!(
+                path,
+                "/admin/api/native/update/apply" | "/admin/api/native/update/rollback"
+            ) {
+            match self.begin_operation() {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    return json(
+                        error.status(),
+                        serde_json::json!({"error": {"message": error.to_string()}}),
+                    );
+                }
+            }
+        } else {
+            None
+        };
         let (result, restart_after) = match (method, path) {
             (&Method::GET | &Method::HEAD, "/admin/api/native/update") => {
                 (self.check(selected_channel, settings).await.and_then(to_value), false)
@@ -138,7 +166,7 @@ impl Manager {
                 Err(error) => (Err(error), false),
             },
             (&Method::POST, "/admin/api/native/update/rollback") => (
-                swap::rollback().map(|_| {
+                swap::rollback(&self.executable).map(|_| {
                     serde_json::json!({ "version": crate::BUILD_VERSION, "restart": self.restart.as_str() })
                 }),
                 true,
@@ -147,8 +175,9 @@ impl Manager {
         };
         match result {
             Ok(value) => {
-                if restart_after {
-                    schedule_restart(self.restart);
+                if restart_after && !matches!(self.restart, Restart::None) {
+                    self.restart_requested.store(true, Ordering::Release);
+                    app.shutdown();
                 }
                 json(StatusCode::OK, value)
             }
@@ -156,6 +185,25 @@ impl Manager {
                 error.status(),
                 serde_json::json!({"error": {"message": error.to_string()}}),
             ),
+        }
+    }
+
+    fn begin_operation(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        let guard = self.operation.try_lock().map_err(|_| Error::Busy)?;
+        if self.restart_requested.load(Ordering::Acquire) {
+            return Err(Error::Busy);
+        }
+        Ok(guard)
+    }
+
+    pub(crate) fn restart_if_requested(&self) {
+        if !self.restart_requested.load(Ordering::Acquire) {
+            return;
+        }
+        match self.restart {
+            Restart::None => {}
+            Restart::Supervisor => std::process::exit(42),
+            Restart::ReExec => reexec(&self.executable),
         }
     }
 
@@ -172,24 +220,9 @@ impl Manager {
     }
 }
 
-fn schedule_restart(restart: Restart) {
-    if matches!(restart, Restart::None) {
-        return;
-    }
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        match restart {
-            Restart::None => {}
-            Restart::Supervisor => std::process::exit(42),
-            Restart::ReExec => reexec(),
-        }
-    });
-}
-
 #[cfg(unix)]
-fn reexec() -> ! {
+fn reexec(executable: &Path) -> ! {
     use std::os::unix::process::CommandExt as _;
-    let executable = std::env::current_exe().unwrap_or_else(|_| std::process::exit(1));
     let error = std::process::Command::new(executable)
         .args(std::env::args_os().skip(1))
         .exec();
@@ -198,7 +231,7 @@ fn reexec() -> ! {
 }
 
 #[cfg(not(unix))]
-fn reexec() -> ! {
+fn reexec(_executable: &Path) -> ! {
     std::process::exit(42)
 }
 

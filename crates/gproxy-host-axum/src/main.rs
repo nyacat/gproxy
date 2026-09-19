@@ -24,10 +24,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = gproxy_host_axum::HostConfig::from_config(&config);
     let app = gproxy_app::App::start(config).await?;
     let instance_name = app.instance_name();
+    let shutdown = app.clone();
     let server = gproxy_host_axum::AxumServer::from_listener(app, listener, host)?;
     tracing::info!(%instance_name, %address, "GPROXY listening");
-    shutdown_signal().await?;
-    server.shutdown().await?;
+    let serving = server.wait();
+    tokio::pin!(serving);
+    tokio::select! {
+        result = &mut serving => result?,
+        signal = shutdown_signal() => {
+            shutdown.shutdown();
+            let result = serving.await;
+            signal?;
+            result?;
+        }
+    }
     Ok(())
 }
 

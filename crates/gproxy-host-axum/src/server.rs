@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::serve::ListenerExt;
 
 pub(crate) const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
 
@@ -41,7 +42,6 @@ pub(crate) struct HostState {
     pub app: gproxy_app::AppHandle,
     pub requests: Arc<gproxy_app::ConcurrencyLimit>,
     pub uploads: Arc<gproxy_app::ConcurrencyLimit>,
-    runtime_lock: Arc<std::sync::Mutex<()>>,
     pub announcements: crate::announce::Announcements,
     pub autostart: Option<Arc<crate::autostart::Manager>>,
     pub selfupdate: Option<Arc<crate::selfupdate::Manager>>,
@@ -58,7 +58,6 @@ impl HostState {
             app,
             requests: gproxy_app::ConcurrencyLimit::new(1024),
             uploads: gproxy_app::ConcurrencyLimit::new(0),
-            runtime_lock: Arc::new(std::sync::Mutex::new(())),
             announcements: crate::announce::Announcements::new(),
             autostart: config.autostart,
             selfupdate: config.selfupdate,
@@ -68,18 +67,13 @@ impl HostState {
         })
     }
 
-    pub(crate) fn sync_runtime(&self) -> Arc<gproxy_admin::dto::RuntimeSettingsStatusDto> {
-        let _guard = self
-            .runtime_lock
-            .lock()
-            .expect("runtime configuration poisoned");
+    fn sync_runtime(&self) {
         let runtime = self.app.runtime_settings();
         self.requests
             .set_limit(runtime.effective.max_in_flight as usize);
         self.uploads
             .set_limit(runtime.effective.file_upload_max_in_flight as usize);
         crate::logging::apply(&runtime);
-        runtime
     }
 
     pub(crate) fn request_id(&self) -> String {
@@ -95,6 +89,7 @@ pub struct AxumServer {
     address: SocketAddr,
     app: gproxy_app::AppHandle,
     task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+    selfupdate: Option<Arc<crate::selfupdate::Manager>>,
 }
 
 impl AxumServer {
@@ -120,14 +115,24 @@ impl AxumServer {
     ) -> Result<Self, HostError> {
         let address = listener.local_addr().map_err(HostError::Io)?;
         let shutdown = app.clone();
+        let selfupdate = config.selfupdate.clone();
         let state = HostState::new(app.clone(), config)?;
+        // Subscribe before loading the initial snapshot so a setting changed
+        // during startup is either in that snapshot or delivered by the watch.
+        let mut updates = app.subscribe_runtime_settings();
         state.sync_runtime();
         let router = Router::new()
             .fallback(crate::ingress::handle)
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .with_state(state.clone());
-        let mut updates = app.subscribe_runtime_settings();
         let task = tokio::spawn(async move {
+            // SSE flushes small frames as they arrive. Nagle buffering can hold
+            // the final frame until the peer's delayed ACK timer fires.
+            let listener = listener.tap_io(|stream| {
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::warn!(%error, "could not disable TCP buffering for accepted connection");
+                }
+            });
             let serving = axum::serve(
                 listener,
                 router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -145,7 +150,12 @@ impl AxumServer {
                 }
             }
         });
-        Ok(Self { address, app, task })
+        Ok(Self {
+            address,
+            app,
+            task,
+            selfupdate,
+        })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -154,17 +164,21 @@ impl AxumServer {
 
     pub async fn shutdown(self) -> Result<(), HostError> {
         self.app.shutdown();
-        self.task
-            .await
-            .map_err(HostError::Join)?
-            .map_err(HostError::Io)
+        self.wait().await
     }
 
     pub async fn wait(self) -> Result<(), HostError> {
-        self.task
+        let result = self
+            .task
             .await
-            .map_err(HostError::Join)?
-            .map_err(HostError::Io)
+            .map_err(HostError::Join)
+            .and_then(|result| result.map_err(HostError::Io));
+        self.app.shutdown();
+        self.app.drain_background().await;
+        if let Some(manager) = self.selfupdate {
+            manager.restart_if_requested();
+        }
+        result
     }
 }
 
@@ -176,4 +190,42 @@ pub enum HostError {
     Join(#[source] tokio::task::JoinError),
     #[error("secure request-id randomness unavailable")]
     Randomness,
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn internal_shutdown_waits_for_background_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = gproxy_app::App::start(gproxy_app::Config::sqlite(
+            "127.0.0.1:0".parse().unwrap(),
+            directory.path().to_path_buf(),
+            gproxy_app::MasterKeyConfig::new(Some([2; 32])),
+        ))
+        .await
+        .unwrap();
+        let server = super::AxumServer::bind(app.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let (complete, completed) = tokio::sync::oneshot::channel();
+        drop(app.spawn_background(async move {
+            finished.await.unwrap();
+            complete.send(()).unwrap();
+        }));
+        app.shutdown();
+        let stopped = server.wait();
+        tokio::pin!(stopped);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut stopped)
+                .await
+                .is_err()
+        );
+        finish.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        completed.await.unwrap();
+    }
 }

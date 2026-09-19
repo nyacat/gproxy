@@ -15,7 +15,7 @@ pub(crate) async fn handle(
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     request: Request,
 ) -> Response {
-    let runtime = state.sync_runtime();
+    let runtime = state.app.runtime_settings();
     let origin = request
         .headers()
         .get(http::header::ORIGIN)
@@ -36,7 +36,6 @@ pub(crate) async fn handle(
         );
     }
     let response = handle_request(state.clone(), peer, request, &runtime.effective).await;
-    state.sync_runtime();
     crate::request_policy::apply_cors(response, origin.as_ref())
 }
 
@@ -53,6 +52,9 @@ async fn handle_request(
         "request accepted"
     );
     let (mut parts, body) = request.into_parts();
+    parts
+        .extensions
+        .insert(gproxy_admin::RequestId(request_id.clone()));
     let client_ip =
         crate::request_policy::client_ip(peer.ip(), &parts.headers, &runtime.trusted_proxies);
     parts
@@ -109,7 +111,7 @@ async fn handle_request(
             Some(manager) => {
                 let channel = state.app.update_channel();
                 manager
-                    .dispatch(&method, &path, channel.as_deref(), runtime)
+                    .dispatch(&method, &path, channel.as_deref(), runtime, &state.app)
                     .await
             }
             None => crate::selfupdate::unavailable(),
@@ -160,7 +162,7 @@ async fn handle_request(
         None
     };
     let result = state.app.execute(request).await;
-    HostResponse::new(result, websocket, permit, request_id).into_response()
+    HostResponse::new(result, websocket, permit, request_id, state.app.clone()).into_response()
 }
 
 async fn websocket_upgrade(
