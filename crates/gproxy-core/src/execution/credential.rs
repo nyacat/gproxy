@@ -12,12 +12,26 @@ use crate::host::{
     CacheBackend, CredentialId, CredentialRecord, CredentialStore, Host, UpstreamTransport,
 };
 
-const REFRESH_LEASE_TTL: Duration = Duration::from_secs(120);
+pub(crate) const REFRESH_LEASE_TTL: Duration = Duration::from_secs(120);
 const REFRESH_RENEW_INTERVAL: Duration = Duration::from_secs(30);
 const REFRESH_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
-const REFRESH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const REFRESH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a caller waits for whoever holds the lease. Waiting exists to pick
+/// up a peer's rotated token, not to outlive the peer: a lease only becomes
+/// free again once `REFRESH_LEASE_TTL` elapses, so waiting that long would keep
+/// a live request — and the execution slot it occupies — parked for two minutes
+/// on the chance that its holder died. A peer that has not published within
+/// this budget is better left to the next request, which finds either a fresh
+/// token or an expired lease it can take over immediately.
+pub(crate) const REFRESH_WAIT_BUDGET: Duration = Duration::from_secs(20);
 const REFRESH_BACKOFF_TTL: Duration = Duration::from_secs(30 * 60);
 const REFRESH_BACKOFF: [u64; 5] = [30, 60, 120, 240, 300];
+
+// A zero interval divides by zero below, and a budget shorter than one interval
+// would give up before ever trying to take the lease.
+const _: () = assert!(REFRESH_POLL_INTERVAL.as_secs() > 0);
+const _: () = assert!(REFRESH_WAIT_BUDGET.as_secs() >= REFRESH_POLL_INTERVAL.as_secs());
+const _: () = assert!(REFRESH_WAIT_BUDGET.as_secs() < REFRESH_LEASE_TTL.as_secs());
 
 pub(crate) async fn load_fresh<H: Host>(
     core: &crate::Core<H>,
@@ -122,7 +136,7 @@ async fn refresh_owned<H: Host>(
     };
     let channel_id = channel.descriptor().id;
     let mut acquired = false;
-    let polls = REFRESH_LEASE_TTL.as_secs() / REFRESH_POLL_INTERVAL.as_secs();
+    let polls = REFRESH_WAIT_BUDGET.as_secs() / REFRESH_POLL_INTERVAL.as_secs();
     for _ in 0..polls {
         if host
             .credentials()

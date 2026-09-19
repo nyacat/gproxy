@@ -441,7 +441,12 @@ fn refresh_waiters_are_bounded_and_cannot_release_another_owner() {
         block_on(host.get("refresh:7")).unwrap(),
         Some(owner.to_vec())
     );
-    assert_eq!(host.state.lock().unwrap().wait_calls, 120);
+    // The waiter gives up well before the lease it is waiting on could expire,
+    // so a dead holder cannot park a request for the whole lease.
+    let polls = crate::execution::credential::REFRESH_WAIT_BUDGET.as_secs()
+        / crate::execution::credential::REFRESH_POLL_INTERVAL.as_secs();
+    assert!(polls < crate::execution::credential::REFRESH_LEASE_TTL.as_secs());
+    assert_eq!(host.state.lock().unwrap().wait_calls, polls as usize);
     assert_eq!(host.state.lock().unwrap().refresh_calls, 0);
     assert!(
         !block_on(host.renew_refresh(CredentialId(7), b"wrong-owner", Duration::from_secs(120)))
