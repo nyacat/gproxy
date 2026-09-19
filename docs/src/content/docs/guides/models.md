@@ -58,6 +58,19 @@ credential inside it by the provider's strategy. Failover walks the rest of
 the ordered list until the route's **Maximum attempts** is spent. Dead
 credentials are excluded before the slot is consumed; degraded ones sort last.
 
+Codex SSE responses may open with HTTP `200` and then report a capacity error.
+Before forwarding the response, GPROXY checks up to 64 KiB of the opening events
+for at most 30 seconds. A retryable error before output or tool activity degrades
+that credential's upstream model and advances to the next candidate within the
+same attempt budget. Once output, usage, or other activity appears, or the check
+reaches its limit, streaming proceeds normally. Later errors still update model
+health, but cannot replay a response that has already been forwarded.
+
+Successful responses recover health using the start time of their own upstream
+attempt. A request that was already running when a model failed cannot clear
+that failure or reset its backoff by finishing later. A subsequent successful
+attempt can recover the model; other models retain their own health state.
+
 ## Exposed Models
 
 A **model mapping** binds a public name to a route. What a route advertises is

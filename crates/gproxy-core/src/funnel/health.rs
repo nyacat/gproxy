@@ -88,10 +88,10 @@ pub(crate) async fn record_response(
         return;
     };
     let (health, detail) = match disposition {
-        Disposition::Success => (
-            crate::CredentialHealth::Healthy,
-            "upstream request succeeded",
-        ),
+        Disposition::Success => {
+            record_success(host, facts, status, "upstream request succeeded").await;
+            return;
+        }
         Disposition::Retryable => (
             crate::CredentialHealth::Degraded,
             "retryable upstream response",
@@ -107,6 +107,31 @@ pub(crate) async fn record_response(
         &target.upstream_model,
         credential_version,
         health,
+        Some(status),
+        detail,
+    )
+    .await;
+}
+
+pub(crate) async fn record_success(
+    host: &impl Host,
+    facts: &super::FunnelCtx,
+    status: http::StatusCode,
+    detail: &str,
+) {
+    if facts.health_delegated {
+        return;
+    }
+    let (Some(version), Some(started_at_ms)) =
+        (facts.credential_version, facts.upstream_started_at_ms)
+    else {
+        return;
+    };
+    host.record_credential_health_success(
+        facts.target.credential,
+        &facts.target.upstream_model,
+        version,
+        started_at_ms,
         Some(status),
         detail,
     )

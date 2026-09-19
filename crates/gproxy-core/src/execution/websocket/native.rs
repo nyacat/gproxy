@@ -86,7 +86,7 @@ impl<H: Host> ResponsesBridge<H> {
             };
             let attempt::Prepared {
                 egress: Egress::WebSocket(upstream_request),
-                facts,
+                mut facts,
                 ..
             } = prepared
             else {
@@ -107,6 +107,7 @@ impl<H: Host> ResponsesBridge<H> {
                     continue;
                 }
             };
+            facts.upstream_started_at_ms = Some(crate::quota::now_ms());
             if let Err(error) = socket.send(WsFrame::Text(frame)).await {
                 self.native_attempt_failed(&facts, &error).await;
                 continue;
@@ -171,7 +172,7 @@ impl<H: Host> ResponsesBridge<H> {
         };
         let attempt::Prepared {
             egress: Egress::WebSocket(frame),
-            facts,
+            mut facts,
             ..
         } = prepared
         else {
@@ -196,6 +197,7 @@ impl<H: Host> ResponsesBridge<H> {
                 "websocket credential rotated; reconnect required".into(),
             ));
         }
+        facts.upstream_started_at_ms = Some(crate::quota::now_ms());
         let sent = self
             .native
             .as_mut()

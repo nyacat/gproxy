@@ -440,6 +440,28 @@ pub trait Host: MaybeSend + MaybeSync + 'static {
         response_status: Option<http::StatusCode>,
         detail: &'a str,
     ) -> BoxFuture<'a, ()>;
+
+    /// Record a completed successful attempt. Recovery evidence must not
+    /// supersede a failure observed after this upstream attempt began.
+    fn record_credential_health_success<'a>(
+        &'a self,
+        credential: CredentialId,
+        model: &'a str,
+        credential_version: u64,
+        started_at_ms: i64,
+        response_status: Option<http::StatusCode>,
+        detail: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        let _ = started_at_ms;
+        self.record_credential_health(
+            credential,
+            model,
+            credential_version,
+            CredentialHealth::Healthy,
+            response_status,
+            detail,
+        )
+    }
     /// Sink for upstream quota-window readings observed on responses.
     /// Optional: an embedder without cycle accounting drops them.
     fn begin_credential_usage<'a>(

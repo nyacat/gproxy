@@ -3,6 +3,7 @@ mod admission;
 mod bindings;
 mod continuations;
 mod credentials;
+mod health;
 mod health_probe;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod health_tests;
@@ -260,7 +261,7 @@ impl Host for AppHost {
                 credential_id: credential.0,
                 model: model.to_owned(),
                 credential_version,
-                version: match health_version(&self.services.health_sequence) {
+                version: match health::observation_version(&self.services.health_sequence) {
                     Some(version) => version,
                     None => return,
                 },
@@ -269,54 +270,37 @@ impl Host for AppHost {
                 response_status: response_status.map(|status| status.as_u16()),
                 detail: Some(detail.into()),
             };
-            let unchanged = self
-                .services
-                .control
-                .credential_health_state(credential, model)
-                == Some((credential_version, state));
-            // Failed attempts advance persistent backoff even if the state is
-            // still degraded. Only repeated healthy evidence may be coalesced.
-            let recovering_account = health == CredentialHealth::Healthy
-                && model != "*"
-                && self
-                    .services
-                    .control
-                    .credential_health_state(credential, "*")
-                    == Some((
-                        credential_version,
-                        gproxy_store::records::CredentialHealthState::Degraded,
-                    ));
-            let refresh = unchanged && health == CredentialHealth::Healthy && !recovering_account;
-            if refresh
-                && !self
-                    .services
-                    .control
-                    .health_refresh_due(credential, model, input.observed_at)
-            {
+            health::record(self, input).await;
+        })
+    }
+
+    fn record_credential_health_success<'a>(
+        &'a self,
+        credential: gproxy_channel_api::CredentialId,
+        model: &'a str,
+        credential_version: u64,
+        started_at_ms: i64,
+        response_status: Option<http::StatusCode>,
+        detail: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(version) = health::success_version(started_at_ms) else {
                 return;
-            }
-            match self.spawner().filter(|_| refresh) {
-                Some(spawner) => {
-                    let host = self.clone();
-                    spawner.spawn(Box::pin(async move {
-                        persist_credential_health(&host, &input).await;
-                    }));
-                }
-                None => {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        let host = self.clone();
-                        let writing = self.services.spawner.spawn_tracked(async move {
-                            persist_credential_health(&host, &input).await;
-                        });
-                        if let Err(error) = writing.await {
-                            tracing::error!(error = %error, "credential health task failed");
-                        }
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    persist_credential_health(self, &input).await;
-                }
-            }
+            };
+            health::record(
+                self,
+                gproxy_store::records::CredentialHealthInput {
+                    credential_id: credential.0,
+                    model: model.to_owned(),
+                    credential_version,
+                    version,
+                    state: gproxy_store::records::CredentialHealthState::Healthy,
+                    observed_at: admission::unix_now(),
+                    response_status: response_status.map(|status| status.as_u16()),
+                    detail: Some(detail.into()),
+                },
+            )
+            .await;
         })
     }
 
@@ -479,99 +463,5 @@ impl Host for AppHost {
         return Some(&self.services.continuations);
         #[cfg(target_arch = "wasm32")]
         None
-    }
-}
-
-fn health_version(sequence: &std::sync::atomic::AtomicU64) -> Option<i64> {
-    let elapsed = web_time::SystemTime::now()
-        .duration_since(web_time::UNIX_EPOCH)
-        .ok()?;
-    let millis = i64::try_from(elapsed.as_millis()).ok()?;
-    let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1_000_000;
-    Some(
-        millis
-            .saturating_mul(1_000_000)
-            .saturating_add(sequence as i64),
-    )
-}
-
-async fn persist_credential_health(
-    host: &AppHost,
-    input: &gproxy_store::records::CredentialHealthInput,
-) {
-    persist_health_row(host, input).await;
-    // A completed model request is evidence that a transient account-wide
-    // failure recovered. It does not clear another model, a newer observation,
-    // another credential version, or a permanent account failure.
-    if input.state == gproxy_store::records::CredentialHealthState::Healthy
-        && input.model != "*"
-        && host
-            .services
-            .control
-            .credential_health_observation(
-                gproxy_channel_api::CredentialId(input.credential_id),
-                "*",
-            )
-            .is_some_and(|record| {
-                record.credential_version == input.credential_version
-                    && record.version < input.version
-                    && record.state == gproxy_store::records::CredentialHealthState::Degraded
-            })
-    {
-        let mut recovered = input.clone();
-        recovered.model = "*".into();
-        recovered.detail = Some(format!("successful response from {}", input.model));
-        persist_health_row_inner(host, &recovered, true).await;
-    }
-}
-
-async fn persist_health_row(host: &AppHost, input: &gproxy_store::records::CredentialHealthInput) {
-    persist_health_row_inner(host, input, false).await;
-}
-
-async fn persist_health_row_inner(
-    host: &AppHost,
-    input: &gproxy_store::records::CredentialHealthInput,
-    recover_degraded_only: bool,
-) {
-    let credential = gproxy_channel_api::CredentialId(input.credential_id);
-    let previous = host
-        .services
-        .control
-        .credential_health_observation(credential, &input.model);
-    let result = if recover_degraded_only {
-        host.services
-            .store
-            .recover_degraded_credential_health(input)
-            .await
-    } else {
-        host.services.store.record_credential_health(input).await
-    };
-    if let Err(error) = result {
-        tracing::error!(error = %error, "credential health persistence failed");
-    } else {
-        // Broadcast a durable failure/recovery even if its local readback fails.
-        // Native peers poll this version, and edge hosts sync it before dispatch.
-        let notify = input.state != gproxy_store::records::CredentialHealthState::Healthy
-            || previous.as_ref().is_some_and(|record| {
-                record.state != gproxy_store::records::CredentialHealthState::Healthy
-                    || record.credential_version != input.credential_version
-            });
-        if notify && let Err(error) = crate::invalidation::bump(&host.services.cache).await {
-            tracing::warn!(error = %error, "credential health invalidation failed");
-        }
-        // An older observation may have been rejected, and storage owns the
-        // failure count. Publish the accepted row instead of the attempted write.
-        if let Err(error) = host
-            .services
-            .control
-            .refresh_credential_health(
-                gproxy_channel_api::CredentialId(input.credential_id),
-                &input.model,
-            )
-            .await
-        {
-            tracing::error!(error = %error, "credential health readback failed");
-        }
     }
 }

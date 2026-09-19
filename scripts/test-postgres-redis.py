@@ -34,6 +34,7 @@ TESTS = [
     ("gproxy-store", "backend::tests::cache::redis_cache_operations_are_atomic"),
     ("gproxy-app", "tests::credential_budget::postgres_failover_and_cache_recovery_keep_exact_spend"),
     ("gproxy-app", "tests::postgres_redis::postgres_redis_preserve_usage_identity_and_settle_concurrent_requests_once"),
+    ("gproxy-app", "tests::postgres_redis::postgres_redis_credential_health_rejects_success_started_before_newer_failures"),
 ]
 
 

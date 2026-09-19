@@ -291,7 +291,7 @@ async fn successful_model_cannot_recover_dead_account_from_a_stale_local_snapsho
             credential_id: credential.0,
             model: "*".into(),
             credential_version: version,
-            version: super::health_version(&host.services.health_sequence).unwrap(),
+            version: super::health::observation_version(&host.services.health_sequence).unwrap(),
             state: CredentialHealthState::Dead,
             observed_at: degraded.observed_at,
             response_status: Some(401),
@@ -324,4 +324,155 @@ async fn successful_model_cannot_recover_dead_account_from_a_stale_local_snapsho
     .await;
     assert!(success.version > dead.version);
     assert_eq!(read(host, credential, "*").await, dead);
+}
+
+async fn successful_attempt(
+    fixture: &setup::Fixture,
+    credential: CredentialId,
+    credential_version: u64,
+    started_at_ms: i64,
+) {
+    fixture
+        .app
+        .inner
+        .host
+        .record_credential_health_success(
+            credential,
+            "upstream-model",
+            credential_version,
+            started_at_ms,
+            Some(http::StatusCode::OK),
+            "upstream stream completed",
+        )
+        .await;
+    fixture.app.drain_background().await;
+}
+
+#[tokio::test]
+async fn old_success_preserves_model_backoff_until_a_later_attempt_succeeds() {
+    let (fixture, credential, version) = fixture().await;
+    let host = &fixture.app.inner.host;
+    let other_model = record(
+        &fixture,
+        credential,
+        "other-model",
+        version,
+        CredentialHealth::Degraded,
+    )
+    .await;
+    record(
+        &fixture,
+        credential,
+        "upstream-model",
+        version,
+        CredentialHealth::Degraded,
+    )
+    .await;
+    let failure = record(
+        &fixture,
+        credential,
+        "upstream-model",
+        version,
+        CredentialHealth::Degraded,
+    )
+    .await;
+    assert_eq!(failure.consecutive_failures, 2);
+    let failed_at_ms = failure.version / 1_000_000;
+    for started_at_ms in [failed_at_ms - 120_000, failed_at_ms] {
+        successful_attempt(&fixture, credential, version, started_at_ms).await;
+        assert_eq!(read(host, credential, "upstream-model").await, failure);
+        assert_eq!(read(host, credential, "other-model").await, other_model);
+    }
+
+    // A new attempt admitted after the two-failure cooldown can recover.
+    successful_attempt(&fixture, credential, version, failed_at_ms + 60_000).await;
+    let recovered = read(host, credential, "upstream-model").await;
+    assert_eq!(recovered.state, CredentialHealthState::Healthy);
+    assert_eq!(recovered.consecutive_failures, 0);
+    assert_eq!(recovered.response_status, Some(200));
+    assert_eq!(read(host, credential, "other-model").await, other_model);
+}
+
+#[tokio::test]
+async fn old_success_cannot_clear_a_failure_missing_from_the_local_snapshot() {
+    for scope in ["upstream-model", "*"] {
+        for state in [CredentialHealthState::Degraded, CredentialHealthState::Dead] {
+            let (fixture, credential, version) = fixture().await;
+            let host = &fixture.app.inner.host;
+            let started_at_ms = (super::admission::unix_now() - 60) * 1_000;
+            host.services
+                .store
+                .record_credential_health(&CredentialHealthInput {
+                    credential_id: credential.0,
+                    model: scope.into(),
+                    credential_version: version,
+                    version: (started_at_ms - 1_000) * 1_000_000,
+                    state: CredentialHealthState::Degraded,
+                    observed_at: started_at_ms / 1_000 - 1,
+                    response_status: Some(503),
+                    detail: Some("earlier failure".into()),
+                })
+                .await
+                .unwrap();
+            host.services
+                .control
+                .refresh_credential_health(credential, scope)
+                .await
+                .unwrap();
+            let previous = read(host, credential, scope).await;
+            // Another worker observes a failure after this attempt starts.
+            // Do not refresh this worker's routing snapshot before completion.
+            host.services
+                .store
+                .record_credential_health(&CredentialHealthInput {
+                    credential_id: credential.0,
+                    model: scope.into(),
+                    credential_version: version,
+                    version: (started_at_ms + 1_000) * 1_000_000 + 1,
+                    state,
+                    observed_at: previous.observed_at + 2,
+                    response_status: Some(503),
+                    detail: Some("failure observed by another worker".into()),
+                })
+                .await
+                .unwrap();
+            let newer = host
+                .services
+                .store
+                .credential_model_health(credential.0, scope)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                host.services
+                    .control
+                    .credential_health_observation(credential, scope),
+                Some(previous)
+            );
+            successful_attempt(&fixture, credential, version, started_at_ms).await;
+            assert_eq!(read(host, credential, scope).await, newer);
+        }
+    }
+}
+
+#[tokio::test]
+async fn successful_attempt_recovers_only_older_account_degradation() {
+    let (fixture, credential, version) = fixture().await;
+    let host = &fixture.app.inner.host;
+    let account = record(
+        &fixture,
+        credential,
+        "*",
+        version,
+        CredentialHealth::Degraded,
+    )
+    .await;
+    let failed_at_ms = account.version / 1_000_000;
+    successful_attempt(&fixture, credential, version, failed_at_ms - 1_000).await;
+    assert_eq!(read(host, credential, "*").await, account);
+
+    successful_attempt(&fixture, credential, version, failed_at_ms + 30_000).await;
+    let recovered = read(host, credential, "*").await;
+    assert_eq!(recovered.state, CredentialHealthState::Healthy);
+    assert_eq!(recovered.consecutive_failures, 0);
 }

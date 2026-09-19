@@ -5,6 +5,135 @@ use super::setup;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an empty PostgreSQL database and dedicated Redis database via GPROXY_TEST_POSTGRES_DSN and GPROXY_TEST_REDIS_URL"]
+async fn postgres_redis_credential_health_rejects_success_started_before_newer_failures() {
+    use gproxy_core::{CredentialId, CredentialStore};
+    use gproxy_store::records::{CredentialHealthInput, CredentialHealthState};
+
+    let fixture = setup::fixture_with_backends(
+        Some(std::env::var("GPROXY_TEST_POSTGRES_DSN").expect("test PostgreSQL database")),
+        Some(std::env::var("GPROXY_TEST_REDIS_URL").expect("test Redis database")),
+    )
+    .await;
+    fixture.app.shutdown();
+    fixture.app.drain_background().await;
+    let host = &fixture.app.inner.host;
+    let credential = CredentialId(fixture.credential);
+    let version = host.load(credential).await.unwrap().version;
+    let started_at_ms = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 60)
+        * 1_000;
+    let mut failures = Vec::new();
+    for scope in ["upstream-model", "*"] {
+        host.services
+            .store
+            .record_credential_health(&CredentialHealthInput {
+                credential_id: credential.0,
+                model: scope.into(),
+                credential_version: version,
+                version: (started_at_ms - 1_000) * 1_000_000,
+                state: CredentialHealthState::Degraded,
+                observed_at: started_at_ms / 1_000 - 1,
+                response_status: Some(503),
+                detail: Some("earlier failure".into()),
+            })
+            .await
+            .unwrap();
+        host.services
+            .control
+            .refresh_credential_health(credential, scope)
+            .await
+            .unwrap();
+        failures.push(
+            host.services
+                .store
+                .credential_model_health(credential.0, scope)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    // Simulate another worker recording failures after this attempt starts,
+    // while this worker still holds the earlier routing snapshot.
+    for row in &mut failures {
+        host.services
+            .store
+            .record_credential_health(&CredentialHealthInput {
+                credential_id: credential.0,
+                model: row.model.clone(),
+                credential_version: version,
+                version: (started_at_ms + 1) * 1_000_000,
+                state: CredentialHealthState::Degraded,
+                observed_at: row.observed_at + 1,
+                response_status: Some(503),
+                detail: Some("newer failure from another worker".into()),
+            })
+            .await
+            .unwrap();
+        *row = host
+            .services
+            .store
+            .credential_model_health(credential.0, &row.model)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.consecutive_failures, 2);
+    }
+    for attempt_start in [started_at_ms, started_at_ms + 1] {
+        host.record_credential_health_success(
+            credential,
+            "upstream-model",
+            version,
+            attempt_start,
+            Some(http::StatusCode::OK),
+            "old request completed successfully",
+        )
+        .await;
+        fixture.app.drain_background().await;
+        for failure in &failures {
+            assert_eq!(
+                host.services
+                    .store
+                    .credential_model_health(credential.0, &failure.model)
+                    .await
+                    .unwrap(),
+                Some(failure.clone())
+            );
+            assert_eq!(
+                host.services
+                    .control
+                    .credential_health_observation(credential, &failure.model),
+                Some(failure.clone())
+            );
+        }
+    }
+    host.record_credential_health_success(
+        credential,
+        "upstream-model",
+        version,
+        started_at_ms + 60_001,
+        Some(http::StatusCode::OK),
+        "new recovery probe completed successfully",
+    )
+    .await;
+    fixture.app.drain_background().await;
+    for scope in ["upstream-model", "*"] {
+        let recovered = host
+            .services
+            .store
+            .credential_model_health(credential.0, scope)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.state, CredentialHealthState::Healthy);
+        assert_eq!(recovered.consecutive_failures, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an empty PostgreSQL database and dedicated Redis database via GPROXY_TEST_POSTGRES_DSN and GPROXY_TEST_REDIS_URL"]
 async fn postgres_redis_preserve_usage_identity_and_settle_concurrent_requests_once() {
     let fixture = setup::fixture_with_backends(
         Some(std::env::var("GPROXY_TEST_POSTGRES_DSN").expect("test PostgreSQL database")),

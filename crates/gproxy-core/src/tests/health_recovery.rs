@@ -3,6 +3,39 @@ use futures_util::FutureExt;
 use super::*;
 
 #[test]
+fn successful_buffered_and_streamed_responses_carry_their_upstream_start_into_recovery() {
+    for streaming in [false, true] {
+        let host = MemoryHost::new(false);
+        host.state.lock().unwrap().credential.secret =
+            json!({"access_token":"fresh","expires_at":i64::MAX});
+        let core = core(&host).unwrap();
+        let selected = target();
+        let outcome =
+            block_on(core.invoke(&host, &selected, request(streaming, "health-success-start")))
+                .unwrap();
+        if let ResponseBody::Stream(mut stream) = outcome.body {
+            block_on(async {
+                while let Some(frame) = stream.next().await {
+                    frame.unwrap();
+                }
+            });
+        }
+        let state = host.state.lock().unwrap();
+        assert_eq!(state.settlements.len(), 1);
+        let started_at_ms = state.settlements[0].upstream_started_at_ms.unwrap();
+        assert_eq!(
+            state.health_successes,
+            [(
+                selected.credential,
+                selected.upstream_model,
+                4,
+                started_at_ms
+            )]
+        );
+    }
+}
+
+#[test]
 fn cooling_models_do_not_consume_the_upstream_attempt_budget() {
     for all_cooling in [false, true] {
         let host = MemoryHost::new(false);

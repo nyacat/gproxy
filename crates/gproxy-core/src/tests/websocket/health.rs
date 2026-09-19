@@ -137,6 +137,12 @@ fn overloaded_model_recovers_after_success_on_reused_or_new_socket() {
                 );
                 assert_eq!(state.socket_opens, if reconnect { 2 } else { 1 });
                 assert_eq!(state.settlements.len(), 2);
+                assert_eq!(state.health_successes.len(), 1);
+                assert_eq!(
+                    Some(state.health_successes[0].3),
+                    state.settlements[1].upstream_started_at_ms,
+                    "recovery uses this response's send time, including on a reused socket"
+                );
                 assert_eq!(state.admission_finishes, [true, true]);
                 assert_eq!(state.health_attempts.len(), 2);
                 assert_eq!(state.health_releases, state.health_attempts);
