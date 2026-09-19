@@ -4,4 +4,4 @@ import type { QuotaProbeWindowDto } from "./QuotaProbeWindowDto";
 import type { QuotaResetCreditsDto } from "./QuotaResetCreditsDto";
 import type { QuotaSnapshot } from "./QuotaSnapshot";
 
-export type QuotaProbeResponse = { snapshot: QuotaSnapshot, windows: Array<QuotaProbeWindowDto>, reset_credits: QuotaResetCreditsDto | null, raw: string, cycles: Array<CredentialQuotaCycleDto>, local_error: boolean, };
+export type QuotaProbeResponse = { credential_version: number, snapshot: QuotaSnapshot, windows: Array<QuotaProbeWindowDto>, reset_credits: QuotaResetCreditsDto | null, raw: string, cycles: Array<CredentialQuotaCycleDto>, local_error: boolean, };

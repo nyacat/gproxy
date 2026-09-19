@@ -235,6 +235,18 @@
       "secretInvalid": "Not valid JSON.",
       "secretRequired": "Enter at least one credential field.",
       "manual": "Enter credential fields manually",
+      "oauthRefresh": {
+        "action": "Refresh OAuth token",
+        "pending": "Refreshing OAuth token…",
+        "error": "Could not refresh the OAuth token. Retry.",
+        "outcomes": {
+          "updated": "OAuth token refreshed and the new refresh token was saved.",
+          "unchanged": "OAuth token refreshed; the refresh token did not change.",
+          "not_returned": "OAuth token refreshed, but upstream returned no new refresh token; the existing token was kept.",
+          "not_applicable": "OAuth token refreshed.",
+          "updated_elsewhere": "This credential was updated by another request."
+        }
+      },
       "weight": "Traffic weight",
       "rpm": "Requests per minute",
       "tpm": "Tokens per minute",

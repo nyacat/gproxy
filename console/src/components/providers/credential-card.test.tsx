@@ -1,6 +1,7 @@
 import type { CredentialDto } from "@/generated/CredentialDto"
 import type { QuotaSnapshot } from "@/generated/QuotaSnapshot"
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
+import type { QuotaProbeResponse } from "@/generated/QuotaProbeResponse"
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query"
 import { act, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -8,10 +9,11 @@ import "@/i18n"
 import { CredentialCard } from "@/components/providers/credential-card"
 import { CredentialList } from "@/components/providers/credential-list"
 import { TooltipProvider } from "@/components/ui/tooltip"
+import { credentials } from "@/api/control"
 
 const credential: CredentialDto = {
   id: 7, provider_id: 3, label: "New credential", kind: "oauth",
-  quota_capabilities: { probe: true, reset: false, top_up_url: null }, version: 1, enabled: true, weight: 100,
+  quota_capabilities: { probe: true, reset: false, top_up_url: null }, refresh_supported: false, version: 1, enabled: true, weight: 100,
   rpm_limit: null, tpm_limit: null, proxy_url: null, tls_fingerprint: null,
   invalid_tls_fingerprint: null, tls_fingerprint_error: null, health: "unknown",
   health_observed_at: null, health_response_status: null, health_detail: null, model_health: [],
@@ -25,7 +27,7 @@ function snapshot(observed: number | null = Date.now()): QuotaSnapshot {
   }
 }
 const response = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } })
-const probed = (value: QuotaSnapshot) => ({ snapshot: value, windows: [], cycles: [], local_error: false, reset_credits: null, raw: "{}" })
+const probed = (value: QuotaSnapshot, credential_version = 1): QuotaProbeResponse => ({ credential_version, snapshot: value, windows: [], cycles: [], local_error: false, reset_credits: null, raw: "{}" })
 function view(value = credential, client = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
   return <QueryClientProvider client={client}><TooltipProvider><CredentialCard credential={value} cycles={[]} cyclesLoading={false} cyclesError={false} /></TooltipProvider></QueryClientProvider>
 }
@@ -86,7 +88,7 @@ describe("CredentialCard", () => {
     expect(client.getQueryState(otherHistory)?.isInvalidated).toBe(false)
   })
 
-  it("keeps a late manual probe bound to the credential version that started it", async () => {
+  it("keeps an older-version manual result out of the current credential cache", async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     let resolveProbe!: (response: Response) => void
     const current = snapshot()
@@ -107,14 +109,143 @@ describe("CredentialCard", () => {
     expect(screen.getByText("220.00 CNY")).toBeInTheDocument()
   })
 
+  it.each(["automatic", "manual"])("moves %s probe results to the actual credential version and rejects an older list read", async (mode) => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const initial = snapshot(mode === "automatic" ? null : Date.now())
+    const current = snapshot(Date.now() + 1)
+    current.entries[0].value = { kind: "balance", remaining: "220.00", unit: "CNY", availability: "available", components: [] }
+    const result = probed(current, 2)
+    let resolveProbe!: (value: Response) => void
+    let resolveOldList!: (value: Response) => void
+    let oldListSignal: AbortSignal | null | undefined
+    let listCalls = 0
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation((path, init) => {
+      if (String(path) === "/admin/api/credentials") {
+        if (listCalls++ > 0) return Promise.resolve(response([{ ...credential, version: 2 }]))
+        oldListSignal = init?.signal
+        return new Promise((resolve) => { resolveOldList = resolve })
+      }
+      if (String(path).endsWith("/quota")) return Promise.resolve(response(initial))
+      return new Promise((resolve) => { resolveProbe = resolve })
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    function CurrentCard() {
+      const saved = useQuery({ queryKey: ["credentials"], queryFn: ({ signal }) => credentials(signal), initialData: [credential], staleTime: Infinity })
+      return <TooltipProvider><CredentialCard credential={saved.data[0]} cycles={[]} cyclesLoading={false} cyclesError={false} /></TooltipProvider>
+    }
+    render(<QueryClientProvider client={client}><CurrentCard /></QueryClientProvider>)
+    if (mode === "manual") {
+      await screen.findByText("110.00 CNY")
+      await userEvent.setup().click(screen.getByRole("button", { name: "Refresh" }))
+    }
+    await waitFor(() => expect(resolveProbe).toBeDefined())
+    void client.invalidateQueries({ queryKey: ["credentials"] })
+    await waitFor(() => expect(resolveOldList).toBeDefined())
+    resolveProbe(response(result))
+    await screen.findByText("220.00 CNY")
+    await waitFor(() => expect(listCalls).toBe(2))
+    expect(oldListSignal?.aborted).toBe(true)
+    await act(async () => resolveOldList(response([credential])))
+    expect(client.getQueryData(["credentials"])).toEqual([{ ...credential, version: 2 }])
+    expect(client.getQueryData(["credential-quota", 7, 2])).toEqual(current)
+    expect(client.getQueryData(["credential-quota-probe", 7, 2])).toEqual(result)
+    expect(client.getQueryData(["credential-quota", 7, 1])).toEqual(initial)
+    expect(client.getQueryData(["credential-quota-probe", 7, 1])).not.toEqual(result)
+    expect(fetchMock.mock.calls.filter(([path]) => String(path).includes("/quota-probe"))).toHaveLength(1)
+  })
+
+  it("preserves a newer snapshot and probe when an older request reaches the same rotated version", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    let resolveProbe!: (value: Response) => void
+    const initial = snapshot(Date.now())
+    const older = snapshot(Date.now() + 1)
+    const current = snapshot(Date.now() + 2)
+    current.entries[0].value = { kind: "balance", remaining: "330.00", unit: "CNY", availability: "available", components: [] }
+    const currentProbe = probed(current, 2)
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response(initial))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveProbe = resolve })))
+    const mounted = render(view(credential, client))
+    await screen.findByText("110.00 CNY")
+    await userEvent.setup().click(screen.getByRole("button", { name: "Refresh" }))
+    client.setQueryData(["credentials"], [{ ...credential, version: 3 }])
+    client.setQueryData(["credential-quota", 7, 2], current)
+    client.setQueryData(["credential-quota-probe", 7, 2], currentProbe)
+    mounted.rerender(view({ ...credential, version: 2 }, client))
+    await screen.findByText("330.00 CNY")
+    resolveProbe(response(probed(older, 2)))
+    await waitFor(() => expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled())
+    expect(client.getQueryData(["credentials"])).toEqual([{ ...credential, version: 3 }])
+    expect(client.getQueryData(["credential-quota", 7, 2])).toEqual(current)
+    expect(client.getQueryData(["credential-quota-probe", 7, 2])).toEqual(currentProbe)
+    expect(client.getQueryData(["credential-quota-probe", 7, 1])).toBeUndefined()
+  })
+
+  it("keeps a rotated late result bound to the original account and provider after navigating away", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const other = { ...credential, id: 8, provider_id: 4, version: 9 }
+    const current = snapshot(Date.now() + 1)
+    current.entries[0].value = { kind: "balance", remaining: "440.00", unit: "CNY", availability: "available", components: [] }
+    client.setQueryData(["credentials"], [credential, other])
+    client.setQueryData(["credential-cycles", "providers", 3], [])
+    client.setQueryData(["credential-cycles", "providers", 4], [])
+    let resolveProbe!: (value: Response) => void
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response(snapshot()))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveProbe = resolve }))
+      .mockResolvedValueOnce(response(current)))
+    const mounted = render(view(credential, client))
+    await screen.findByText("110.00 CNY")
+    await userEvent.setup().click(screen.getByRole("button", { name: "Refresh" }))
+    mounted.rerender(view(other, client))
+    await screen.findByText("440.00 CNY")
+    const result = probed(snapshot(), 2)
+    resolveProbe(response(result))
+    await waitFor(() => expect(client.getQueryData(["credential-quota-probe", 7, 2])).toEqual(result))
+    expect(client.getQueryData(["credentials"])).toEqual([{ ...credential, version: 2 }, other])
+    expect(client.getQueryData(["credential-quota", 8, 9])).toEqual(current)
+    expect(client.getQueryData(["credential-quota-probe", 8, 9])).toBeUndefined()
+    expect(client.getQueryState(["credential-cycles", "providers", 3])?.isInvalidated).toBe(true)
+    expect(client.getQueryState(["credential-cycles", "providers", 4])?.isInvalidated).toBe(false)
+  })
+
+  it("keeps a same-millisecond success when an in-flight failed probe arrives later", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const attempted = Date.now()
+    const current = snapshot(attempted)
+    current.entries[0].value = { kind: "balance", remaining: "330.00", unit: "CNY", availability: "available", components: [] }
+    const failed = snapshot(attempted)
+    failed.sources[0].error = { code: "unauthorized", message: "Late quota error" }
+    const currentProbe = probed(current)
+    let resolveProbe!: (value: Response) => void
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response(snapshot(attempted - 1)))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveProbe = resolve })))
+    render(view(credential, client))
+    await screen.findByText("110.00 CNY")
+    await userEvent.setup().click(screen.getByRole("button", { name: "Refresh" }))
+    act(() => {
+      client.setQueryData(["credential-quota", 7, 1], current)
+      client.setQueryData(["credential-quota-probe", 7, 1], currentProbe)
+    })
+    await screen.findByText("330.00 CNY")
+    resolveProbe(response(probed(failed)))
+    await waitFor(() => expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled())
+    expect(client.getQueryData(["credential-quota", 7, 1])).toEqual(current)
+    expect(client.getQueryData(["credential-quota-probe", 7, 1])).toEqual(currentProbe)
+    expect(screen.queryByText("Late quota error")).not.toBeInTheDocument()
+    expect(screen.getByText("330.00 CNY")).toBeInTheDocument()
+  })
+
   it("does not let an older snapshot read overwrite a completed probe", async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     let resolveSnapshot!: (response: Response) => void
     let oldReadSignal: AbortSignal | null | undefined
-    const current = snapshot()
+    const initial = snapshot()
+    const current = snapshot(initial.sources[0].observed_at_ms! + 1)
     current.entries[0].value = { kind: "balance", remaining: "220.00", unit: "CNY", availability: "available", components: [] }
     vi.stubGlobal("fetch", vi.fn<typeof fetch>()
-      .mockResolvedValueOnce(response(snapshot()))
+      .mockResolvedValueOnce(response(initial))
       .mockImplementationOnce((_path, init) => {
         oldReadSignal = init?.signal
         return new Promise((resolve) => { resolveSnapshot = resolve })
@@ -133,7 +264,7 @@ describe("CredentialCard", () => {
     await waitFor(() => expect(oldReadSignal).toBeDefined())
     await userEvent.setup().click(screen.getByRole("button", { name: "Refresh" }))
     await screen.findByText("220.00 CNY")
-    await act(async () => resolveSnapshot(response(snapshot())))
+    await act(async () => resolveSnapshot(response(initial)))
     expect(client.getQueryData(["credential-quota", 7, 1])).toEqual(current)
     expect(oldReadSignal?.aborted).toBe(true)
     expect(otherSignals).toHaveLength(2)
@@ -156,7 +287,7 @@ describe("CredentialCard", () => {
 
   it("preserves an API Key's saved balance when refresh fails and reports per-source errors", async () => {
     const fresh = snapshot()
-    const failed = snapshot()
+    const failed = snapshot(fresh.sources[0].attempted_at_ms! + 1)
     failed.sources[0].error = { code: "unauthorized", message: "Upstream returned 401" }
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(response(fresh)).mockResolvedValueOnce(response(probed(failed)))
     vi.stubGlobal("fetch", fetchMock)
