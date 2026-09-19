@@ -23,52 +23,58 @@ pub(super) fn increment(metrics: &mut Value, usage: &UsageInput) -> Result<(), S
 
 impl Store {
     pub(super) async fn rebuild_cycle(&self, id: i64) -> Result<(), StoreError> {
-        for _ in 0..8 {
+        let mut conflicts = 0;
+        while conflicts < 8 {
             let Some(mut cycle) = self.credential_quota_cycle(id).await? else {
                 return Ok(());
             };
-            let tracking = &mut cycle.tracking;
-            if !tracking.needs_rebuild {
+            if !cycle.tracking.needs_rebuild {
                 return Ok(());
             }
-            tracking.models.clear();
-            cycle.metrics = if tracking.scope == gproxy_core::QuotaScope::Unknown {
-                serde_json::json!({})
-            } else {
-                super::metrics::metrics(&UsageTotals::default())
-            };
             let expected = cycle.version;
-            let mut after = 0;
-            let mut statements = Vec::new();
-            loop {
+            let mut batch = vec![runtime::lock_cycle(&cycle)?];
+            if cycle.tracking.scope == gproxy_core::QuotaScope::Unknown {
+                cycle.tracking.needs_rebuild = false;
+                cycle.tracking.rebuild_after = None;
+                cycle.metrics = serde_json::json!({});
+                cycle.tracking.models.clear();
+            } else {
+                let after = cycle.tracking.rebuild_after.unwrap_or(0);
+                if cycle.tracking.rebuild_after.is_none() {
+                    cycle.tracking.models.clear();
+                    cycle.metrics = super::metrics::metrics(&UsageTotals::default());
+                }
                 let rows = self
                     .backend()
                     .execute(runtime::cycle_usage_rows(&cycle, after, None)?)
                     .await?
                     .rows;
                 if rows.is_empty() {
-                    break;
-                }
-                for row in rows {
-                    let record = crate::store::usage::parse_usage(row)?;
-                    after = record.id;
-                    if cycle.tracking.scope.includes(&record.usage.upstream_model) {
-                        accumulate(&mut cycle, &record.usage)?;
-                        statements.push(runtime::link_cycle_usage(&cycle, record.id)?);
+                    cycle.tracking.needs_rebuild = false;
+                    cycle.tracking.rebuild_after = None;
+                } else {
+                    for row in rows {
+                        let record = crate::store::usage::parse_usage(row)?;
+                        cycle.tracking.rebuild_after = Some(record.id);
+                        if cycle.tracking.scope.includes(&record.usage.upstream_model) {
+                            accumulate(&mut cycle, &record.usage)?;
+                            batch.push(runtime::link_cycle_usage(&cycle, record.id)?);
+                        }
                     }
                 }
             }
-            cycle.tracking.needs_rebuild = false;
             cycle.version += 1;
-            statements.push(runtime::update_tracked_cycle(&cycle, expected)?);
-            if self
-                .backend()
-                .batch(statements)
-                .await?
-                .last()
-                .is_some_and(|result| result.affected_rows == 1)
-            {
-                return Ok(());
+            batch.push(runtime::update_tracked_cycle(&cycle, expected)?);
+            // Lock the cycle before linking, then commit the links, totals and
+            // cursor together. A losing CAS must never leave uncounted links.
+            let results = self.backend().batch(batch).await?;
+            if results.last().expect("cycle update").affected_rows == 1 {
+                conflicts = 0;
+                if !cycle.tracking.needs_rebuild {
+                    return Ok(());
+                }
+            } else {
+                conflicts += 1;
             }
         }
         Err(StoreError::Database(

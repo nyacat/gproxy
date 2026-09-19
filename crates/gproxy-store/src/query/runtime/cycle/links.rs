@@ -30,7 +30,7 @@ pub(crate) fn cycle_usage_rows(
         .and_where(Expr::col((Alias::new("usage_rows"), Alias::new("id"))).gt(after))
         .and_where(sent_at().gte(cycle.accounting_start_ms))
         .order_by((Alias::new("usage_rows"), Alias::new("id")), Order::Asc)
-        .limit(1000);
+        .limit(256);
     if let Some(end) = cycle.accounting_end_ms {
         query.and_where(sent_at().lt(end));
     }
@@ -56,6 +56,18 @@ pub(crate) fn cycle_usage_rows(
         });
     }
     Statement::query(&query)
+}
+
+// A conditional no-op UPDATE serializes cycle writers on all supported SQL
+// backends, including when two transactions started from the same version.
+pub(crate) fn lock_cycle(cycle: &CredentialQuotaCycleRecord) -> Result<Statement, StoreError> {
+    Statement::query(
+        Query::update()
+            .table(Alias::new("credential_quota_cycles"))
+            .value(Alias::new("version"), Expr::col(Alias::new("version")))
+            .and_where(Expr::col(Alias::new("id")).eq(cycle.id))
+            .and_where(Expr::col(Alias::new("version")).eq(cycle.version)),
+    )
 }
 
 pub(crate) fn link_cycle_usage(

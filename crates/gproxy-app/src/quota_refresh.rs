@@ -10,43 +10,60 @@ pub(crate) fn now() -> i64 {
         .as_secs() as i64
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn schedule(app: &AppHandle) {
-    let Some(spawner) = app.inner.host.spawner() else {
-        return;
-    };
-    let app = app.clone();
-    spawner.spawn(Box::pin(async move {
-        let maintenance = async {
-            loop {
-                if let Err(error) = sweep(&app).await {
-                    tracing::warn!(error = %error, "quota maintenance failed");
-                }
-                app.inner.host.wait(Duration::from_secs(30)).await;
-            }
-        };
-        let shutdown = app.wait_shutdown();
-        futures_util::pin_mut!(maintenance, shutdown);
-        futures_util::future::select(maintenance, shutdown).await;
-    }));
-}
-
-async fn sweep(app: &AppHandle) -> Result<(), gproxy_admin::AdminError> {
-    let now = now();
-    let active = app
-        .inner
+    let inner = std::sync::Arc::downgrade(&app.inner);
+    app.inner
         .host
         .services
-        .store
-        .active_usage_credentials(now - 1800)
+        .spawner
+        .spawn_maintenance(app.inner.shutdown.subscribe(), async move {
+            let mut rebuild_after = 0;
+            loop {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                let task_app = AppHandle { inner };
+                if let Err(error) = sweep(&task_app, &mut rebuild_after).await {
+                    tracing::warn!(error = %error, "quota maintenance failed");
+                }
+                drop(task_app);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn schedule(_app: &AppHandle) {}
+
+async fn sweep(app: &AppHandle, rebuild_after: &mut i64) -> Result<(), gproxy_admin::AdminError> {
+    let now = now();
+    let store = &app.inner.host.services.store;
+    let pending = store
+        .pending_credential_quota_rebuilds(None, *rebuild_after)
         .await?;
+    *rebuild_after = pending.last().copied().unwrap_or(0);
+    for id in pending {
+        if let Err(error) = store.repair_credential_quota_cycle(id).await {
+            tracing::warn!(cycle_id = id, error = %error, "quota cycle rebuild remains pending");
+        }
+    }
+    let active = store.active_usage_credentials(now - 1800).await?;
     let snapshot = app.inner.host.services.control.current();
-    for credential in &snapshot.credentials {
-        app.inner
-            .host
-            .services
-            .store
-            .repair_credential_quota(credential.id, now)
-            .await?;
+    for cycle in store.unclosed_credential_quota_cycles(None).await? {
+        if cycle.accounting_end_ms.is_some_and(|end| end <= now * 1000) {
+            let end = cycle.accounting_end_ms.expect("checked end") / 1000;
+            store
+                .close_credential_quota_cycle(
+                    cycle.id,
+                    gproxy_store::records::QuotaCycleCloseReason::BoundaryCrossed,
+                    end,
+                )
+                .await?;
+        }
+    }
+    for id in &active {
+        store.repair_credential_quota(*id, now).await?;
     }
     let credentials = snapshot
         .credentials
@@ -96,7 +113,7 @@ pub(crate) async fn opportunistic(app: &AppHandle) {
         )
         .await;
     if matches!(due, Ok(true))
-        && let Err(error) = sweep(app).await
+        && let Err(error) = sweep(app, &mut 0).await
     {
         tracing::warn!(error = %error, "opportunistic quota maintenance failed");
     }

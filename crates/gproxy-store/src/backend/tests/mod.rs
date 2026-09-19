@@ -1,9 +1,17 @@
 mod cache;
 mod credential_budget;
+mod cycle_reads;
 mod oauth_migration;
 mod parity;
+mod quota_activity;
+mod quota_contention;
+mod quota_migration;
+mod quota_observation_version;
 mod scenario;
 mod sender;
+mod settlement_recovery;
+mod usage_records;
+mod usage_summary;
 
 use std::sync::Arc;
 
@@ -36,5 +44,6 @@ fn store(executor: Arc<impl Executor + 'static>) -> Store {
     Store {
         executor,
         dialect: Dialect::NativeSqlite,
+        quota_window_locks: Default::default(),
     }
 }

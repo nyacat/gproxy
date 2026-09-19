@@ -3,6 +3,28 @@ use crate::records::UsageRecord;
 use crate::{Store, StoreError};
 
 impl Store {
+    /// Discover rebuilds independently of open windows and recent traffic.
+    /// The caller advances `after` even if a particular rebuild fails.
+    pub async fn pending_credential_quota_rebuilds(
+        &self,
+        credential: Option<i64>,
+        after: i64,
+    ) -> Result<Vec<i64>, StoreError> {
+        self.backend()
+            .execute(runtime::pending_credential_quota_rebuilds(
+                credential, after,
+            )?)
+            .await?
+            .rows
+            .iter()
+            .map(|row| row.i64("id"))
+            .collect()
+    }
+
+    pub async fn repair_credential_quota_cycle(&self, cycle_id: i64) -> Result<(), StoreError> {
+        self.rebuild_cycle(cycle_id).await
+    }
+
     pub async fn begin_credential_usage(
         &self,
         request: &str,
@@ -10,11 +32,44 @@ impl Store {
         model: &str,
         at_ms: i64,
     ) -> Result<(), StoreError> {
+        self.begin_credential_attempt(request, request, credential, model, at_ms)
+            .await
+    }
+
+    pub async fn begin_credential_attempt(
+        &self,
+        request: &str,
+        parent: &str,
+        credential: i64,
+        model: &str,
+        at_ms: i64,
+    ) -> Result<(), StoreError> {
         self.backend()
-            .execute(runtime::begin_usage(request, credential, model, at_ms)?)
+            .execute(runtime::begin_usage(
+                request, parent, credential, model, at_ms,
+            )?)
             .await?;
         Ok(())
     }
+    pub async fn finish_credential_attempt(
+        &self,
+        request: &str,
+        credential: i64,
+        at_ms: i64,
+    ) -> Result<(), StoreError> {
+        self.backend()
+            .execute(runtime::finish_usage(request, credential, at_ms)?)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn finish_credential_usage(&self, parent: &str) -> Result<(), StoreError> {
+        self.backend()
+            .execute(runtime::finish_usage_request(parent)?)
+            .await?;
+        Ok(())
+    }
+
     pub(super) async fn repair_cycle_links(
         &self,
         credential: i64,
@@ -22,8 +77,10 @@ impl Store {
     ) -> Result<(), StoreError> {
         let cycles = self
             .backend()
-            .execute(runtime::select_credential_quota_cycle_history(
-                credential, window,
+            .execute(runtime::select_credential_quota_cycle_history_limited(
+                credential,
+                window,
+                Some(runtime::REPAIR_HISTORY),
             )?)
             .await?
             .rows;
@@ -74,6 +131,7 @@ impl Store {
                 {
                     continue;
                 }
+                let lock = runtime::lock_cycle(&cycle)?;
                 let link = runtime::link_cycle_usage(&cycle, record.id)?;
                 let expected = cycle.version;
                 super::accounting::accumulate(&mut cycle, &record.usage)?;
@@ -81,11 +139,12 @@ impl Store {
                 let results = self
                     .backend()
                     .batch(vec![
+                        lock,
                         link,
                         runtime::update_cycle_after_link(&cycle, expected)?,
                     ])
                     .await?;
-                complete &= results[1].affected_rows == 1;
+                complete &= results[2].affected_rows == 1;
             }
             if complete {
                 return Ok(());
@@ -101,15 +160,19 @@ impl Store {
         credential: i64,
         now: i64,
     ) -> Result<(), StoreError> {
-        let cycles = self
-            .credential_quota_cycles(Some(credential), 0, now.saturating_add(1))
+        for id in self
+            .pending_credential_quota_rebuilds(Some(credential), 0)
+            .await?
+        {
+            self.rebuild_cycle(id).await?;
+        }
+        let opens = self
+            .unclosed_credential_quota_cycles(Some(credential))
             .await?;
         let mut windows = std::collections::BTreeSet::new();
-        for cycle in cycles {
+        for cycle in &opens {
             windows.insert(cycle.window_key.clone());
-            if cycle.status == crate::records::QuotaCycleStatus::Open
-                && cycle.accounting_end_ms.is_some_and(|end| end <= now * 1000)
-            {
+            if cycle.accounting_end_ms.is_some_and(|end| end <= now * 1000) {
                 let end = cycle.accounting_end_ms.expect("checked end") / 1000;
                 self.close_credential_quota_cycle(
                     cycle.id,
@@ -123,14 +186,19 @@ impl Store {
             self.repair_cycle_links(credential, &window).await?;
             let cycles = self
                 .backend()
-                .execute(runtime::select_credential_quota_cycle_history(
-                    credential, &window,
+                .execute(runtime::select_credential_quota_cycle_history_limited(
+                    credential,
+                    &window,
+                    Some(runtime::REPAIR_HISTORY),
                 )?)
                 .await?
                 .rows;
             for row in cycles {
                 let cycle = super::row::parse(row)?;
-                if cycle.tracking.scope == gproxy_core::QuotaScope::Unknown {
+                if cycle.tracking.scope == gproxy_core::QuotaScope::Unknown
+                    || !cycle.tracking.needs_rebuild
+                        && cycle.status != crate::records::QuotaCycleStatus::Open
+                {
                     continue;
                 }
                 let mut after = 0;

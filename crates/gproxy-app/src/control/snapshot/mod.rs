@@ -6,6 +6,8 @@ mod index;
 mod materialize;
 mod pressure;
 mod pricing;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod reload_tests;
 mod resolve;
 mod rules;
 mod types;
@@ -27,6 +29,8 @@ use types::CredentialHealthMap;
 pub(crate) use types::KeyIdentity;
 use types::{CompiledSnapshot, CredentialPressure, CredentialPressureMap};
 
+const PROBE_STALE_SECONDS: i64 = 120;
+
 #[derive(Clone)]
 pub(crate) struct SnapshotControl {
     store: Store,
@@ -41,6 +45,20 @@ pub(crate) struct SnapshotControl {
     /// this instance performs forgets its own entry immediately.
     credential_records: Arc<Mutex<HashMap<i64, CredentialRecord>>>,
     health_persisted_at: Arc<Mutex<HashMap<(gproxy_channel_api::CredentialId, String), i64>>>,
+    /// Last successful probe persist per credential. Response-header snapshots
+    /// only hit the store when this is older than [`PROBE_STALE_SECONDS`].
+    probe_ok_at: Arc<Mutex<HashMap<i64, (u64, i64)>>>,
+    /// Reloads may overlap while waiting on storage. A completed read can
+    /// publish unless a newer read has already published its snapshot.
+    reload_generation: Arc<Mutex<ReloadGeneration>>,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    reload_pause: Arc<Mutex<Option<reload_tests::Pause>>>,
+}
+
+#[derive(Default)]
+struct ReloadGeneration {
+    next: u64,
+    published: u64,
 }
 
 impl SnapshotControl {
@@ -67,22 +85,49 @@ impl SnapshotControl {
             oauth_keys: Arc::new(ArcSwap::from_pointee(oauth_keys)),
             credential_records: Arc::default(),
             health_persisted_at: Arc::default(),
+            probe_ok_at: Arc::default(),
+            reload_generation: Arc::default(),
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            reload_pause: Arc::default(),
         })
     }
 
     pub(crate) async fn reload(&self) -> Result<(), StoreError> {
+        let generation = {
+            let mut generation = self.reload_generation.lock().expect("snapshot generation");
+            generation.next = generation
+                .next
+                .checked_add(1)
+                .expect("snapshot generation exhausted");
+            generation.next
+        };
         let stored = self.store.control_snapshot().await?;
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        {
+            let pause = self.reload_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                let _ = pause.read.send(());
+                let _ = pause.resume.await;
+            }
+        }
         let health = load_health(&self.store).await?;
-        self.oauth_keys.store(Arc::new(
-            self.store.oauth_user_key_ids().await?.into_iter().collect(),
-        ));
-        self.snapshot
-            .store(Arc::new(CompiledSnapshot::build(stored, &self.runtime)?));
+        let oauth_keys = self.store.oauth_user_key_ids().await?.into_iter().collect();
+        let compiled = Arc::new(CompiledSnapshot::build(stored, &self.runtime)?);
+        // A second reload can finish while this one is waiting on another
+        // backend read. Its generation wins; publishing this older snapshot
+        // would roll the routing table and health state backwards.
+        let mut current_generation = self.reload_generation.lock().expect("snapshot generation");
+        if current_generation.published > generation {
+            return Ok(());
+        }
+        self.oauth_keys.store(Arc::new(oauth_keys));
+        self.snapshot.store(compiled);
         self.credential_health.store(Arc::new(health));
         self.credential_records
             .lock()
             .expect("credential cache")
             .clear();
+        current_generation.published = generation;
         Ok(())
     }
 
@@ -92,6 +137,25 @@ impl SnapshotControl {
             .expect("credential cache")
             .get(&id)
             .cloned()
+    }
+
+    /// The loaded record may be newer than the compiled control snapshot after
+    /// OAuth rotation. Read only its version without cloning the decrypted secret.
+    pub(crate) fn known_credential_version(&self, id: i64) -> Option<u64> {
+        self.credential_records
+            .lock()
+            .expect("credential cache")
+            .get(&id)
+            .map(|record| record.version)
+            .or_else(|| {
+                self.snapshot
+                    .load()
+                    .stored
+                    .credentials
+                    .iter()
+                    .find(|record| record.id == id)
+                    .map(|record| record.version)
+            })
     }
 
     pub(crate) fn cache_credential(&self, record: &CredentialRecord) {
@@ -159,6 +223,66 @@ impl SnapshotControl {
         });
     }
 
+    pub(crate) fn apply_live_pressure(
+        &self,
+        observation: &gproxy_store::records::CredentialQuotaObservation,
+    ) {
+        let Some(used_percent) = observation.used_percent.or_else(|| {
+            let used = observation.upstream_used?;
+            let limit = observation.upstream_limit?;
+            (limit > Decimal::ZERO).then(|| used / limit * Decimal::ONE_HUNDRED)
+        }) else {
+            return;
+        };
+        let credential = gproxy_channel_api::CredentialId(observation.credential_id);
+        let window_key = observation.window_key.clone();
+        let last_observed_at = observation.observed_at;
+        let period_end = (observation.boundary_source == QuotaBoundarySource::Upstream)
+            .then_some(observation.period_end)
+            .flatten();
+        self.credential_pressure.rcu(|current| {
+            let mut updated = (**current).clone();
+            let windows = updated.entry(credential).or_default();
+            let replace = windows
+                .get(&window_key)
+                .is_none_or(|stored| stored.last_observed_at <= last_observed_at);
+            if replace {
+                let (cycle_id, version) = windows
+                    .get(&window_key)
+                    .map(|stored| (stored.cycle_id, stored.version))
+                    .unwrap_or((0, 0));
+                windows.insert(
+                    window_key.clone(),
+                    CredentialPressure {
+                        cycle_id,
+                        version,
+                        last_observed_at,
+                        used_percent,
+                        period_end,
+                    },
+                );
+            }
+            Arc::new(updated)
+        });
+    }
+
+    pub(crate) fn note_probe_ok(&self, credential_id: i64, version: u64, observed_at: i64) {
+        self.probe_ok_at
+            .lock()
+            .expect("probe cache")
+            .insert(credential_id, (version, observed_at));
+    }
+
+    pub(crate) fn probe_persist_due(&self, credential_id: i64, version: u64, now: i64) -> bool {
+        self.probe_ok_at
+            .lock()
+            .expect("probe cache")
+            .get(&credential_id)
+            .is_none_or(|(saved_version, at)| {
+                *saved_version != version || now.saturating_sub(*at) >= PROBE_STALE_SECONDS
+            })
+    }
+
     pub(crate) async fn observe_credential_quota_cycle(
         &self,
         observation: &gproxy_store::records::CredentialQuotaObservation,
@@ -187,6 +311,23 @@ impl SnapshotControl {
         Ok(cycle)
     }
 
+    pub(crate) async fn observe_credential_quota_cycle_for_version(
+        &self,
+        observation: &gproxy_store::records::CredentialQuotaObservation,
+        expected_version: u64,
+    ) -> Result<Option<gproxy_store::records::CredentialQuotaCycleRecord>, StoreError> {
+        let cycle = self
+            .store
+            .observe_credential_quota_cycle_for_version(observation, expected_version)
+            .await?;
+        if let Some(cycle) = &cycle
+            && self.known_credential_version(observation.credential_id) == Some(expected_version)
+        {
+            self.update_pressure(cycle);
+        }
+        Ok(cycle)
+    }
+
     pub(crate) async fn close_credential_quota_cycle(
         &self,
         id: i64,
@@ -211,6 +352,10 @@ impl SnapshotControl {
         self.snapshot.load().settings.runtime.clone()
     }
 
+    pub(crate) fn instance_name(&self) -> String {
+        self.snapshot.load().settings.instance_name.clone()
+    }
+
     pub(crate) fn runtime_settings_status(
         &self,
         configured: gproxy_admin::dto::RuntimeSettingsDto,
@@ -227,10 +372,11 @@ impl SnapshotControl {
     }
 
     pub(crate) fn key_identity(&self, version: u32, digest: &[u8]) -> Option<KeyIdentity> {
+        let digest: [u8; 32] = digest.try_into().ok()?;
         self.snapshot
             .load()
             .identities
-            .get(&(version, digest.to_vec()))
+            .get(&(version, digest))
             .cloned()
             .filter(|identity| !self.is_oauth_key(identity.caller.user_key_id))
     }

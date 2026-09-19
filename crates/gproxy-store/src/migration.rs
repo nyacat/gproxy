@@ -1,6 +1,8 @@
+mod branch_history;
+
 use sea_query::{
-    Alias, ColumnDef, Expr, MysqlQueryBuilder, PostgresQueryBuilder, Query, SqliteQueryBuilder,
-    Table,
+    Alias, ColumnDef, Expr, ExprTrait, MysqlQueryBuilder, PostgresQueryBuilder, Query,
+    SqliteQueryBuilder, Table,
 };
 
 use crate::StoreError;
@@ -30,22 +32,41 @@ pub(crate) async fn migrate_to(
             "database schema is newer than this binary".into(),
         ));
     }
+    branch_history::reconcile(
+        executor,
+        dialect,
+        applied.last().copied().unwrap_or_default(),
+        target,
+    )
+    .await?;
     for version in SchemaVersion::ALL {
         if version.number() <= applied.last().copied().unwrap_or_default()
             || version.number() > target.number()
         {
             continue;
         }
-        let mut statements = migration_statements(version, dialect);
+        let mut statements = if matches!(
+            version,
+            SchemaVersion::ModelPermissions
+                | SchemaVersion::RouteStrategies
+                | SchemaVersion::QuotaSnapshots
+                | SchemaVersion::QuotaRebuildIndex
+                | SchemaVersion::SettlementRecovery
+                | SchemaVersion::QuotaActivityLifecycle
+        ) {
+            branch_history::additive_statements(executor, dialect, version).await?
+        } else {
+            migration_statements(version, dialect)
+                .into_iter()
+                .map(Statement::plain)
+                .collect()
+        };
         if statements
             .first()
-            .is_some_and(|statement| statement.starts_with("PRAGMA "))
+            .is_some_and(|statement| statement.sql.starts_with("PRAGMA "))
         {
-            executor
-                .execute(Statement::plain(statements.remove(0)))
-                .await?;
+            executor.execute(statements.remove(0)).await?;
         }
-        let mut statements: Vec<_> = statements.into_iter().map(Statement::plain).collect();
         if version == SchemaVersion::OAuthSessions {
             statements.extend(crate::oauth_migration::statements()?);
         }
@@ -57,6 +78,33 @@ pub(crate) async fn migrate_to(
             let sweep = crate::query::orphan_sweep(version)?;
             statements.extend(sweep.iter().cloned());
             statements.extend(sweep);
+        }
+        if version == SchemaVersion::QuotaRebuildIndex {
+            // Tracking is written by serde_json without whitespace. Backfill
+            // once on upgrade; maintenance subsequently uses the index.
+            statements.push(Statement::query(
+                Query::update()
+                    .table(Alias::new("credential_quota_cycles"))
+                    .value(Alias::new("needs_rebuild"), 1_i64)
+                    .and_where(
+                        Expr::col(Alias::new("tracking_json")).like("%\"needs_rebuild\":true%"),
+                    ),
+            )?);
+        }
+        if version == SchemaVersion::QuotaActivityLifecycle {
+            // A retry may find the DDL already committed (notably on MySQL).
+            // Backfills must therefore be safe both for partially upgraded rows
+            // and for existing self v12 rows with real attempt/parent identities.
+            statements.push(Statement::query(
+                Query::update()
+                    .table(Alias::new("credential_quota_activity"))
+                    .value(
+                        Alias::new("parent_request_id"),
+                        Expr::col(Alias::new("request_id")),
+                    )
+                    .and_where(Expr::col(Alias::new("parent_request_id")).is_null()),
+            )?);
+            statements.push(crate::query::runtime::settle_usage(None)?);
         }
         statements.push(record_version(version)?);
         executor.batch(statements).await?;

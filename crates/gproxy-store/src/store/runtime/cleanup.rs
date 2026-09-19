@@ -88,5 +88,7 @@ fn retention_statements(cutoff: i64) -> Result<Vec<Statement>, StoreError> {
             .collect::<Result<Vec<_>, _>>()?,
     );
     statements.push(runtime::delete_stale_quota_activity(cutoff)?);
+    statements.push(runtime::delete_oldest_observations(Some(cutoff))?);
+    statements.extend(runtime::delete_closed_additional_cycles(cutoff)?);
     Ok(statements)
 }
