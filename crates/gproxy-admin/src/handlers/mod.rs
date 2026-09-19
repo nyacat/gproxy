@@ -67,6 +67,7 @@ pub(crate) async fn dispatch(
         Route::CredentialCyclesQuery => {
             observability::credential_cycles_query(state, parts, body).await
         }
+        Route::CredentialCyclesPage => observability::pages::cycles(state, parts, body).await,
         Route::Channels => catalogue::channels(state),
         Route::TlsPresets => catalogue::tls_presets(state),
         Route::RulePresets => rule_presets::list(),

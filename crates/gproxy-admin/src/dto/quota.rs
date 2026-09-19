@@ -16,6 +16,34 @@ pub struct CredentialCycleReadRequest {
     pub current_only: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct CredentialCycleCursorDto {
+    pub last_observed_at: i64,
+    pub id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct CredentialCyclePageRequest {
+    pub from: i64,
+    pub to: i64,
+    pub credential_id: Option<i64>,
+    pub provider_id: Option<i64>,
+    pub window_key: Option<String>,
+    pub cursor: Option<CredentialCycleCursorDto>,
+    #[serde(default = "cycle_page_limit")]
+    pub limit: u32,
+}
+
+fn cycle_page_limit() -> u32 {
+    10
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct CredentialCyclePageDto {
+    pub items: Vec<super::CredentialQuotaCycleDto>,
+    pub next_cursor: Option<CredentialCycleCursorDto>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct QuotaCapabilitiesDto {
     pub probe: bool,

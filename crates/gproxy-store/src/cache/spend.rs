@@ -1,7 +1,7 @@
-// Both reservation operations share exact decimal arithmetic. Redis Lua's
-// numbers cannot represent every i64 counter, including quota boundaries.
-macro_rules! spend_script {
-    ($body:literal) => {
+// Redis Lua's numbers cannot represent every i64 counter. Share exact signed
+// decimal comparisons between admission and the durable-spend floor.
+macro_rules! integer_script {
+    ($body:expr) => {
         concat!(
             r#"
 local function magnitude_compare(a, b)
@@ -22,6 +22,24 @@ local function normalize(value)
   if digits == '' then return '0' end
   return (negative and '-' or '') .. digits
 end
+local minimum, maximum = '-9223372036854775808', '9223372036854775807'
+local function integer(value)
+  value = normalize(value)
+  if compare(value, minimum) < 0 or compare(value, maximum) > 0 then
+    error('cache counter overflow')
+  end
+  return value
+end
+"#,
+            $body
+        )
+    };
+}
+
+macro_rules! spend_script {
+    ($body:literal) => {
+        integer_script!(concat!(
+            r#"
 local function add(a, b)
   local an, bn = a:sub(1, 1) == '-', b:sub(1, 1) == '-'
   a, b = an and a:sub(2) or a, bn and b:sub(2) or b
@@ -44,14 +62,6 @@ local function add(a, b)
   if carry > 0 then result = tostring(carry) .. result end
   return normalize((an and '-' or '') .. result)
 end
-local minimum, maximum = '-9223372036854775808', '9223372036854775807'
-local function integer(value)
-  value = normalize(value)
-  if compare(value, minimum) < 0 or compare(value, maximum) > 0 then
-    error('cache counter overflow')
-  end
-  return value
-end
 local function saturate(value)
   if compare(value, minimum) < 0 then return minimum end
   if compare(value, maximum) > 0 then return maximum end
@@ -72,7 +82,7 @@ local function reserve(used, pending, estimate, limit)
 end
 "#,
             $body
-        )
+        ))
     };
 }
 
@@ -109,14 +119,39 @@ return 1
 "#
 );
 
+// INCRBY updates an exact signed integer internally, but its Lua return value
+// is a double. Read the stored decimal string in the same script to return all
+// i64 values exactly, including the boundaries and values above 2^53.
+pub(crate) const INCR_SCRIPT: &str = r#"
+local exists = redis.call('EXISTS', KEYS[1])
+redis.call('INCRBY', KEYS[1], ARGV[1])
+if exists == 0 and tonumber(ARGV[2]) > 0 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return redis.call('GET', KEYS[1])
+"#;
+
+pub(crate) const COMPARE_INCR_SCRIPT: &str = r#"
+if redis.call('GET', KEYS[2]) ~= ARGV[2] then return false end
+redis.call('INCRBY', KEYS[1], ARGV[1])
+local value = redis.call('GET', KEYS[1])
+if value == '0' then
+  redis.call('PEXPIRE', KEYS[1], 3600000)
+else
+  redis.call('PERSIST', KEYS[1])
+end
+redis.call('SET', KEYS[2], ARGV[3])
+return value
+"#;
+
 /// KEYS[1]=used ARGV[1]=durable floor ARGV[2]=ttl_ms.
-/// Compare decimal strings so large integer counters do not lose precision in Lua.
-pub(crate) const RAISE_SCRIPT: &str = r#"
+/// Use the same signed decimal comparison as admission; a replay may never
+/// lower an existing counter, even when either operand is negative.
+pub(crate) const RAISE_SCRIPT: &str = integer_script!(
+    r#"
 local current = redis.call('GET', KEYS[1])
-local floor = ARGV[1]
-if not current or string.sub(current, 1, 1) == '-' or
-   string.len(current) < string.len(floor) or
-   (string.len(current) == string.len(floor) and current < floor) then
+local floor = integer(ARGV[1])
+if not current or compare(integer(current), floor) < 0 then
   redis.call('SET', KEYS[1], floor)
 end
 if tonumber(ARGV[2]) > 0 then
@@ -125,4 +160,5 @@ else
   redis.call('PERSIST', KEYS[1])
 end
 return 1
-"#;
+"#
+);

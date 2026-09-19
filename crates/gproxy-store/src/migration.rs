@@ -53,6 +53,7 @@ pub(crate) async fn migrate_to(
                 | SchemaVersion::QuotaRebuildIndex
                 | SchemaVersion::SettlementRecovery
                 | SchemaVersion::QuotaActivityLifecycle
+                | SchemaVersion::QuotaHistoryIndex
         ) {
             branch_history::additive_statements(executor, dialect, version).await?
         } else {

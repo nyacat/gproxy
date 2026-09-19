@@ -47,7 +47,7 @@ pub(super) async fn refresh(
         }
     }
     .await;
-    super::lease::release(app, slot, owner).await?;
+    slot.release().await?;
     let mut state = QuotaSourceState {
         capability,
         attempted_at_ms: Some(attempted_at_ms),

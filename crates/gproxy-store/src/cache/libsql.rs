@@ -10,6 +10,21 @@ use super::error;
 
 type Error = gproxy_core::error::StoreError;
 
+// SQLite promotes an overflowing integer sum to REAL instead of failing.
+// Keep increments checked inside the write statement so a failed guarded
+// increment also rolls back its state transition in the enclosing batch.
+macro_rules! checked_increment_sql {
+    ($prefix:literal, $suffix:literal) => {
+        concat!(
+            $prefix,
+            "CASE WHEN excluded.v>0 AND CAST(gproxy_kv.v AS INTEGER)>9223372036854775807-excluded.v THEN abs(-9223372036854775808)",
+            " WHEN excluded.v<0 AND CAST(gproxy_kv.v AS INTEGER)<(-9223372036854775808)-excluded.v THEN abs(-9223372036854775808)",
+            " ELSE CAST(gproxy_kv.v AS INTEGER)+excluded.v END",
+            $suffix
+        )
+    };
+}
+
 // Materialize the checked sum before applying quota predicates: SQLite would
 // otherwise promote an overflowing i64 addition to REAL or skip its evaluation
 // on an exhausted quota. Both reserve APIs share checked pending arithmetic and
@@ -130,8 +145,11 @@ impl CacheBackend for LibsqlCache {
         Box::pin(async move {
             let now = now_ms();
             let result = self.execute(
-                "INSERT INTO gproxy_kv(k,v,expires_ms) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET v=CASE WHEN gproxy_kv.expires_ms IS NOT NULL AND gproxy_kv.expires_ms<=? THEN excluded.v ELSE CAST(gproxy_kv.v AS INTEGER)+? END, expires_ms=CASE WHEN gproxy_kv.expires_ms IS NOT NULL AND gproxy_kv.expires_ms<=? THEN excluded.expires_ms ELSE gproxy_kv.expires_ms END RETURNING CAST(v AS INTEGER) AS value",
-                vec![text(key), integer(by), expiry(ttl), integer(now), integer(by), integer(now)], "increment").await?;
+                checked_increment_sql!(
+                    "INSERT INTO gproxy_kv(k,v,expires_ms) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET v=CASE WHEN gproxy_kv.expires_ms IS NOT NULL AND gproxy_kv.expires_ms<=? THEN excluded.v ELSE ",
+                    " END, expires_ms=CASE WHEN gproxy_kv.expires_ms IS NOT NULL AND gproxy_kv.expires_ms<=? THEN excluded.expires_ms ELSE gproxy_kv.expires_ms END RETURNING CAST(v AS INTEGER) AS value"
+                ),
+                vec![text(key), integer(by), expiry(ttl), integer(now), integer(now)], "increment").await?;
             result
                 .rows
                 .first()
@@ -161,7 +179,10 @@ impl CacheBackend for LibsqlCache {
                     ],
                 ),
                 Statement::with_args(
-                    "INSERT INTO gproxy_kv(k,v,expires_ms) SELECT ?,?,NULL WHERE changes()=1 ON CONFLICT(k) DO UPDATE SET v=CASE WHEN gproxy_kv.expires_ms IS NOT NULL AND gproxy_kv.expires_ms<=? THEN excluded.v ELSE CAST(gproxy_kv.v AS INTEGER)+excluded.v END,expires_ms=NULL RETURNING CAST(v AS INTEGER) AS value",
+                    checked_increment_sql!(
+                        "INSERT INTO gproxy_kv(k,v,expires_ms) SELECT ?,?,NULL WHERE changes()=1 ON CONFLICT(k) DO UPDATE SET v=CASE WHEN gproxy_kv.expires_ms IS NOT NULL AND gproxy_kv.expires_ms<=? THEN excluded.v ELSE ",
+                        " END,expires_ms=NULL RETURNING CAST(v AS INTEGER) AS value"
+                    ),
                     vec![text(counter_key), integer(by), integer(now_ms())],
                 ),
                 Statement::with_args(
@@ -215,7 +236,7 @@ impl CacheBackend for LibsqlCache {
                     vec![text(key), DbValue::Blob(expected), integer(now)],
                 ),
                 (None, None) => (
-                    "DELETE FROM gproxy_kv WHERE k=? AND expires_ms IS NOT NULL AND expires_ms<=? RETURNING 1 AS swapped",
+                    "SELECT 1 AS swapped WHERE NOT EXISTS(SELECT 1 FROM gproxy_kv WHERE k=? AND (expires_ms IS NULL OR expires_ms>?))",
                     vec![text(key), integer(now)],
                 ),
             };

@@ -10,6 +10,121 @@ use std::sync::{
 };
 
 #[tokio::test]
+async fn cancelling_a_probe_releases_its_credential_and_global_leases() {
+    use gproxy_core::CacheBackend;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let fixture = setup::fixture().await;
+    let app = &fixture.app;
+    app.shutdown();
+    app.drain_background().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted, request_seen) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 4096];
+            let size = first.read(&mut buffer).await.unwrap();
+            assert!(size > 0);
+            bytes.extend_from_slice(&buffer[..size]);
+            if bytes.windows(4).any(|value| value == b"\r\n\r\n") {
+                break;
+            }
+        }
+        accepted.send(()).unwrap();
+        released.await.unwrap();
+        drop(first);
+        let (mut second, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(second.read(&mut request).await.unwrap() > 0);
+        let body = r#"{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"110","granted_balance":"10","topped_up_balance":"100"}]}"#;
+        second.write_all(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+        ).as_bytes()).await.unwrap();
+    });
+    let MutationResult::Id(provider) = app
+        .mutate(ControlMutation::Provider(
+            gproxy_store::records::ProviderInput {
+                name: "cancelled probe".into(),
+                label: None,
+                channel: "deepseek".into(),
+                settings: json!({"base_url":format!("http://{address}/v1")}),
+                credential_strategy: "round_robin".into(),
+                proxy_url: None,
+                tls_fingerprint: None,
+                enabled: true,
+            },
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("provider");
+    };
+    let MutationResult::Id(id) = app
+        .mutate(ControlMutation::Credential {
+            provider_id: provider,
+            label: None,
+            secret: json!({"api_key":setup::random_key()}),
+            enabled: true,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("credential");
+    };
+    let probing = app.clone();
+    let probe = tokio::spawn(async move { probing.quota_probe_lightweight(id, true).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), request_seen)
+        .await
+        .unwrap()
+        .unwrap();
+    let cache = &app.inner.host.services.cache;
+    assert!(
+        cache
+            .get(&format!("quota:probe:{id}:lease"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(cache.get("quota:probe-slot:0").await.unwrap().is_some());
+    probe.abort();
+    assert!(probe.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(std::time::Duration::from_secs(5), app.drain_background())
+        .await
+        .unwrap();
+    assert!(
+        cache
+            .get(&format!("quota:probe:{id}:lease"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for slot in 0..4 {
+        assert!(
+            cache
+                .get(&format!("quota:probe-slot:{slot}"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    release.send(()).unwrap();
+    let next = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        app.quota_probe_lightweight(id, true),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(next.snapshot.entries.len(), 1);
+    assert!(next.snapshot.sources[0].error.is_none());
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn quota_snapshot_reads_without_egress_and_refresh_preserves_last_success() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

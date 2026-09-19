@@ -38,6 +38,11 @@ pub(super) fn prepare(
         })?;
         let secret =
             state.open_imported_credential(&secret.clone().into(), source, source_master_key)?;
+        if !secret.is_object() {
+            return Err(AdminError::BadRequest(
+                "credential secret must be an object".into(),
+            ));
+        }
         let input = CredentialInput {
             provider_id: config.provider_id,
             label: config

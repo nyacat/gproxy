@@ -10,18 +10,16 @@ use super::{error, ttl_millis};
 
 type Error = gproxy_core::error::StoreError;
 
-const INCR_SCRIPT: &str = "local e=redis.call('EXISTS',KEYS[1]); local v=redis.call('INCRBY',KEYS[1],ARGV[1]); if e==0 and tonumber(ARGV[2])>0 then redis.call('PEXPIRE',KEYS[1],ARGV[2]); end; return v";
-const COMPARE_INCR_SCRIPT: &str = "if redis.call('GET',KEYS[2])~=ARGV[2] then return false end; local v=redis.call('INCRBY',KEYS[1],ARGV[1]); if v==0 then redis.call('PEXPIRE',KEYS[1],3600000) else redis.call('PERSIST',KEYS[1]) end; redis.call('SET',KEYS[2],ARGV[3]); return v";
 const CAS_SCRIPT: &str = "local c=redis.call('GET',KEYS[1]); if (ARGV[1]=='0' and c) or (ARGV[1]=='1' and c~=ARGV[2]) then return 0 end; if ARGV[3]=='1' then if tonumber(ARGV[5])>0 then redis.call('SET',KEYS[1],ARGV[4],'PX',ARGV[5]) else redis.call('SET',KEYS[1],ARGV[4]) end else redis.call('DEL',KEYS[1]) end; return 1";
 
 fn incr_script() -> &'static Script {
     static SCRIPT: OnceLock<Script> = OnceLock::new();
-    SCRIPT.get_or_init(|| Script::new(INCR_SCRIPT))
+    SCRIPT.get_or_init(|| Script::new(super::spend::INCR_SCRIPT))
 }
 
 fn compare_incr_script() -> &'static Script {
     static SCRIPT: OnceLock<Script> = OnceLock::new();
-    SCRIPT.get_or_init(|| Script::new(COMPARE_INCR_SCRIPT))
+    SCRIPT.get_or_init(|| Script::new(super::spend::COMPARE_INCR_SCRIPT))
 }
 
 fn cas_script() -> &'static Script {
@@ -107,13 +105,14 @@ impl CacheBackend for RedisCache {
         ttl: Option<Duration>,
     ) -> BoxFuture<'a, Result<i64, Error>> {
         Box::pin(async move {
-            incr_script()
+            let value: String = incr_script()
                 .key(key)
                 .arg(by)
                 .arg(ttl_millis(ttl))
                 .invoke_async(&mut self.connection.clone())
                 .await
-                .map_err(|_| error("Redis", "increment"))
+                .map_err(|_| error("Redis", "increment"))?;
+            value.parse().map_err(|_| error("Redis", "increment"))
         })
     }
 
@@ -126,7 +125,7 @@ impl CacheBackend for RedisCache {
         state: Vec<u8>,
     ) -> BoxFuture<'a, Result<Option<i64>, Error>> {
         Box::pin(async move {
-            compare_incr_script()
+            let value: Option<String> = compare_incr_script()
                 .key(counter_key)
                 .key(state_key)
                 .arg(by)
@@ -134,7 +133,14 @@ impl CacheBackend for RedisCache {
                 .arg(state)
                 .invoke_async(&mut self.connection.clone())
                 .await
-                .map_err(|_| error("Redis", "compare increment"))
+                .map_err(|_| error("Redis", "compare increment"))?;
+            value
+                .map(|value| {
+                    value
+                        .parse()
+                        .map_err(|_| error("Redis", "compare increment"))
+                })
+                .transpose()
         })
     }
 

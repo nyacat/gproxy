@@ -195,7 +195,13 @@ fn accumulate_trend(
     ] {
         checked_add(target, unsigned(row.i64(column)?, column)?, column)?;
     }
-    value.cost += decimal(row.text("cost")?, "cost")?;
+    value.cost = value
+        .cost
+        .checked_add(decimal(row.text("cost")?, "cost")?)
+        .ok_or_else(|| StoreError::InvalidData {
+            field: "cost",
+            message: "usage trend cost exceeds Decimal range".into(),
+        })?;
     Ok(())
 }
 
@@ -276,7 +282,13 @@ fn accumulate(
     ] {
         checked_add(target, metric_tokens(&metrics, name)?, name)?;
     }
-    value.cost += decimal(row.text("cost")?, "cost")?;
+    value.cost = value
+        .cost
+        .checked_add(decimal(row.text("cost")?, "cost")?)
+        .ok_or_else(|| StoreError::InvalidData {
+            field: "cost",
+            message: "usage aggregate cost exceeds Decimal range".into(),
+        })?;
     Ok(())
 }
 
@@ -329,15 +341,7 @@ fn checked_add(target: &mut u64, value: u64, field: &'static str) -> Result<(), 
 }
 
 pub(super) fn parse_usage(row: Row) -> Result<UsageRecord, StoreError> {
-    let (metrics, mut legacy_dimensions) = read_metrics(&row)?;
-    let mut dimensions = json(row.text("dimensions_json")?, "dimensions_json")?;
-    if !legacy_dimensions.is_empty() {
-        let current = dimensions
-            .as_object_mut()
-            .ok_or_else(|| invalid("dimensions_json", "usage dimensions must be an object"))?;
-        legacy_dimensions.append(current);
-        *current = legacy_dimensions;
-    }
+    let (metrics, dimensions) = read_usage_payload(&row)?;
     Ok(UsageRecord {
         id: row.i64("id")?,
         usage: UsageInput {
@@ -363,6 +367,22 @@ pub(super) fn parse_usage(row: Row) -> Result<UsageRecord, StoreError> {
             latency_ms: unsigned(row.i64("latency_ms")?, "latency_ms")?,
         },
     })
+}
+
+/// Normalize the stored payload for both complete usage rows and narrow quota
+/// estimate projections. Current dimensions take precedence over the legacy
+/// metrics envelope on every read path.
+pub(super) fn read_usage_payload(row: &Row) -> Result<(Value, Value), StoreError> {
+    let (metrics, mut legacy_dimensions) = read_metrics(row)?;
+    let mut dimensions = json(row.text("dimensions_json")?, "dimensions_json")?;
+    if !legacy_dimensions.is_empty() {
+        let current = dimensions
+            .as_object_mut()
+            .ok_or_else(|| invalid("dimensions_json", "usage dimensions must be an object"))?;
+        legacy_dimensions.append(current);
+        *current = legacy_dimensions;
+    }
+    Ok((metrics, dimensions))
 }
 
 pub(super) fn unsigned(value: i64, field: &'static str) -> Result<u64, StoreError> {

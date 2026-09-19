@@ -58,6 +58,7 @@ pub(crate) enum Route {
     QuotaWindows,
     CredentialCycles,
     CredentialCyclesQuery,
+    CredentialCyclesPage,
     Channels,
     TlsPresets,
     RulePresets,
@@ -110,6 +111,9 @@ pub(crate) fn parse(method: &Method, path: &str) -> Option<Route> {
     if method == Method::POST {
         if segments.as_slice() == ["credential-cycles", "query"] {
             return Some(Route::CredentialCyclesQuery);
+        }
+        if segments.as_slice() == ["credential-cycles", "page"] {
+            return Some(Route::CredentialCyclesPage);
         }
         let login = match segments.as_slice() {
             ["login", "authcode", "start"] => Some(Route::LoginAuthCodeStart),
@@ -343,6 +347,7 @@ pub(crate) fn audit(route: &Route, body: &[u8]) -> Option<AuditDescriptor> {
         | Route::CredentialQuotaRead(_)
         | Route::CredentialCycles
         | Route::CredentialCyclesQuery
+        | Route::CredentialCyclesPage
         | Route::Channels
         | Route::TlsPresets
         | Route::RulePresets

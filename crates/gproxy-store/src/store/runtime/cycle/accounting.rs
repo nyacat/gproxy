@@ -15,7 +15,13 @@ pub(super) fn increment(metrics: &mut Value, usage: &UsageInput) -> Result<(), S
     let delta: BTreeMap<String, Decimal> =
         serde_json::from_value(delta).map_err(|error| StoreError::Database(error.to_string()))?;
     for (name, amount) in delta {
-        *values.entry(name).or_default() += amount;
+        let current = values.entry(name).or_default();
+        *current = current
+            .checked_add(amount)
+            .ok_or_else(|| StoreError::InvalidData {
+                field: "metrics",
+                message: "cycle metrics exceed Decimal range".into(),
+            })?;
     }
     *metrics = serde_json::to_value(values).expect("decimal metrics serialize");
     Ok(())
