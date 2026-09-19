@@ -13,6 +13,26 @@ use crate::funnel::Settled;
 /// hosts: the surface hooks and the engine share one stream type.
 pub use gproxy_channel_api::{ByteStream, TransportError};
 
+/// Interrupts upstream reading while allowing the stream to finish inline
+/// settlement. After cancelling, keep polling the response stream to EOF.
+#[derive(Clone, Debug)]
+pub struct StreamCancellation(futures_util::future::AbortHandle);
+
+impl StreamCancellation {
+    pub fn cancel(&self) {
+        self.0.abort();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_aborted()
+    }
+
+    pub(crate) fn pair() -> (Self, futures_util::future::AbortRegistration) {
+        let (handle, registration) = futures_util::future::AbortHandle::new_pair();
+        (Self(handle), registration)
+    }
+}
+
 /// One inbound request, normalized. Bodies are buffered `Bytes`: transforms
 /// and failover retries need the request replayable, and the refcounted
 /// buffer keeps clones free.
@@ -81,6 +101,9 @@ pub struct ExecOutcome {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: ResponseBody,
+    /// Present when a streamed response owns inline settlement. Cancelling
+    /// releases the upstream; consuming the remaining stream finishes settlement.
+    pub stream_cancellation: Option<StreamCancellation>,
     pub disposition: Disposition,
     pub(crate) _settled: Settled,
 }

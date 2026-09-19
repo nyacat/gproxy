@@ -13,7 +13,8 @@ mod attempts;
 pub(super) struct Completion {
     pub status: Option<http::StatusCode>,
     pub response_body: Option<Bytes>,
-    pub estimated_output_chars: Option<u64>,
+    pub estimated_output_chars: Option<crate::usage::OutputEstimate>,
+    pub terminal_disposition: Option<gproxy_channel_api::Disposition>,
     pub record_usage: bool,
     pub usage: Option<NormalizedUsage>,
     pub actual_service_tier: Option<String>,
@@ -27,6 +28,7 @@ pub(crate) async fn complete<H: Host>(host: &H, ctx: &FunnelCtx, completion: Com
         status,
         response_body,
         estimated_output_chars,
+        terminal_disposition,
         record_usage,
         usage,
         actual_service_tier,
@@ -79,6 +81,15 @@ pub(crate) async fn complete<H: Host>(host: &H, ctx: &FunnelCtx, completion: Com
     } else {
         NormalizedUsage::default()
     };
+    if source == UsageSource::Estimated
+        && (ended == Ended::Interrupted
+            || terminal_disposition
+                .is_some_and(|value| value != gproxy_channel_api::Disposition::Success))
+    {
+        usage
+            .dimensions
+            .insert("usage_incomplete".into(), "true".into());
+    }
     if let Some(tier) = actual_service_tier.as_ref() {
         usage.dimensions.insert("service_tier".into(), tier.clone());
     }
@@ -122,10 +133,19 @@ pub(crate) async fn complete<H: Host>(host: &H, ctx: &FunnelCtx, completion: Com
         latency_ms,
         attempts,
     };
-    if unique {
-        host.usage().record(&settlement).await;
-    }
-    if ctx.admitted {
+    let recorded = if unique {
+        match host.usage().record_checked(&settlement).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(request_id = %ctx.request_id, error = %error,
+                    "usage settlement failed; admission retained for recovery");
+                false
+            }
+        }
+    } else {
+        true
+    };
+    if ctx.admitted && recorded {
         host.finish_admission(&ctx.request_id, Some(&settlement))
             .await;
     }
@@ -155,6 +175,7 @@ pub(crate) async fn complete<H: Host>(host: &H, ctx: &FunnelCtx, completion: Com
         target_framing = ?ctx.target_framing,
         surface = ctx.surface_label.unwrap_or(""),
         ended = ?ended,
+        disposition = ?terminal_disposition,
         latency_ms,
         "request.completed"
     );
@@ -163,17 +184,25 @@ pub(crate) async fn complete<H: Host>(host: &H, ctx: &FunnelCtx, completion: Com
 fn estimate(
     request_body: &[u8],
     response_body: Option<&[u8]>,
-    output_chars: Option<u64>,
+    output_chars: Option<crate::usage::OutputEstimate>,
     operation: Option<gproxy_protocol::Operation>,
 ) -> NormalizedUsage {
-    let output_chars = output_chars
-        .or_else(|| response_body.map(utf8_chars))
-        .unwrap_or_default();
+    let (output_chars, basis) = match output_chars {
+        Some(crate::usage::OutputEstimate::Content(chars)) => (chars, "content_chars"),
+        Some(crate::usage::OutputEstimate::Wire(chars)) => (chars, "wire_chars_legacy"),
+        None => (
+            response_body.map(utf8_chars).unwrap_or_default(),
+            "wire_chars_legacy",
+        ),
+    };
     let mut usage = NormalizedUsage {
         input_tokens: estimate_input_tokens(request_body),
         output_tokens: output_chars.div_ceil(2),
         ..Default::default()
     };
+    usage
+        .dimensions
+        .insert("output_estimate_basis".into(), basis.into());
     if operation == Some(gproxy_protocol::Operation::WebSearch) {
         usage.metrics.insert("web_searches".into(), Decimal::ONE);
     }

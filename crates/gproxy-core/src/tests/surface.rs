@@ -10,7 +10,19 @@ use http::Method;
 struct MemorySynth;
 
 static SYNTH: MemorySynth = MemorySynth;
-static ENTRIES: [SurfaceEntry; 13] = [
+static ENTRIES: [SurfaceEntry; 14] = [
+    SurfaceEntry {
+        method: &Method::GET,
+        pattern: PathPattern(&[Seg::Lit("surface"), Seg::Lit("invoke-pinned")]),
+        affinity: SurfaceAffinity::Header {
+            name: "x-session",
+            ttl_secs: 60,
+        },
+        action: SurfaceAction::Synthesize {
+            handler: &SYNTH,
+            upstream: true,
+        },
+    },
     SurfaceEntry {
         method: &Method::GET,
         pattern: PathPattern(&[
@@ -204,7 +216,7 @@ impl Synthesizer for MemorySynth {
                     .invoke(SurfaceRequest {
                         label: "test-control",
                         key: None,
-                        stream: false,
+                        stream: ctx.path == "/surface/invoke-pinned",
                         method: Method::GET,
                         upstream_path: "/control".into(),
                         query: None,

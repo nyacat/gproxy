@@ -80,4 +80,419 @@ async fn exercise_atomicity(cache: SharedCache) {
     );
     cache.delete(&counter).await.expect("remove counter");
     cache.delete(&lease).await.expect("remove lease");
+
+    let used = format!("{prefix}:used");
+    let pending = format!("{prefix}:pending");
+    cache.delete(&used).await.expect("clear used");
+    cache.delete(&pending).await.expect("clear pending");
+    assert_eq!(
+        cache
+            .reserve_spend(&used, &pending, 1, 2, None)
+            .await
+            .expect("missing used"),
+        gproxy_core::SpendReserve::MissingUsed
+    );
+    assert!(cache.seed_counter(&used, 0, None).await.expect("seed used"));
+    assert!(
+        !cache
+            .seed_counter(&used, 99, None)
+            .await
+            .expect("seed is once")
+    );
+    let mut calls = Vec::new();
+    for _ in 0..8 {
+        let cache = cache.clone();
+        let used = used.clone();
+        let pending = pending.clone();
+        calls.push(tokio::spawn(async move {
+            cache
+                .reserve_spend(&used, &pending, 1, 3, None)
+                .await
+                .expect("reserve")
+        }));
+    }
+    let mut allowed = 0;
+    let mut denied = 0;
+    for call in calls {
+        match call.await.expect("reserve task") {
+            gproxy_core::SpendReserve::Allowed => allowed += 1,
+            gproxy_core::SpendReserve::Denied => denied += 1,
+            gproxy_core::SpendReserve::MissingUsed => panic!("used was seeded"),
+        }
+    }
+    assert_eq!(allowed, 3);
+    assert_eq!(denied, 5);
+    let state = format!("{prefix}:state");
+    cache.set(&state, b"reserved".to_vec(), None).await.unwrap();
+    let (left, right) = tokio::join!(
+        cache.raise_counter(&used, 7, None),
+        cache.raise_counter(&used, 7, None),
+    );
+    left.unwrap();
+    right.unwrap();
+    cache.raise_counter(&used, 5, None).await.unwrap();
+    assert_eq!(cache.incr(&used, 0, None).await.unwrap(), 7);
+    let (left, right) = tokio::join!(
+        cache.compare_incr_and_set(
+            &pending,
+            -1,
+            &state,
+            b"reserved".to_vec(),
+            b"released".to_vec()
+        ),
+        cache.compare_incr_and_set(
+            &pending,
+            -1,
+            &state,
+            b"reserved".to_vec(),
+            b"released".to_vec()
+        ),
+    );
+    assert_ne!(left.unwrap().is_some(), right.unwrap().is_some());
+    assert_eq!(cache.incr(&pending, 0, None).await.unwrap(), 2);
+    cache.delete(&state).await.unwrap();
+    assert_eq!(
+        cache
+            .compare_incr_and_set(
+                &pending,
+                -1,
+                &state,
+                b"reserved".to_vec(),
+                b"released".to_vec()
+            )
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(cache.incr(&pending, 0, None).await.unwrap(), 2);
+    cache.delete(&used).await.unwrap();
+    cache.raise_counter(&used, 9, None).await.unwrap();
+    assert_eq!(cache.incr(&used, 0, None).await.unwrap(), 9);
+    cache.delete(&used).await.unwrap();
+    cache.delete(&pending).await.unwrap();
+    exercise_reservation_state(cache.clone(), &prefix).await;
+    exercise_reservation_bounds(cache, &prefix).await;
+}
+
+async fn exercise_reservation_state(cache: SharedCache, prefix: &str) {
+    use gproxy_core::SpendReserve;
+
+    let used = format!("{prefix}:atomic-used");
+    let pending = format!("{prefix}:atomic-pending");
+    let state = format!("{prefix}:atomic-state");
+    for key in [&used, &pending, &state] {
+        cache.delete(key).await.unwrap();
+    }
+    assert_eq!(
+        cache
+            .reserve_spend_and_set(
+                &used,
+                &pending,
+                7,
+                10,
+                &state,
+                b"ready".to_vec(),
+                b"reserved".to_vec()
+            )
+            .await
+            .unwrap(),
+        None,
+    );
+    cache.set(&state, b"ready".to_vec(), None).await.unwrap();
+    assert_eq!(
+        cache
+            .reserve_spend_and_set(
+                &used,
+                &pending,
+                7,
+                10,
+                &state,
+                b"ready".to_vec(),
+                b"reserved".to_vec()
+            )
+            .await
+            .unwrap(),
+        Some(SpendReserve::MissingUsed),
+    );
+    assert_eq!(cache.get(&state).await.unwrap(), Some(b"ready".to_vec()));
+    assert!(cache.get(&pending).await.unwrap().is_none());
+    cache.seed_counter(&used, 3, None).await.unwrap();
+    assert_eq!(
+        cache
+            .reserve_spend_and_set(
+                &used,
+                &pending,
+                8,
+                10,
+                &state,
+                b"ready".to_vec(),
+                b"reserved".to_vec()
+            )
+            .await
+            .unwrap(),
+        Some(SpendReserve::Denied),
+    );
+    assert_eq!(cache.get(&state).await.unwrap(), Some(b"ready".to_vec()));
+    assert!(cache.get(&pending).await.unwrap().is_none());
+
+    // Lost replies and simultaneous retries must all observe the same one
+    // committed reservation, even when it consumes the entire available quota.
+    let mut calls = Vec::new();
+    for _ in 0..16 {
+        let cache = cache.clone();
+        let (used, pending, state) = (used.clone(), pending.clone(), state.clone());
+        calls.push(tokio::spawn(async move {
+            cache
+                .reserve_spend_and_set(
+                    &used,
+                    &pending,
+                    7,
+                    10,
+                    &state,
+                    b"ready".to_vec(),
+                    b"reserved".to_vec(),
+                )
+                .await
+                .unwrap()
+        }));
+    }
+    for call in calls {
+        assert_eq!(call.await.unwrap(), Some(SpendReserve::Allowed));
+    }
+    assert_eq!(cache.incr(&pending, 0, None).await.unwrap(), 7);
+    assert_eq!(cache.get(&state).await.unwrap(), Some(b"reserved".to_vec()));
+    cache.delete(&used).await.unwrap();
+    assert_eq!(
+        cache
+            .reserve_spend_and_set(
+                &used,
+                &pending,
+                7,
+                10,
+                &state,
+                b"ready".to_vec(),
+                b"reserved".to_vec()
+            )
+            .await
+            .unwrap(),
+        Some(SpendReserve::Allowed),
+    );
+    assert_eq!(cache.incr(&pending, 0, None).await.unwrap(), 7);
+    cache.set(&state, b"released".to_vec(), None).await.unwrap();
+    assert_eq!(
+        cache
+            .reserve_spend_and_set(
+                &used,
+                &pending,
+                7,
+                10,
+                &state,
+                b"ready".to_vec(),
+                b"reserved".to_vec()
+            )
+            .await
+            .unwrap(),
+        None,
+    );
+    assert_eq!(cache.incr(&pending, 0, None).await.unwrap(), 7);
+    assert_eq!(cache.get(&state).await.unwrap(), Some(b"released".to_vec()));
+
+    // Redis Lua must not round a one-unit reservation at the f64 boundary.
+    cache.delete(&pending).await.unwrap();
+    cache
+        .seed_counter(&used, 9_007_199_254_740_992, None)
+        .await
+        .unwrap();
+    cache.set(&state, b"ready".to_vec(), None).await.unwrap();
+    assert_eq!(
+        cache
+            .reserve_spend_and_set(
+                &used,
+                &pending,
+                1,
+                9_007_199_254_740_993,
+                &state,
+                b"ready".to_vec(),
+                b"reserved".to_vec()
+            )
+            .await
+            .unwrap(),
+        Some(SpendReserve::Allowed),
+    );
+    assert_eq!(
+        cache
+            .reserve_spend_and_set(
+                &used,
+                &pending,
+                0,
+                9_007_199_254_740_993,
+                &state,
+                b"reserved".to_vec(),
+                b"advanced".to_vec()
+            )
+            .await
+            .unwrap(),
+        Some(SpendReserve::Denied),
+    );
+    assert_eq!(cache.incr(&pending, 0, None).await.unwrap(), 1);
+    cache.delete(&pending).await.unwrap();
+    assert_eq!(
+        cache
+            .reserve_spend(&used, &pending, 1, 9_007_199_254_740_993, None)
+            .await
+            .unwrap(),
+        SpendReserve::Allowed,
+    );
+    assert_eq!(
+        cache
+            .reserve_spend(&used, &pending, 1, 9_007_199_254_740_993, None)
+            .await
+            .unwrap(),
+        SpendReserve::Denied,
+    );
+    assert_eq!(cache.incr(&pending, 0, None).await.unwrap(), 1);
+
+    // A denied large pending increment must restore its exact prior value:
+    // after refusing two units there must still be room for exactly one.
+    cache.delete(&used).await.unwrap();
+    cache.delete(&pending).await.unwrap();
+    cache.seed_counter(&used, 0, None).await.unwrap();
+    cache
+        .seed_counter(&pending, 9_007_199_254_740_992, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        cache
+            .reserve_spend(&used, &pending, 2, 9_007_199_254_740_993, None)
+            .await
+            .unwrap(),
+        SpendReserve::Denied,
+    );
+    assert_eq!(
+        cache
+            .reserve_spend(&used, &pending, 1, 9_007_199_254_740_993, None)
+            .await
+            .unwrap(),
+        SpendReserve::Allowed,
+    );
+    assert_eq!(
+        cache
+            .reserve_spend(&used, &pending, 0, 9_007_199_254_740_993, None)
+            .await
+            .unwrap(),
+        SpendReserve::Denied,
+    );
+    for key in [&used, &pending, &state] {
+        cache.delete(key).await.unwrap();
+    }
+}
+
+async fn exercise_reservation_bounds(cache: SharedCache, prefix: &str) {
+    use gproxy_core::SpendReserve;
+
+    let used = format!("{prefix}:bounded-used");
+    let pending = format!("{prefix}:bounded-pending");
+    let state = format!("{prefix}:bounded-state");
+    let cases = [
+        // Pending arithmetic is checked even when the quota is exhausted.
+        (0, i64::MAX, 1, i64::MAX, None),
+        (-i64::MAX, i64::MAX, 1, i64::MAX, None),
+        (0, i64::MIN, -1, i64::MAX, None),
+        // used+pending saturates, matching the shared spend_fits contract.
+        (i64::MAX - 10, 0, 11, i64::MAX, Some(true)),
+        (i64::MAX - 1, 1, 0, i64::MAX, Some(false)),
+        (i64::MIN, i64::MAX, 0, 0, Some(true)),
+        (0, i64::MIN + 1, -1, 1, Some(true)),
+        (0, -5, 3, 1, Some(true)),
+        (i64::MAX - 10, 5, 4, i64::MAX - 1, Some(true)),
+        (i64::MAX - 10, 5, 5, i64::MAX - 1, Some(false)),
+        // A denied negative reservation must not attempt to negate i64::MIN.
+        (1, 0, i64::MIN, 1, Some(false)),
+    ];
+    for guarded in [false, true] {
+        for (used_value, pending_value, estimate, limit, allowed) in cases {
+            for key in [&used, &pending, &state] {
+                cache.delete(key).await.unwrap();
+            }
+            cache.seed_counter(&used, used_value, None).await.unwrap();
+            cache
+                .seed_counter(&pending, pending_value, None)
+                .await
+                .unwrap();
+            cache.set(&state, b"ready".to_vec(), None).await.unwrap();
+            let result = if guarded {
+                cache
+                    .reserve_spend_and_set(
+                        &used,
+                        &pending,
+                        estimate,
+                        limit,
+                        &state,
+                        b"ready".to_vec(),
+                        b"reserved".to_vec(),
+                    )
+                    .await
+            } else {
+                cache
+                    .reserve_spend(&used, &pending, estimate, limit, None)
+                    .await
+                    .map(Some)
+            };
+            match allowed {
+                None => assert!(result.is_err(), "pending overflow must fail: {result:?}"),
+                Some(true) => assert_eq!(result.unwrap(), Some(SpendReserve::Allowed)),
+                Some(false) => assert_eq!(result.unwrap(), Some(SpendReserve::Denied)),
+            }
+            let expected_state = if guarded && allowed == Some(true) {
+                b"reserved".to_vec()
+            } else {
+                b"ready".to_vec()
+            };
+            assert_eq!(cache.get(&state).await.unwrap(), Some(expected_state));
+            if guarded && allowed.is_none() {
+                // Completed or conflicting state wins before evaluating any
+                // counters, including an otherwise overflowing increment.
+                for (value, outcome) in [
+                    (b"reserved".to_vec(), Some(SpendReserve::Allowed)),
+                    (b"advanced".to_vec(), None),
+                ] {
+                    cache.set(&state, value, None).await.unwrap();
+                    assert_eq!(
+                        cache
+                            .reserve_spend_and_set(
+                                &used,
+                                &pending,
+                                estimate,
+                                limit,
+                                &state,
+                                b"ready".to_vec(),
+                                b"reserved".to_vec(),
+                            )
+                            .await
+                            .unwrap(),
+                        outcome,
+                    );
+                }
+            }
+            let expected_pending = if allowed == Some(true) {
+                pending_value.checked_add(estimate).unwrap()
+            } else {
+                pending_value
+            };
+            // Subtract before observing the result because existing Redis
+            // incr replies cannot represent every large integer in Lua.
+            if expected_pending == i64::MIN {
+                assert_eq!(cache.incr(&pending, i64::MAX, None).await.unwrap(), -1);
+                assert_eq!(cache.incr(&pending, 1, None).await.unwrap(), 0);
+            } else {
+                assert_eq!(
+                    cache.incr(&pending, -expected_pending, None).await.unwrap(),
+                    0
+                );
+            }
+        }
+    }
+    for key in [&used, &pending, &state] {
+        cache.delete(key).await.unwrap();
+    }
 }

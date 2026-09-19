@@ -1,25 +1,26 @@
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 
-use futures_util::StreamExt;
-use futures_util::lock::Mutex;
-use gproxy_core::ByteStream;
+use gproxy_core::{ByteStream, StreamCancellation};
 use js_sys::{Object, Promise, Reflect, Uint8Array};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 use web_sys::{ReadableStream, ReadableStreamDefaultController};
 
-type StreamState = Rc<Mutex<Option<ByteStream>>>;
+use crate::stream_state::StreamState;
 
 pub(crate) struct StreamBody {
     readable: ReadableStream,
-    state: StreamState,
+    state: Rc<StreamState>,
 }
 
 impl StreamBody {
-    pub(crate) async fn new(stream: ByteStream) -> Result<Self, JsValue> {
-        let state = Rc::new(Mutex::new(Some(stream)));
+    pub(crate) async fn new(
+        stream: ByteStream,
+        cancellation: Option<StreamCancellation>,
+    ) -> Result<Self, JsValue> {
+        let state = Rc::new(StreamState::new(stream, cancellation));
         let source = Object::new();
 
         let pull_state = state.clone();
@@ -33,7 +34,7 @@ impl StreamBody {
         let cancel = Closure::<dyn FnMut(JsValue) -> Promise>::new(move |_| {
             let state = cancel_state.clone();
             future_to_promise(AssertUnwindSafe(async move {
-                drain_state(state).await;
+                state.cancel().await;
                 Ok(JsValue::UNDEFINED)
             }))
         })
@@ -45,7 +46,7 @@ impl StreamBody {
         match readable {
             Ok(readable) => Ok(Self { readable, state }),
             Err(error) => {
-                drain_state(state).await;
+                state.cancel().await;
                 Err(error)
             }
         }
@@ -55,52 +56,43 @@ impl StreamBody {
         self.readable.clone()
     }
 
-    pub(crate) async fn drain(&self) {
-        drain_state(self.state.clone()).await;
+    pub(crate) async fn cancel(&self) {
+        self.state.cancel().await;
     }
 }
 
 async fn pull_once(
-    state: StreamState,
+    state: Rc<StreamState>,
     controller: ReadableStreamDefaultController,
 ) -> Result<JsValue, JsValue> {
-    let mut slot = state.lock().await;
-    let Some(mut stream) = slot.take() else {
-        controller.close()?;
+    let next = state.next().await;
+    if state.is_cancelled() {
         return Ok(JsValue::UNDEFINED);
-    };
-    match stream.next().await {
+    }
+    match next {
         Some(Ok(bytes)) => {
             let Ok(length) = u32::try_from(bytes.len()) else {
                 let error = JsValue::from_str("response stream chunk exceeds Uint8Array capacity");
                 controller.error_with_e(&error);
-                drain_stream(stream).await;
+                state.cancel().await;
                 return Ok(JsValue::UNDEFINED);
             };
             let chunk = Uint8Array::new_with_length(length);
             chunk.copy_from(&bytes);
             if let Err(error) = controller.enqueue_with_chunk(&chunk.into()) {
-                drain_stream(stream).await;
+                state.cancel().await;
                 return Err(error);
             }
-            *slot = Some(stream);
         }
         Some(Err(error)) => {
             controller.error_with_e(&JsValue::from_str(&error.to_string()));
-            drain_stream(stream).await;
+            state.cancel().await;
         }
         None => controller.close()?,
     }
     Ok(JsValue::UNDEFINED)
 }
 
-async fn drain_state(state: StreamState) {
-    let mut slot = state.lock().await;
-    if let Some(stream) = slot.take() {
-        drain_stream(stream).await;
-    }
-}
-
-pub(crate) async fn drain_stream(mut stream: ByteStream) {
-    while stream.next().await.is_some() {}
+pub(crate) async fn cancel_stream(stream: ByteStream, cancellation: Option<StreamCancellation>) {
+    StreamState::new(stream, cancellation).cancel().await;
 }

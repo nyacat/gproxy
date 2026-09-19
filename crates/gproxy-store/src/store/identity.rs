@@ -89,4 +89,13 @@ impl Store {
     pub async fn delete_quota(&self, id: i64) -> Result<bool, StoreError> {
         self.delete_owned("quotas", id).await
     }
+
+    pub async fn quota_exists(&self, id: i64) -> Result<bool, StoreError> {
+        Ok(!self
+            .backend()
+            .execute(identity::quota_exists(id)?)
+            .await?
+            .rows
+            .is_empty())
+    }
 }

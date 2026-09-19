@@ -20,6 +20,7 @@ pub(crate) fn opened(
         status: http::StatusCode::OK,
         headers,
         body: ResponseBody::Stream(body),
+        stream_cancellation: None,
         disposition: Disposition::Success,
         _settled: super::Settled(()),
     }

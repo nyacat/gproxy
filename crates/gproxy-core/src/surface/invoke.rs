@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use web_time::Instant;
 
@@ -13,6 +14,7 @@ use crate::boundary::RequestCtx;
 use crate::control::{ControlPlane, Plan, Pricing, Target};
 use crate::error::CoreError;
 use crate::funnel::error as funnel_error;
+use crate::funnel::inline::InlineCompletion;
 use crate::funnel::{self, FunnelCtx};
 use crate::host::{CredentialId, Host, UpstreamTransport};
 
@@ -24,6 +26,7 @@ pub(crate) struct SurfaceCaller<'a, H: Host> {
     pricing: BTreeMap<CredentialId, Option<Pricing>>,
     request_id: String,
     sequence: AtomicU64,
+    inline_completions: Mutex<Vec<InlineCompletion>>,
 }
 
 impl<'a, H: Host> SurfaceCaller<'a, H> {
@@ -53,6 +56,7 @@ impl<'a, H: Host> SurfaceCaller<'a, H> {
             pricing,
             request_id,
             sequence: AtomicU64::new(0),
+            inline_completions: Mutex::new(Vec::new()),
         }
     }
 
@@ -73,6 +77,32 @@ impl<'a, H: Host> SurfaceCaller<'a, H> {
                 })
                 .cloned(),
         }
+    }
+
+    pub(crate) fn into_completions(self) -> Vec<InlineCompletion> {
+        self.inline_completions
+            .into_inner()
+            .expect("surface inline stream lock")
+    }
+
+    fn preserve_reply(
+        &self,
+        mut outcome: crate::ExecOutcome,
+    ) -> Result<SurfaceReply, TransportError> {
+        if let Some(cancellation) = outcome.stream_cancellation.take() {
+            outcome.body = match outcome.body {
+                crate::ResponseBody::Stream(body) => {
+                    let (body, completion) = InlineCompletion::wrap(body, cancellation);
+                    self.inline_completions
+                        .lock()
+                        .expect("surface inline stream lock")
+                        .push(completion);
+                    crate::ResponseBody::Stream(body)
+                }
+                body => body,
+            };
+        }
+        super::reply::from_outcome(outcome)
     }
 }
 
@@ -131,7 +161,7 @@ impl<H: Host> SurfaceInvoke for SurfaceCaller<'_, H> {
                 )),
             });
             match result {
-                Ok(outcome) => super::reply::from_outcome(outcome),
+                Ok(outcome) => self.preserve_reply(outcome),
                 Err(error) => {
                     self.core.host.finish_admission(&ctx.request_id, None).await;
                     funnel_error::request_failed_surface(&ctx, key, Some(label), &error);
@@ -192,6 +222,7 @@ impl<H: Host> SurfaceInvoke for SurfaceCaller<'_, H> {
                 .transpose()
                 .map_err(TransportError::Interrupted)?;
             let mut facts = FunnelCtx {
+                activity: None,
                 upstream_started_at_ms: Some(crate::quota::now_ms()),
                 request_id,
                 target: self.target.clone(),
@@ -237,7 +268,7 @@ impl<H: Host> SurfaceInvoke for SurfaceCaller<'_, H> {
             } else {
                 gproxy_channel_api::Disposition::Terminal
             };
-            super::reply::from_outcome(
+            self.preserve_reply(
                 funnel::free_streaming(
                     self.core.host.clone(),
                     facts,

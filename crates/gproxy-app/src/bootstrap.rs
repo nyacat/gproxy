@@ -87,10 +87,13 @@ impl App {
             spawner,
             #[cfg(not(target_arch = "wasm32"))]
             continuations: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            quota_observe: Default::default(),
+            token_counts: Default::default(),
+            settlement_recovery: Default::default(),
         });
         let host = AppHost { services };
         let core = gproxy_core::Core::new(host.clone(), channels)?;
-        crate::cleanup::schedule(&host);
         #[cfg(not(target_arch = "wasm32"))]
         let shutdown = tokio::sync::watch::channel(false).0;
         #[cfg(target_arch = "wasm32")]
@@ -100,14 +103,19 @@ impl App {
                 core,
                 host,
                 invalidation_version: std::sync::atomic::AtomicI64::new(invalidation_version),
+                reload_lock: futures_util::lock::Mutex::new(()),
+                #[cfg(all(test, not(target_arch = "wasm32")))]
+                reload_runtime_pause: std::sync::Mutex::default(),
                 shutdown,
                 #[cfg(not(target_arch = "wasm32"))]
                 runtime_updates,
             }),
         };
         handle.sync_invalidation().await?;
+        crate::cleanup::schedule(&handle);
         crate::invalidation::schedule(&handle);
         crate::quota_refresh::schedule(&handle);
+        crate::host::settlement_recovery::start(&handle);
         Ok(handle)
     }
 }

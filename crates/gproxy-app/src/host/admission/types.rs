@@ -21,6 +21,10 @@ pub(in crate::host) struct IdentityState {
 #[derive(Serialize, Deserialize)]
 pub(super) struct QuotaReservation {
     pub window_id: i64,
+    #[serde(default)]
+    pub quota_id: i64,
+    #[serde(default)]
+    pub slot: u32,
     pub cache_key: String,
     pub estimated_cost_micros: i64,
     pub cost_recorded: bool,

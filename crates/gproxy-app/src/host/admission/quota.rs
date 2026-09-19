@@ -6,7 +6,7 @@ use gproxy_protocol::{OperationKey, SettleMode};
 
 use super::super::AppHost;
 use super::auth::subject_matches;
-use super::types::{CounterCharge, QuotaReservation};
+use super::types::{AdmissionState, QuotaReservation, reservation_key};
 
 pub(super) async fn reserve(
     host: &AppHost,
@@ -15,85 +15,101 @@ pub(super) async fn reserve(
     operation: Option<OperationKey>,
     plan: &Plan,
     now: i64,
-    charged: &mut Vec<CounterCharge>,
-) -> Result<Vec<QuotaReservation>, CoreError> {
+    state: &mut AdmissionState,
+) -> Result<(), CoreError> {
     if !operation.is_some_and(|key| key.operation().spec().settle != SettleMode::Free) {
-        return Ok(Vec::new());
+        return Ok(());
+    }
+    if !has_spend_limit(host, identity) {
+        return Ok(());
     }
     let estimate = estimated_cost_micros(host, request, plan).await?;
-    reserve_cost(host, identity, estimate, now, charged).await
+    reserve_cost(host, identity, &request.request_id, estimate, now, state).await
 }
 
 pub(super) async fn reserve_retry(
     host: &AppHost,
     identity: &CallerIdentity,
+    request_id: &str,
     body: &bytes::Bytes,
     target: &gproxy_core::Target,
-    charged: &mut Vec<CounterCharge>,
-) -> Result<Vec<QuotaReservation>, CoreError> {
-    let estimate = estimated_target_cost_micros(host, body, target).await?;
-    reserve_cost(host, identity, estimate, super::auth::unix_now(), charged).await
+    state: &mut AdmissionState,
+) -> Result<(), CoreError> {
+    if !has_spend_limit(host, identity) {
+        return Ok(());
+    }
+    let estimate = estimated_target_cost_micros(host, request_id, body, target).await?;
+    reserve_cost(
+        host,
+        identity,
+        request_id,
+        estimate,
+        super::auth::unix_now(),
+        state,
+    )
+    .await
+}
+
+fn has_spend_limit(host: &AppHost, identity: &CallerIdentity) -> bool {
+    host.services.control.current().quotas.iter().any(|quota| {
+        quota.enabled
+            && subject_matches(&quota.subject_kind, quota.subject_id, identity)
+            && quota.limits().next().is_some()
+    })
 }
 
 async fn reserve_cost(
     host: &AppHost,
     identity: &CallerIdentity,
+    request_id: &str,
     estimate: i64,
     now: i64,
-    charged: &mut Vec<CounterCharge>,
-) -> Result<Vec<QuotaReservation>, CoreError> {
-    let mut reservations = Vec::new();
+    state: &mut AdmissionState,
+) -> Result<(), CoreError> {
+    let key = reservation_key(request_id);
     let snapshot = host.services.control.current();
     for quota in snapshot.quotas.iter().filter(|quota| {
         quota.enabled && subject_matches(&quota.subject_kind, quota.subject_id, identity)
     }) {
+        if host
+            .services
+            .cache
+            .get(&super::window::failure_key(quota.id))
+            .await?
+            .is_some()
+        {
+            return Err(CoreError::Store(gproxy_core::error::StoreError(
+                "quota settlement failed; repair accounting before retrying".into(),
+            )));
+        }
         for (kind, limit) in quota.limits() {
-            let window = host
-                .services
-                .store
-                .ensure_quota_window(quota.id, kind, now)
-                .await
-                .map_err(|error| {
-                    CoreError::Store(gproxy_core::error::StoreError(error.to_string()))
-                })?;
-            let key = format!("gproxy:quota-pending:{}", window.id);
-            let pending = host.services.cache.incr(&key, estimate, None).await?;
-            charged.push(CounterCharge {
-                key: key.clone(),
-                amount: estimate,
-            });
-            let live = host
-                .services
-                .store
-                .quota_window(window.id)
-                .await
-                .map_err(store_error)?
-                .ok_or_else(|| {
-                    CoreError::Store(gproxy_core::error::StoreError(
-                        "quota window vanished after reservation".into(),
-                    ))
-                })?;
-            let before = pending.saturating_sub(estimate).max(0);
-            let projected = pending.max(0);
-            let exhausted = live.cost_used + gproxy_core::usage::micros_to_cost(before) >= limit;
-            let exceeds = live.cost_used + gproxy_core::usage::micros_to_cost(projected) > limit;
-            if exhausted || exceeds {
-                return Err(CoreError::QuotaExceeded);
-            }
-            reservations.push(QuotaReservation {
-                window_id: window.id,
-                cache_key: key,
-                estimated_cost_micros: estimate,
-                cost_recorded: false,
-                released: false,
-            });
+            super::window::reserve(
+                host,
+                quota.id,
+                kind,
+                limit,
+                estimate,
+                now,
+                &key,
+                |window_id| {
+                    let expected = serde_json::to_vec(state).expect("admission state serializes");
+                    state.reservations.push(QuotaReservation {
+                        window_id,
+                        quota_id: quota.id,
+                        slot: state.reservations.len() as u32,
+                        cache_key: super::window::pending_key(window_id),
+                        estimated_cost_micros: estimate,
+                        cost_recorded: false,
+                        released: false,
+                    });
+                    let updated = serde_json::to_vec(state).expect("admission state serializes");
+                    (expected, updated)
+                },
+            )
+            .await?;
         }
     }
-    Ok(reservations)
-}
-
-fn store_error(error: gproxy_store::StoreError) -> CoreError {
-    CoreError::Store(gproxy_core::error::StoreError(error.to_string()))
+    Ok(())
 }
 
 async fn estimated_cost_micros(
@@ -108,17 +124,18 @@ async fn estimated_cost_micros(
         .filter(|target| seen.insert((target.provider.id, target.upstream_model.clone())))
         .filter_map(|target| candidate(host, target))
         .collect::<Vec<_>>();
-    estimate_micros(host, &request.body, candidates).await
+    estimate_micros(host, &request.request_id, &request.body, candidates).await
 }
 
 /// The cost this request would settle at on one target, in micro-units.
 pub(super) async fn estimated_target_cost_micros(
     host: &AppHost,
+    request_id: &str,
     body: &bytes::Bytes,
     target: &gproxy_core::Target,
 ) -> Result<i64, CoreError> {
     let candidates = candidate(host, target).into_iter().collect();
-    estimate_micros(host, body, candidates).await
+    estimate_micros(host, request_id, body, candidates).await
 }
 
 fn candidate(
@@ -138,11 +155,12 @@ fn candidate(
 
 async fn estimate_micros(
     host: &AppHost,
+    request_id: &str,
     body: &bytes::Bytes,
     candidates: Vec<(String, Option<serde_json::Value>, Pricing)>,
 ) -> Result<i64, CoreError> {
     let cost = host
-        .maximum_candidate_cost(body.clone(), candidates)
+        .maximum_candidate_cost(request_id, body.clone(), candidates)
         .await?;
     gproxy_core::usage::cost_to_micros(cost)
         .ok_or_else(|| CoreError::Internal("admission cost estimate exceeds counter".into()))
@@ -153,33 +171,56 @@ impl AppHost {
     /// edge host has no vocabularies and no pool to hand it to.
     async fn maximum_candidate_cost(
         &self,
+        request_id: &str,
         body: bytes::Bytes,
         candidates: Vec<(String, Option<serde_json::Value>, Pricing)>,
     ) -> Result<rust_decimal::Decimal, CoreError> {
+        let cache = self.services.token_counts.request(request_id);
+        let cached = candidates.iter().try_fold(
+            rust_decimal::Decimal::ZERO,
+            |maximum, (model, map, pricing)| {
+                let input_tokens = cache.get(model, map.as_ref(), &body)?;
+                let usage = NormalizedUsage {
+                    input_tokens,
+                    ..Default::default()
+                };
+                Some(maximum.max(pricing.clone().for_request(&body).cost(&usage)))
+            },
+        );
+        if let Some(cost) = cached {
+            return Ok(cost);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let registry = self.services.tokenizers.clone();
-            tokio::task::spawn_blocking(move || maximum_cost(&body, &candidates, &registry))
+            tokio::task::spawn_blocking(move || maximum_cost(&body, &candidates, &registry, &cache))
                 .await
                 .map_err(|error| CoreError::Internal(format!("tokenizer task failed: {error}")))
         }
         #[cfg(target_arch = "wasm32")]
         {
-            Ok(maximum_cost(&body, &candidates, ()))
+            Ok(maximum_cost(&body, &candidates, (), &cache))
         }
     }
 }
 
 fn maximum_cost(
-    body: &[u8],
+    body: &bytes::Bytes,
     candidates: &[(String, Option<serde_json::Value>, Pricing)],
     registry: gproxy_tokenize::RegistryHandle<'_>,
+    cache: &super::super::token_counts::RequestTokenCounts,
 ) -> rust_decimal::Decimal {
+    if candidates.is_empty() {
+        return rust_decimal::Decimal::ZERO;
+    }
     candidates
         .iter()
         .map(|(model, map, pricing)| {
+            let input_tokens = cache.get_or_insert(model, map.as_ref(), body, || {
+                gproxy_tokenize::count(model, body, map.as_ref(), registry)
+            });
             let usage = NormalizedUsage {
-                input_tokens: gproxy_tokenize::count(model, body, map.as_ref(), registry),
+                input_tokens,
                 ..Default::default()
             };
             pricing.clone().for_request(body).cost(&usage)

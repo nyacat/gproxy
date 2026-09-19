@@ -52,7 +52,9 @@ pub use gproxy_protocol as protocol;
 pub use gproxy_protocol::OperationKey;
 
 pub use api::{Core, InitError};
-pub use boundary::{ByteStream, Disposition, ExecOutcome, RequestCtx, ResponseBody, RoutingMode};
+pub use boundary::{
+    ByteStream, Disposition, ExecOutcome, RequestCtx, ResponseBody, RoutingMode, StreamCancellation,
+};
 pub use continuation::{Continuation, ContinuationKey, ContinuationMeta, ContinuationStore};
 pub use control::{
     ConditionalMetricRate, ConfiguredFingerprint, ControlPlane, DiscoveredModel, ExposedModel,
@@ -63,7 +65,7 @@ pub use error::CoreError;
 pub use fingerprint::apply_request as apply_provider_transport;
 pub use host::{
     CacheBackend, CaptureSink, CredentialHealth, CredentialId, CredentialRecord, CredentialStore,
-    Host, SettlementPermit, Spawner, UpstreamTransport, UsageSink,
+    Host, SettlementPermit, Spawner, SpendReserve, UpstreamTransport, UsageSink, spend_fits,
 };
 pub use quota::QuotaProbeResult;
 pub use quota_source::QuotaSourceProbeResult;

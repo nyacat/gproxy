@@ -248,6 +248,9 @@ async fn run<H: Host>(
                 error = %error,
                 "surface affinity commit failed"
             );
+            if let Ok((outcome, _)) = result {
+                crate::funnel::cancel_outcome(outcome).await;
+            }
             return Dispatch::Outcome(Err(error));
         }
     }

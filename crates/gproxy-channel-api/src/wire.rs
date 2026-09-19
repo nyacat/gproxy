@@ -17,14 +17,14 @@ pub enum TransportError {
     Interrupted(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Alpn {
     Http1,
     Http2,
     Http3,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TlsVersion {
     Tls10,
     Tls11,
@@ -32,7 +32,7 @@ pub enum TlsVersion {
     Tls13,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Http2Setting {
     HeaderTableSize,
     EnablePush,
@@ -42,7 +42,7 @@ pub enum Http2Setting {
     MaxHeaderListSize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PseudoHeader {
     Method,
     Scheme,
@@ -50,7 +50,7 @@ pub enum PseudoHeader {
     Path,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Http2Profile {
     pub enable_push: Option<bool>,
     pub initial_window_size: Option<u32>,
@@ -66,7 +66,7 @@ pub struct Http2Profile {
 /// Channel-declared native client fingerprint. Edge hosts ignore optional
 /// profiles because their runtimes own the TLS stack; requests marked with
 /// [`RequiredClientProfile`] fail instead of silently losing one.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct ClientProfile {
     pub preset: Option<ClientProfilePreset>,
     pub alpn: Option<Cow<'static, [Alpn]>>,
@@ -79,6 +79,16 @@ pub struct ClientProfile {
     pub grease: Option<bool>,
     pub extension_permutation: Option<Cow<'static, [u16]>>,
     pub http2: Option<Http2Profile>,
+}
+
+/// A channel's exportable client defaults. Headers contain only static client
+/// metadata; credentials and per-request/session values belong to preparation.
+#[derive(Debug, Clone)]
+pub struct ClientFingerprint {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub headers: http::HeaderMap,
+    pub profile: &'static ClientProfile,
 }
 
 impl ClientProfile {
@@ -113,7 +123,7 @@ impl ClientProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClientProfilePreset {
     /// Captured desktop Chrome 148 TLS, HTTP/2 and default-header behavior.
     Chrome148,
@@ -137,7 +147,9 @@ pub type ByteStream =
 
 /// Stable credential identity. i64 to match relational primary keys;
 /// embedders without a database can hand out any distinct values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct CredentialId(pub i64);
 
 /// `Send` on native, nothing on wasm — the marker that lets one trait

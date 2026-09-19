@@ -14,6 +14,8 @@ mod realtime;
 mod refusal;
 mod services;
 mod session_affinity;
+mod stream_cancellation;
+mod streaming;
 mod surface;
 mod surface_engine;
 mod surface_harness;
@@ -481,4 +483,39 @@ fn block_on<F: Future>(future: F) -> F::Output {
             Poll::Pending => std::thread::yield_now(),
         }
     }
+}
+
+#[test]
+fn quota_activity_storage_failure_stops_before_egress_without_upstream_health_changes() {
+    let host = MemoryHost::new(false);
+    host.state.lock().unwrap().fail_usage_begin = true;
+    let core = core(&host).unwrap();
+    let request = request(false, "activity-storage-failure");
+    let classified = crate::execution::request::classify(&request).unwrap();
+    let mut prepared = block_on(crate::attempt::prepare(
+        &core,
+        &host,
+        &target(),
+        &request,
+        &classified,
+        crate::attempt::AdmissionCtx {
+            admitted: true,
+            owner_user_id: None,
+        },
+        web_time::Instant::now(),
+    ))
+    .unwrap();
+    prepared.quota_accounted = true;
+    let Err(failure) = block_on(crate::attempt::send(&core, prepared)) else {
+        panic!("storage error must prevent sending")
+    };
+    assert!(matches!(
+        *failure,
+        crate::attempt::Failure::Local {
+            error: CoreError::Store(_)
+        }
+    ));
+    let state = host.state.lock().unwrap();
+    assert!(state.upstream_requests.is_empty());
+    assert!(state.health.is_empty());
 }

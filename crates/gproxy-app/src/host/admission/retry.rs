@@ -1,5 +1,5 @@
 use gproxy_channel_api::CallerIdentity;
-use gproxy_core::{CacheBackend, CoreError, Target};
+use gproxy_core::{CoreError, Target};
 use gproxy_protocol::SettleMode;
 
 use super::super::AppHost;
@@ -41,36 +41,14 @@ pub(in crate::host) async fn admit(
                 budget: gproxy_core::control::FailoverBudget { max_attempts: 1 },
             },
         )?;
-        let mut charged = Vec::new();
-        let extra =
-            match super::quota::reserve_retry(host, &identity, body, target, &mut charged).await {
-                Ok(extra) => extra,
-                Err(error) => return super::reserve::rollback_error(host, charged, error).await,
-            };
-        let expected = serde_json::to_vec(&state).expect("admission state serializes");
-        state.reservations.extend(extra);
-        let updated = serde_json::to_vec(&state).expect("admission state serializes");
-        let result = host
-            .services
-            .cache
-            .compare_and_swap(
-                &super::types::reservation_key(request_id),
-                Some(expected),
-                Some(updated),
-                None,
-            )
-            .await;
-        match result {
-            Ok(true) => {}
-            Ok(false) => {
-                return super::reserve::rollback_error(
-                    host,
-                    charged,
-                    CoreError::Internal("admission changed during fallback".into()),
-                )
-                .await;
+        let start = state.reservations.len();
+        if let Err(error) =
+            super::quota::reserve_retry(host, &identity, request_id, body, target, &mut state).await
+        {
+            if let Err(rollback) = super::finish::refund_from(host, request_id, start).await {
+                tracing::error!(request_id, error = %rollback, "fallback reservation rollback requires replay");
             }
-            Err(error) => return super::reserve::rollback_error(host, charged, error.into()).await,
+            return Err(error);
         }
     }
     super::credential::admit(host, request_id, target, body, settle).await

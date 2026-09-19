@@ -9,6 +9,12 @@ const COST_MICROS: i64 = 1_000_000;
 /// extract it) and re-exported here.
 pub use gproxy_channel_api::NormalizedUsage;
 
+#[derive(Clone, Copy)]
+pub(crate) enum OutputEstimate {
+    Content(u64),
+    Wire(u64),
+}
+
 /// Cross-target admission estimate until a model tokenizer is available.
 /// Counts UTF-8 scalar starts and charges one token per two characters.
 pub fn estimate_input_tokens(body: &[u8]) -> u64 {
@@ -33,7 +39,7 @@ pub(crate) fn utf8_chars(bytes: &[u8]) -> u64 {
 }
 
 /// Where the numbers came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UsageSource {
     /// Reported by the upstream response.
     Upstream,
@@ -42,7 +48,7 @@ pub enum UsageSource {
 }
 
 /// How the exchange ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Ended {
     Complete,
     /// Client hung up or the stream broke; usage may be partial.
@@ -51,7 +57,7 @@ pub enum Ended {
 
 /// The funnel's product: one settled exchange. Handed to the host's
 /// `UsageSink`; the same struct reconciles quota pre-charges internally.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Settlement {
     pub upstream_started_at_ms: Option<i64>,
     pub request_id: String,
@@ -66,7 +72,7 @@ pub struct Settlement {
     pub attempts: Vec<SettledAttempt>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SettledAttempt {
     pub upstream_model: String,
     pub usage: NormalizedUsage,

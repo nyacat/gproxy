@@ -107,17 +107,126 @@ pub trait CacheBackend {
         value: Option<Vec<u8>>,
         ttl: Option<Duration>,
     ) -> BoxFuture<'a, Result<bool, StoreError>>;
+    /// Create an integer counter if it is absent. Returns whether this caller
+    /// wrote the seed. Used to load quota `cost_used` from the store without
+    /// clobbering a live admission view.
+    fn seed_counter<'a>(
+        &'a self,
+        key: &'a str,
+        value: i64,
+        ttl: Option<Duration>,
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
+    /// Atomically charge `estimate` against `used_key + pending_key` and
+    /// compare with `limit`. A missing used counter is not treated as zero.
+    fn reserve_spend<'a>(
+        &'a self,
+        used_key: &'a str,
+        pending_key: &'a str,
+        estimate: i64,
+        limit: i64,
+        pending_ttl: Option<Duration>,
+    ) -> BoxFuture<'a, Result<SpendReserve, StoreError>>;
+    /// Atomically reserve spend and advance the caller's reservation state.
+    /// Repeating an already committed transition returns `Some(Allowed)` without
+    /// charging again. A different current state returns `None`.
+    /// Successful writes retain both pending and state without an expiry.
+    /// Backends without this capability fail explicitly; sequential writes are
+    /// not a safe substitute for this atomic operation.
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_spend_and_set<'a>(
+        &'a self,
+        used_key: &'a str,
+        pending_key: &'a str,
+        estimate: i64,
+        limit: i64,
+        state_key: &'a str,
+        expected_state: Vec<u8>,
+        state: Vec<u8>,
+    ) -> BoxFuture<'a, Result<Option<SpendReserve>, StoreError>> {
+        let _ = (
+            used_key,
+            pending_key,
+            estimate,
+            limit,
+            state_key,
+            expected_state,
+            state,
+        );
+        Box::pin(async {
+            Err(StoreError(
+                "cache backend does not support atomic quota reservation".into(),
+            ))
+        })
+    }
+    /// Atomically raise a counter to at least the durable cumulative spend.
+    /// Replayed or out-of-order settlements cannot double-charge or regress it.
+    fn raise_counter<'a>(
+        &'a self,
+        key: &'a str,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+}
+
+/// Outcome of the cache spend reservation operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpendReserve {
+    /// `used_key` is absent; the caller must seed it from durable storage.
+    MissingUsed,
+    Allowed,
+    Denied,
+}
+
+/// Same inequalities the admission path used when it read `cost_used` after
+/// incrementing pending: exhausted if `used + before >= limit`, exceeds if
+/// `used + projected > limit`.
+pub fn spend_fits(used: i64, pending_after: i64, estimate: i64, limit: i64) -> bool {
+    let before = pending_after.saturating_sub(estimate).max(0);
+    let projected = pending_after.max(0);
+    used.saturating_add(before) < limit && used.saturating_add(projected) <= limit
+}
+
+#[cfg(test)]
+mod spend_tests {
+    use super::spend_fits;
+
+    #[test]
+    fn matches_exhausted_and_exceeds() {
+        assert!(spend_fits(0, 5, 5, 5));
+        assert!(!spend_fits(0, 6, 6, 5));
+        assert!(!spend_fits(5, 0, 0, 5));
+        assert!(spend_fits(4, 1, 1, 5));
+        assert!(!spend_fits(4, 2, 2, 5));
+    }
 }
 
 /// Settlement output. `gproxy-app` writes usage rows; an embedder may
 /// aggregate in memory or drop. Never on the hot path's critical section.
 pub trait UsageSink {
     fn record<'a>(&'a self, settlement: &'a Settlement) -> BoxFuture<'a, ()>;
+
+    /// A fallible sink keeps admission reservations until its output is durable.
+    fn record_checked<'a>(
+        &'a self,
+        settlement: &'a Settlement,
+    ) -> BoxFuture<'a, Result<(), CoreError>> {
+        let record = self.record(settlement);
+        Box::pin(async move {
+            record.await;
+            Ok(())
+        })
+    }
 }
 
 /// Wire capture, sibling of [`UsageSink`]: the funnel offers every request
 /// and response; the sink decides retention and redaction.
 pub trait CaptureSink {
+    /// Whether response bodies need to be retained for wire capture.
+    /// The default preserves capture behavior for existing embedders.
+    fn captures_response_body(&self) -> bool {
+        true
+    }
+
     fn record<'a>(&'a self, capture: &'a Capture) -> BoxFuture<'a, ()>;
 }
 
@@ -164,6 +273,15 @@ pub trait Spawner: MaybeSync {
     #[cfg(target_arch = "wasm32")]
     fn spawn(&self, task: std::pin::Pin<Box<dyn Future<Output = ()>>>);
 
+    /// Schedule cleanup after a host-supplied delay. Hosts may end the delay
+    /// early during shutdown so cleanup can finish before the process exits.
+    fn spawn_delayed(&self, delay: BoxFuture<'static, ()>, task: BoxFuture<'static, ()>) {
+        self.spawn(Box::pin(async move {
+            delay.await;
+            task.await;
+        }));
+    }
+
     /// Reserve room in the settlement backlog before a settlement is
     /// detached. Settlement is slower than serving, so an unbounded backlog
     /// grows without limit under load; the host bounds it and this future
@@ -197,6 +315,11 @@ pub trait UpstreamTransport: MaybeSync {
         request: http::Request<bytes::Bytes>,
     ) -> BoxFuture<'a, Result<Box<dyn WsDuplex>, TransportError>>;
 }
+
+/// Host-owned attempt lifetime. The final clone is dropped after settlement or
+/// cancellation, including failures before a response reaches the funnel.
+pub trait CredentialUsageActivity: MaybeSend + MaybeSync {}
+pub type CredentialUsageLease = crate::Shared<dyn CredentialUsageActivity>;
 
 /// The aggregate a host hands to [`crate::Core`]. Associated types keep
 /// everything statically dispatched; no `dyn` on the hot path.
@@ -286,6 +409,21 @@ pub trait Host: MaybeSend + MaybeSync + 'static {
     ) -> BoxFuture<'a, Result<(), CoreError>> {
         let _ = (request_id, target, started_at_ms);
         Box::pin(async { Ok(()) })
+    }
+
+    fn track_credential_usage<'a>(
+        &'a self,
+        parent_request_id: &'a str,
+        request_id: &'a str,
+        target: &'a crate::control::Target,
+        started_at_ms: i64,
+    ) -> BoxFuture<'a, Result<Option<CredentialUsageLease>, CoreError>> {
+        let _ = parent_request_id;
+        Box::pin(async move {
+            self.begin_credential_usage(request_id, target, started_at_ms)
+                .await?;
+            Ok(None)
+        })
     }
 
     fn observe_credential_quota_entries<'a>(

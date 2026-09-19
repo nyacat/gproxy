@@ -24,7 +24,7 @@ pub(in crate::host) fn admit<'a>(
             return Ok(());
         };
         let tokens = match credential.tpm_limit {
-            Some(_) => count(host, target, body).await?,
+            Some(_) => count(host, request_id, target, body).await?,
             None => 0,
         };
         if credential.tpm_limit.is_some_and(|limit| tokens > limit) {
@@ -58,23 +58,36 @@ pub(in crate::host) fn admit<'a>(
     })
 }
 
-async fn count(host: &AppHost, target: &Target, body: &bytes::Bytes) -> Result<u64, CoreError> {
+async fn count(
+    host: &AppHost,
+    request_id: &str,
+    target: &Target,
+    body: &bytes::Bytes,
+) -> Result<u64, CoreError> {
+    let cache = host.services.token_counts.request(request_id);
+    let map = target.provider.settings.get("tokenizer_map");
+    if let Some(tokens) = cache.get(&target.upstream_model, map, body) {
+        return Ok(tokens);
+    }
     let model = target.upstream_model.clone();
-    let map = target.provider.settings.get("tokenizer_map").cloned();
+    let map = map.cloned();
     let body = body.clone();
     #[cfg(not(target_arch = "wasm32"))]
     {
         let registry = host.services.tokenizers.clone();
         tokio::task::spawn_blocking(move || {
-            gproxy_tokenize::count(&model, &body, map.as_ref(), &registry)
+            cache.get_or_insert(&model, map.as_ref(), &body, || {
+                gproxy_tokenize::count(&model, &body, map.as_ref(), &registry)
+            })
         })
         .await
         .map_err(|error| CoreError::Internal(format!("tokenizer task failed: {error}")))
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = host;
-        Ok(gproxy_tokenize::count(&model, &body, map.as_ref(), ()))
+        Ok(cache.get_or_insert(&model, map.as_ref(), &body, || {
+            gproxy_tokenize::count(&model, &body, map.as_ref(), ())
+        }))
     }
 }
 
