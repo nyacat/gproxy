@@ -34,16 +34,23 @@ impl<H: Host> FunnelSocket<H> {
         let Some(ctx) = self.ctx.take() else {
             return;
         };
-        complete_stream(
+        let settle = complete_stream(
             self.host.clone(),
             ctx,
             http::StatusCode::SWITCHING_PROTOCOLS,
-            None,
-            None,
-            None,
+            crate::funnel::StreamDetails::default(),
             ended,
-        )
-        .await;
+        );
+        let permit = self.permit.take();
+        if let Some(spawner) = self.host.spawner() {
+            spawner.spawn(Box::pin(async move {
+                settle.await;
+                drop(permit);
+            }));
+        } else {
+            settle.await;
+            drop(permit);
+        }
     }
 }
 
@@ -96,9 +103,7 @@ impl<H: Host> Drop for FunnelSocket<H> {
                 self.host.clone(),
                 ctx,
                 http::StatusCode::SWITCHING_PROTOCOLS,
-                None,
-                None,
-                None,
+                crate::funnel::StreamDetails::default(),
                 Ended::Interrupted,
             );
             let permit = self.permit.take();
@@ -128,6 +133,7 @@ pub(crate) async fn websocket<H: Host>(
         status: http::StatusCode::SWITCHING_PROTOCOLS,
         headers: http::HeaderMap::new(),
         body: ResponseBody::WebSocket(Box::new(FunnelSocket::new(host, ctx, socket, permit))),
+        stream_cancellation: None,
         disposition: Disposition::Success,
         _settled: Settled(()),
     }
@@ -138,6 +144,7 @@ pub(crate) fn bridged_websocket(socket: Box<dyn gproxy_channel_api::WsDuplex>) -
         status: http::StatusCode::SWITCHING_PROTOCOLS,
         headers: http::HeaderMap::new(),
         body: ResponseBody::WebSocket(socket),
+        stream_cancellation: None,
         disposition: Disposition::Success,
         _settled: Settled(()),
     }

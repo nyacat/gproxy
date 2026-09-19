@@ -14,6 +14,9 @@ pub struct RealtimeMeter {
     transcription_model: Option<String>,
     dedupe: dedupe::Dedupe,
     ready: bool,
+    failure: Option<crate::UpstreamFailure>,
+    failed_response: bool,
+    failure_ids: std::collections::VecDeque<u64>,
 }
 
 impl RealtimeMeter {
@@ -26,15 +29,51 @@ impl RealtimeMeter {
             transcription_model,
             dedupe: dedupe::Dedupe::default(),
             ready: false,
+            failure: None,
+            failed_response: false,
+            failure_ids: Default::default(),
         }
     }
 
     pub fn observe(&mut self, frame: &WsFrame) -> SessionObservation {
+        self.failure = None;
+        self.failed_response = false;
         let text = match frame {
             WsFrame::Text(text) => text,
             WsFrame::Binary(_) => return compromised("sideband sent a binary event", false),
             WsFrame::Close(_) => return SessionObservation::None,
         };
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+            && let Some(failure) = crate::UpstreamFailure::from_value(
+                "realtime",
+                &http::HeaderMap::new(),
+                None,
+                &value,
+                None,
+            )
+        {
+            use std::hash::{Hash, Hasher};
+            self.failed_response = true;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            // Provider event ids distinguish repeated failures; a bounded hash
+            // of the envelope is the fallback, never retained plaintext.
+            value
+                .get("event_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(text)
+                .hash(&mut hasher);
+            let id = hasher.finish();
+            if !self.failure_ids.contains(&id) {
+                self.failure_ids.push_back(id);
+                if self.failure_ids.len() > 256 {
+                    self.failure_ids.pop_front();
+                }
+                self.failure = Some(failure);
+            }
+            if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
+                return SessionObservation::None;
+            }
+        }
         let event: RealtimeServerEvent = match serde_json::from_str(text) {
             Ok(event) => event,
             Err(error) => return compromised(format!("event JSON: {error}"), false),
@@ -56,6 +95,10 @@ impl RealtimeMeter {
 
     pub fn ready(&self) -> bool {
         self.ready
+    }
+
+    pub fn take_failure(&mut self) -> Option<crate::UpstreamFailure> {
+        self.failure.take()
     }
 
     pub fn primary_model(&self) -> &str {
@@ -83,6 +126,9 @@ impl RealtimeMeter {
                     return SessionObservation::None;
                 }
                 let Some(usage) = event.response.usage.as_ref() else {
+                    if self.failed_response {
+                        return SessionObservation::None;
+                    }
                     return compromised("response.done omitted usage", false);
                 };
                 match normalize::realtime(usage) {

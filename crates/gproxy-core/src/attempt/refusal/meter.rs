@@ -1,8 +1,9 @@
+use gproxy_channel_api::StreamDecodeError;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use gproxy_channel_api::{
-    ChannelError, Frame, NormalizedUsage, StreamDecoder, StreamEnd, StreamTail, UsageAttempt,
+    Frame, NormalizedUsage, StreamDecoder, StreamEnd, StreamTail, UsageAttempt,
 };
 
 #[derive(Clone)]
@@ -10,9 +11,13 @@ pub(super) struct Meter(Arc<Mutex<State>>);
 
 #[derive(Default)]
 struct State {
+    failure: Option<gproxy_channel_api::UpstreamFailure>,
     decoder: Option<Box<dyn StreamDecoder>>,
     attempts: Vec<UsageAttempt>,
     latest: Option<NormalizedUsage>,
+    actual_service_tier: Option<String>,
+    estimated_output_chars: Option<u64>,
+    recovery_pending: bool,
     model: String,
     started: Option<i64>,
     input: Bytes,
@@ -33,13 +38,17 @@ impl Meter {
     ) {
         let mut state = self.0.lock().expect("fallback meter lock");
         state.decoder = decoder;
+        state.failure = None;
         state.model = model;
         state.started = Some(started);
         state.input = input;
         state.received = 0;
+        state.actual_service_tier = None;
+        state.estimated_output_chars = None;
+        state.recovery_pending = false;
     }
 
-    pub(super) fn push(&self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
+    pub(super) fn push(&self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
         let mut state = self.0.lock().expect("fallback meter lock");
         state.received = state
             .received
@@ -50,16 +59,39 @@ impl Meter {
         }
     }
 
-    pub(super) fn finish(&self, end: StreamEnd, refused: bool) -> Result<Vec<Frame>, ChannelError> {
+    pub(super) fn finish(
+        &self,
+        end: StreamEnd,
+        refused: bool,
+    ) -> Result<Vec<Frame>, StreamDecodeError> {
         let mut state = self.0.lock().expect("fallback meter lock");
         let Some(mut decoder) = state.decoder.take() else {
             return Ok(Vec::new());
         };
-        let tail = decoder.finish(end)?;
+        let result = decoder.finish(end);
+        state.failure = decoder.terminal_failure().cloned();
+        let tail = match result {
+            Ok(tail) => tail,
+            Err(error) => {
+                let tail = decoder.recover_tail();
+                state.actual_service_tier = tail.actual_service_tier;
+                state.estimated_output_chars = tail.estimated_output_chars;
+                if let Some(usage) = tail.usage {
+                    state.record(usage, refused, false);
+                }
+                state.recovery_pending = true;
+                return Err(error);
+            }
+        };
+        state.actual_service_tier = tail.actual_service_tier;
+        state.estimated_output_chars = tail.estimated_output_chars;
         let estimated = tail.usage.is_none();
         let usage = tail.usage.unwrap_or_else(|| NormalizedUsage {
             input_tokens: crate::usage::estimate_input_tokens(&state.input),
-            output_tokens: state.received.div_ceil(2),
+            output_tokens: state
+                .estimated_output_chars
+                .unwrap_or(state.received)
+                .div_ceil(2),
             ..Default::default()
         });
         state.record(usage, refused, estimated);
@@ -82,10 +114,21 @@ impl Meter {
 
     pub(super) fn usage(&self) -> Option<NormalizedUsage> {
         let state = self.0.lock().expect("fallback meter lock");
-        state.latest.clone().map(|mut usage| {
-            usage.attempts = state.attempts.clone();
-            usage
-        })
+        state.usage()
+    }
+
+    fn tail(&self, recovering: bool) -> StreamTail {
+        let mut state = self.0.lock().expect("fallback meter lock");
+        let pending = std::mem::take(&mut state.recovery_pending);
+        if recovering && !pending {
+            return StreamTail::default();
+        }
+        StreamTail {
+            estimated_output_chars: state.estimated_output_chars.take(),
+            usage: state.usage(),
+            actual_service_tier: state.actual_service_tier.take(),
+            ..Default::default()
+        }
     }
 
     pub(super) fn len(&self) -> usize {
@@ -101,11 +144,18 @@ impl Meter {
     }
 
     pub(super) fn decoder(&self) -> Box<dyn StreamDecoder> {
-        Box::new(Observer(self.clone()))
+        Box::new(Observer(self.clone(), None))
     }
 }
 
 impl State {
+    fn usage(&self) -> Option<NormalizedUsage> {
+        self.latest.clone().map(|mut usage| {
+            usage.attempts = self.attempts.clone();
+            usage
+        })
+    }
+
     fn record(&mut self, mut usage: NormalizedUsage, refused: bool, estimated: bool) {
         let mut attempts = std::mem::take(&mut usage.attempts);
         if attempts.is_empty() {
@@ -128,17 +178,75 @@ impl State {
     }
 }
 
-struct Observer(Meter);
+struct Observer(Meter, Option<gproxy_channel_api::UpstreamFailure>);
 
 impl StreamDecoder for Observer {
-    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
+    fn terminal_failure(&self) -> Option<&gproxy_channel_api::UpstreamFailure> {
+        self.1.as_ref()
+    }
+
+    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
         Ok(vec![Frame(chunk)])
     }
-    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, ChannelError> {
-        self.0.finish(end, false)?;
-        Ok(StreamTail {
-            usage: self.0.usage(),
-            ..Default::default()
-        })
+    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
+        let result = self.0.finish(end, false);
+        self.1 = self.0.0.lock().expect("fallback meter").failure.clone();
+        result?;
+        Ok(self.0.tail(false))
+    }
+
+    fn recover_tail(&mut self) -> StreamTail {
+        self.0.tail(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gproxy_channel_api::{Channel, StreamCtx};
+    use gproxy_protocol::{ContentGenerationKind, Operation, OperationKey, StreamFraming};
+
+    #[test]
+    fn observer_recovers_rule_tail_usage_and_attempts_once() {
+        let key = OperationKey::content(
+            Operation::StreamGenerateContent,
+            ContentGenerationKind::OpenAiChat,
+        );
+        let headers = http::HeaderMap::new();
+        let request = Bytes::new();
+        let upstream = gproxy_channels::OpenAiChannel.stream_decoder(StreamCtx {
+            key,
+            framing: StreamFraming::Sse,
+            request_body: &request,
+            response_headers: &headers,
+        });
+        let rules = crate::process::ResponseRuleDecoder::new(
+            upstream,
+            Arc::from([]),
+            key,
+            StreamFraming::Sse,
+            crate::process::RuleModels::new("test-model", None),
+            headers,
+        )
+        .unwrap();
+        let meter = Meter::new();
+        meter.start(Some(Box::new(rules)), "test-model".into(), 1, request);
+        meter.push(Bytes::from_static(b"data: {\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":7,\"total_tokens\":20},\"service_tier\":\"priority\"}\n\n")).unwrap();
+        meter.push(Bytes::from_static(b"data: \xe4")).unwrap();
+        let mut observer = meter.decoder();
+        let error = observer.finish(StreamEnd::Complete).unwrap_err();
+        assert!(error.to_string().contains("not UTF-8"), "{error}");
+        let tail = observer.recover_tail();
+        assert!(tail.frames.is_empty());
+        assert_eq!(tail.actual_service_tier.as_deref(), Some("priority"));
+        let usage = tail.usage.unwrap();
+        assert_eq!(usage.input_tokens, 13);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.attempts.len(), 1);
+        assert!(!usage.attempts[0].estimated);
+        assert_eq!(usage.attempts[0].model, "test-model");
+        let tail = observer.recover_tail();
+        assert!(tail.usage.is_none());
+        assert!(tail.actual_service_tier.is_none());
     }
 }

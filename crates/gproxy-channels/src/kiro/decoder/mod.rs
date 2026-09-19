@@ -2,6 +2,7 @@ mod events;
 mod terminal;
 
 use bytes::Bytes;
+use gproxy_channel_api::StreamDecodeError;
 use gproxy_channel_api::{ChannelError, Frame, StreamCtx, StreamDecoder, StreamEnd, StreamTail};
 use gproxy_protocol::{ContentGenerationKind, Operation, OperationKind};
 use serde_json::{Value, json};
@@ -20,7 +21,7 @@ pub(super) struct KiroDecoder {
     started: bool,
     content_started: bool,
     reasoning_started: bool,
-    failed: bool,
+    pub(super) failure: gproxy_channel_api::FailureState,
     tools: super::tool_stream::Tracker,
     sequence: u64,
 }
@@ -57,7 +58,7 @@ impl KiroDecoder {
                 started: false,
                 content_started: false,
                 reasoning_started: false,
-                failed: false,
+                failure: gproxy_channel_api::FailureState::new("kiro", ctx.response_headers),
                 tools: Default::default(),
                 sequence: 0,
             }
@@ -85,45 +86,63 @@ impl KiroDecoder {
 }
 
 impl StreamDecoder for KiroDecoder {
-    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
-        let frames = self.parser.push(chunk)?;
+    fn terminal_failure(&self) -> Option<&gproxy_channel_api::UpstreamFailure> {
+        self.failure.failure()
+    }
+
+    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
+        let parsed = self.parser.push(chunk);
         let mut output = Vec::new();
-        for frame in frames {
-            events::handle(self, frame, &mut output)?;
+        for frame in parsed.frames {
+            if let Err(error) = events::handle(self, frame, &mut output) {
+                return Err(StreamDecodeError::from(error).prepend(output));
+            }
+        }
+        if let Some(error) = parsed.error {
+            return Err(StreamDecodeError::from(error).prepend(output));
         }
         Ok(output)
     }
 
-    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, ChannelError> {
+    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
         if end == StreamEnd::Interrupted {
             return Ok(StreamTail {
+                estimated_output_chars: None,
                 frames: Vec::new(),
                 usage: self.usage.take(),
                 actual_service_tier: None,
             });
         }
         self.parser.finish()?;
-        if self.failed {
-            return Err(ChannelError::Decode(
-                "Kiro upstream ended with an exception event".into(),
-            ));
+        if self.failure.failure().is_some() {
+            return Ok(StreamTail {
+                usage: self.usage.take(),
+                ..Default::default()
+            });
         }
         if !self.tools.is_complete() {
             return Err(ChannelError::Decode(
                 "Kiro stream ended before a tool call stopped".into(),
-            ));
+            )
+            .into());
         }
         if !self.started {
-            return Err(ChannelError::Decode(
-                "Kiro stream produced no events".into(),
-            ));
+            return Err(ChannelError::Decode("Kiro stream produced no events".into()).into());
         }
         let frames = terminal::finish(self);
         let usage = self.usage.take();
         Ok(StreamTail {
+            estimated_output_chars: None,
             frames,
             usage,
             actual_service_tier: None,
         })
+    }
+
+    fn recover_tail(&mut self) -> StreamTail {
+        StreamTail {
+            usage: self.usage.take(),
+            ..Default::default()
+        }
     }
 }

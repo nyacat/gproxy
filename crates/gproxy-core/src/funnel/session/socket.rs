@@ -60,7 +60,17 @@ impl<H: Host> Session<H> {
 
     fn observe(&mut self, frame: &WsFrame) -> Result<(), TransportError> {
         let ready = self.meter.ready();
-        match self.meter.observe(frame) {
+        let observation = self.meter.observe(frame);
+        if let Some(failure) = self.meter.take_failure() {
+            self.guard.failure(
+                failure,
+                matches!(
+                    &observation,
+                    gproxy_channel_api::SessionObservation::Usage(_)
+                ),
+            );
+        }
+        match observation {
             SessionObservation::None => {}
             SessionObservation::Usage(sample) if ready => {
                 let provider = self.guard.ctx().target.provider.clone();

@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use gproxy_channel_api::StreamDecodeError;
 use gproxy_channel_api::{
     ChannelError, Frame, NormalizedUsage, PreparedRequest, PreparedSession, RealtimeMeter,
     SessionPrepareCtx, StreamDecoder, StreamEnd, StreamTail,
@@ -44,13 +45,14 @@ pub(super) fn prepare_test_session(
 }
 
 impl StreamDecoder for MemoryHost {
-    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
+    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
         Ok(vec![Frame(chunk)])
     }
 
-    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, ChannelError> {
+    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
         let omit_usage = self.state.lock().expect("state lock").omit_usage;
         Ok(StreamTail {
+            estimated_output_chars: None,
             frames: (end == StreamEnd::Complete)
                 .then_some(Frame(Bytes::from_static(b"tail")))
                 .into_iter()

@@ -15,6 +15,8 @@ use super::{SseDecoder, SseFrame};
 use crate::TransformError;
 
 pub enum BufferedResponse {
+    /// A protocol-level failure is a complete answer even without a content result.
+    Error(Box<serde_json::Value>),
     OpenAiChat(Box<openai::ChatCompletionResponse>),
     OpenAiResponses(Box<openai::ResponseObject>),
     Claude(Box<claude_wire::CreateMessageResponseBody>),
@@ -24,6 +26,7 @@ pub enum BufferedResponse {
 impl BufferedResponse {
     pub fn into_bytes(self) -> Result<Bytes, TransformError> {
         Ok(Bytes::from(match self {
+            Self::Error(error) => serde_json::to_vec(&error)?,
             Self::OpenAiChat(response) => serde_json::to_vec(&response)?,
             Self::OpenAiResponses(response) => serde_json::to_vec(&response)?,
             Self::Claude(response) => serde_json::to_vec(&response)?,
@@ -35,6 +38,7 @@ impl BufferedResponse {
 pub struct ResponseCollector {
     decoder: SseDecoder,
     state: Collector,
+    error: Option<serde_json::Value>,
 }
 
 enum Collector {
@@ -65,18 +69,45 @@ impl ResponseCollector {
         Ok(Self {
             decoder: SseDecoder::default(),
             state,
+            error: None,
         })
     }
 
     pub fn push(&mut self, chunk: Bytes) -> Result<(), TransformError> {
         for frame in self.decoder.push(&chunk)? {
-            self.state.frame(frame)?;
+            self.frame(frame)?;
         }
         Ok(())
     }
 
+    fn frame(&mut self, frame: SseFrame) -> Result<(), TransformError> {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&frame.data)
+            && !matches!(
+                value.get("type").and_then(serde_json::Value::as_str),
+                Some(
+                    "response.inject.failed"
+                        | "response.steer.failed"
+                        | "response.mcp_call.failed"
+                        | "response.mcp_list_tools.failed"
+                )
+            )
+            && (value.get("type").and_then(serde_json::Value::as_str) == Some("error")
+                || value.get("error").is_some_and(|error| !error.is_null()))
+        {
+            if self.error.is_none() {
+                self.error = Some(if value.get("error").is_some() {
+                    value
+                } else {
+                    serde_json::json!({"error": value})
+                });
+            }
+            return Ok(());
+        }
+        self.state.frame(frame)
+    }
+
     pub fn is_complete(&self) -> bool {
-        self.state.is_complete()
+        self.error.is_some() || self.state.is_complete()
     }
 
     pub fn claude_has_output(&self) -> bool {
@@ -89,7 +120,10 @@ impl ResponseCollector {
 
     pub fn finish(mut self) -> Result<BufferedResponse, TransformError> {
         if let Some(frame) = self.decoder.finish()? {
-            self.state.frame(frame)?;
+            self.frame(frame)?;
+        }
+        if let Some(error) = self.error {
+            return Ok(BufferedResponse::Error(Box::new(error)));
         }
         self.state.finish()
     }

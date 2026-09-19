@@ -122,3 +122,29 @@ fn only_valid_server_usage_events_are_metered() {
         SessionObservation::Compromised { .. }
     ));
 }
+
+#[test]
+fn upstream_failures_are_deduplicated_without_poisoning_later_responses() {
+    let mut meter = meter();
+    let failure = text(
+        r#"{"type":"error","event_id":"evt-1","error":{"code":"invalid_request_error","message":"bad"}}"#,
+    );
+    assert!(matches!(meter.observe(&failure), SessionObservation::None));
+    assert_eq!(
+        meter.take_failure().unwrap().disposition,
+        crate::Disposition::Terminal
+    );
+    assert!(matches!(meter.observe(&failure), SessionObservation::None));
+    assert!(meter.take_failure().is_none());
+    assert!(matches!(meter.observe(&text(r#"{"type":"response.done","response":{"id":"failed-1","status":"failed","status_details":{"error":{"code":"server_error","message":"busy"}}}}"#)), SessionObservation::None));
+    assert_eq!(
+        meter.take_failure().unwrap().disposition,
+        crate::Disposition::Retryable
+    );
+    let sample = usage(meter.observe(&text(r#"{"type":"response.done","response":{"id":"failed-2","status":"failed","status_details":{"error":{"code":"server_error","message":"busy"}},"usage":{"total_tokens":5,"input_tokens":3,"output_tokens":2}}}"#)));
+    assert_eq!(sample.usage.output_tokens, 2);
+    assert!(meter.take_failure().is_some());
+    let sample = usage(meter.observe(&text(r#"{"type":"response.done","response":{"id":"success","status":"completed","usage":{"total_tokens":5,"input_tokens":3,"output_tokens":2}}}"#)));
+    assert_eq!(sample.usage.input_tokens, 3);
+    assert!(meter.take_failure().is_none());
+}

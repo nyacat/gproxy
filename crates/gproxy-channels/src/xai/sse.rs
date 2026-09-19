@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use gproxy_channel_api::StreamDecodeError;
 use gproxy_channel_api::{ChannelError, Frame, StreamCtx, StreamDecoder, StreamEnd, StreamTail};
 use gproxy_protocol::{ContentGenerationKind, OperationKind};
 use serde_json::Value;
@@ -61,16 +62,23 @@ impl XaiSseDecoder {
 }
 
 impl StreamDecoder for XaiSseDecoder {
-    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
+    fn terminal_failure(&self) -> Option<&gproxy_channel_api::UpstreamFailure> {
+        self.inner.terminal_failure()
+    }
+    fn terminal_disposition(&self) -> Option<gproxy_channel_api::Disposition> {
+        self.inner.terminal_disposition()
+    }
+
+    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
         self.buffer.extend_from_slice(&chunk);
         if self.buffer.len() > 100 * 1024 * 1024 {
-            return Err(ChannelError::Decode("xAI SSE frame exceeds 100 MiB".into()));
+            return Err(ChannelError::Decode("xAI SSE frame exceeds 100 MiB".into()).into());
         }
         self.drain();
         self.inner.push(chunk)
     }
 
-    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, ChannelError> {
+    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
         if end == StreamEnd::Complete && !self.buffer.is_empty() {
             let raw = std::mem::take(&mut self.buffer);
             self.observe(&raw);

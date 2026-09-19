@@ -106,7 +106,29 @@ pub(super) async fn open<H: Host>(
                 return Err(error);
             }
         };
-        match meter.observe(&frame) {
+        let observation = meter.observe(&frame);
+        if let Some(failure) = meter.take_failure() {
+            super::super::diagnostic::log(
+                ctx,
+                http::StatusCode::SWITCHING_PROTOCOLS,
+                &failure,
+                true,
+                false,
+            );
+            super::super::health::record_failure(
+                host,
+                ctx,
+                http::StatusCode::SWITCHING_PROTOCOLS,
+                &failure,
+            )
+            .await;
+            close(&mut socket).await;
+            super::ownership::release(host, &lease).await;
+            return Err(CoreError::Transport(
+                gproxy_channel_api::TransportError::Interrupted(failure.health_detail()),
+            ));
+        }
+        match observation {
             gproxy_channel_api::SessionObservation::Usage(sample) => initial.push(sample),
             gproxy_channel_api::SessionObservation::None => {}
             gproxy_channel_api::SessionObservation::Compromised { reason, .. } => {

@@ -29,7 +29,7 @@ pub(super) async fn run<H: Host>(
                     true,
                 );
                 runner
-                    .capture(error.status, &error.headers, error.body)
+                    .capture(error.status, &error.headers, Some(error.body))
                     .await;
                 return failure(CoreError::Transport(error.error));
             }
@@ -38,7 +38,7 @@ pub(super) async fn run<H: Host>(
             .capture(
                 collected.status(),
                 collected.headers(),
-                collected.body().clone(),
+                Some(collected.body().clone()),
             )
             .await;
         if !collected.status().is_success() {

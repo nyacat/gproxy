@@ -55,6 +55,11 @@ enum AttemptBody {
 }
 
 pub(crate) enum Failure {
+    /// Local persistence/admission failure before egress. Failover would only
+    /// repeat the same broken local operation and misreport upstream health.
+    Local {
+        error: CoreError,
+    },
     Transport {
         facts: FunnelCtx,
         error: TransportError,
@@ -96,20 +101,22 @@ pub(crate) async fn send<H: Host>(
     }
     let mut committed = matches!(&egress, Egress::Orchestrated(_));
     facts.upstream_started_at_ms = Some(crate::quota::now_ms());
-    if quota_accounted
-        && let Err(error) = core
+    if quota_accounted {
+        facts.activity = match core
             .host
-            .begin_credential_usage(
+            .track_credential_usage(
+                &facts.request_id,
                 &facts.request_id,
                 &facts.target,
                 facts.upstream_started_at_ms.expect("send time"),
             )
             .await
-    {
-        return Err(Box::new(Failure::Transport {
-            facts,
-            error: TransportError::Interrupted(error.to_string()),
-        }));
+        {
+            Ok(activity) => activity,
+            Err(error) => {
+                return Err(Box::new(Failure::Local { error }));
+            }
+        };
     }
     let response = match egress {
         Egress::Http(request) => match core.host.transport().send(*request).await {
@@ -219,7 +226,7 @@ pub(crate) async fn send<H: Host>(
         .expect("prepared attempt channel remains registered");
     if stream && response.status().is_success() {
         let disposition = committed_disposition(classify(channel, &response, &[]), committed);
-        crate::funnel::health::response(
+        crate::funnel::health::stream_response(
             core.host.as_ref(),
             channel,
             &facts,
@@ -288,7 +295,31 @@ pub(crate) async fn send<H: Host>(
             };
             return match body::collect_stream(response, decoder, kind).await {
                 Ok(mut collected) => {
-                    if source != key {
+                    if let Some(failure) = &collected.upstream_failure {
+                        funnel::diagnostic::log(
+                            &facts,
+                            collected.response.status(),
+                            failure,
+                            true,
+                            collected.usage.is_some(),
+                        );
+                    }
+                    if source.kind() != key.kind()
+                        && let Some(failure) = &collected.upstream_failure
+                        && failure.error_envelope
+                    {
+                        *collected.response.body_mut() = funnel::diagnostic::error_body(
+                            source.kind(),
+                            collected.response.body(),
+                            failure,
+                        );
+                    }
+                    if source != key
+                        && collected
+                            .upstream_failure
+                            .as_ref()
+                            .is_none_or(|f| !f.error_envelope)
+                    {
                         match gproxy_transform::response(
                             source,
                             key,
@@ -307,10 +338,28 @@ pub(crate) async fn send<H: Host>(
                             }
                         }
                     }
+                    let terminal = collected.terminal_disposition.unwrap_or(disposition);
+                    if let Some(failure) = &collected.upstream_failure {
+                        funnel::health::record_failure(
+                            core.host.as_ref(),
+                            &facts,
+                            collected.response.status(),
+                            failure,
+                        )
+                        .await;
+                    } else if terminal != Disposition::Terminal {
+                        crate::funnel::health::record_response(
+                            core.host.as_ref(),
+                            &facts,
+                            terminal,
+                            collected.response.status(),
+                        )
+                        .await;
+                    }
                     Ok(Completed {
                         channel: channel.descriptor().id,
                         facts,
-                        disposition,
+                        disposition: committed_disposition(terminal, committed),
                         body: AttemptBody::Buffered(funnel::BufferedRelay {
                             response: collected.response,
                             usage: collected.usage,
@@ -322,14 +371,30 @@ pub(crate) async fn send<H: Host>(
                     })
                 }
                 Err(failure) => {
-                    crate::funnel::health::degraded(
-                        core.host.as_ref(),
-                        &facts.target,
-                        facts.credential_version,
-                        Some(failure.status),
-                        "upstream response interrupted",
-                    )
-                    .await;
+                    if let Some(diagnostic) = &failure.upstream_failure {
+                        funnel::diagnostic::log(&facts, failure.status, diagnostic, true, false);
+                        funnel::health::record_failure(
+                            core.host.as_ref(),
+                            &facts,
+                            failure.status,
+                            diagnostic,
+                        )
+                        .await;
+                        if diagnostic.disposition == Disposition::Terminal {
+                            return Err(Box::new(Failure::Committed {
+                                error: CoreError::Transport(failure.error),
+                            }));
+                        }
+                    } else {
+                        crate::funnel::health::degraded(
+                            core.host.as_ref(),
+                            &facts.target,
+                            facts.credential_version,
+                            Some(failure.status),
+                            "upstream response interrupted",
+                        )
+                        .await;
+                    }
                     Err(Box::new(Failure::Interrupted {
                         channel: channel.descriptor().id,
                         facts,
@@ -378,17 +443,31 @@ pub(crate) async fn send<H: Host>(
             }));
         }
     };
-    let disposition =
-        committed_disposition(classify(channel, &response, response.body()), committed);
-    crate::funnel::health::response(
-        core.host.as_ref(),
-        channel,
-        &facts,
-        disposition,
-        response.status(),
-        response.headers(),
-    )
-    .await;
+    let failure = channel.response_failure(ResponseView {
+        status: response.status(),
+        headers: response.headers(),
+        body: response.body(),
+    });
+    let semantic = failure.as_ref().map_or_else(
+        || classify(channel, &response, response.body()),
+        |failure| failure.disposition,
+    );
+    funnel::health::observe_quota(core.host.as_ref(), channel, &facts, response.headers()).await;
+    if let Some(failure) = &failure {
+        funnel::diagnostic::log(
+            &facts,
+            response.status(),
+            failure,
+            false,
+            usage_override.is_some(),
+        );
+        funnel::health::record_failure(core.host.as_ref(), &facts, response.status(), failure)
+            .await;
+    } else {
+        funnel::health::record_response(core.host.as_ref(), &facts, semantic, response.status())
+            .await;
+    }
+    let disposition = committed_disposition(semantic, committed);
     Ok(Completed {
         channel: channel.descriptor().id,
         facts,

@@ -18,7 +18,7 @@ pub(super) async fn relay<H: Host>(
 ) -> Result<ExecOutcome, CoreError> {
     if stream && response.status().is_success() {
         let disposition = classify(channel, &response, &[]);
-        crate::funnel::health::response(
+        crate::funnel::health::stream_response(
             core.host.as_ref(),
             channel,
             &facts,

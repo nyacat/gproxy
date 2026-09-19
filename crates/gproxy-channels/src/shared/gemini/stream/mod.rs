@@ -1,6 +1,7 @@
 mod json_array;
 mod sse;
 
+use gproxy_channel_api::StreamDecodeError;
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
@@ -12,6 +13,7 @@ use gproxy_protocol::{ContentGenerationKind, Operation, OperationKind, StreamFra
 
 pub(crate) struct GeminiStreamDecoder {
     parser: Parser,
+    failure: gproxy_channel_api::FailureState,
     terminal: Terminal,
     response_tier: Option<String>,
     usage: Option<gproxy_channel_api::NormalizedUsage>,
@@ -37,28 +39,35 @@ impl GeminiStreamDecoder {
         };
         Some(Self {
             parser,
+            failure: gproxy_channel_api::FailureState::new("gemini", ctx.response_headers),
             terminal: Terminal::default(),
             response_tier: super::usage::response_tier(ctx.response_headers),
             usage: None,
         })
     }
 
-    fn parse(&mut self, chunk: &[u8]) -> Result<Vec<GenerateContentResponse>, ChannelError> {
+    fn parse(&mut self, chunk: &[u8]) -> Result<Vec<serde_json::Value>, ChannelError> {
         match &mut self.parser {
             Parser::Sse(parser) => parser.push(chunk),
             Parser::JsonArray(parser) => parser.push(chunk),
         }
     }
 
-    fn parse_finish(&mut self) -> Result<Vec<GenerateContentResponse>, ChannelError> {
+    fn parse_finish(&mut self) -> Result<Vec<serde_json::Value>, ChannelError> {
         match &mut self.parser {
             Parser::Sse(parser) => parser.finish(),
             Parser::JsonArray(parser) => parser.finish(),
         }
     }
 
-    fn observe(&mut self, chunks: Vec<GenerateContentResponse>) -> Result<(), ChannelError> {
-        for chunk in chunks {
+    fn observe(&mut self, chunks: Vec<serde_json::Value>) -> Result<(), ChannelError> {
+        for value in chunks {
+            self.failure.observe(None, &value);
+            if value.get("error").is_some_and(|error| !error.is_null()) {
+                continue;
+            }
+            let chunk: GenerateContentResponse = serde_json::from_value(value)
+                .map_err(|_| ChannelError::Decode("invalid Gemini content response".into()))?;
             if let Some(metadata) = chunk.usage_metadata.as_ref() {
                 if self.response_tier.is_none() {
                     self.response_tier = metadata
@@ -89,7 +98,11 @@ impl GeminiStreamDecoder {
 }
 
 impl StreamDecoder for GeminiStreamDecoder {
-    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
+    fn terminal_failure(&self) -> Option<&gproxy_channel_api::UpstreamFailure> {
+        self.failure.failure()
+    }
+
+    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
         let parsed = self.parse(&chunk)?;
         self.observe(parsed)?;
         if chunk.is_empty() {
@@ -99,9 +112,10 @@ impl StreamDecoder for GeminiStreamDecoder {
         }
     }
 
-    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, ChannelError> {
+    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
         if end == StreamEnd::Interrupted {
             return Ok(StreamTail {
+                estimated_output_chars: None,
                 frames: Vec::new(),
                 usage: self.usage.take(),
                 actual_service_tier: self.response_tier.take(),
@@ -109,16 +123,26 @@ impl StreamDecoder for GeminiStreamDecoder {
         }
         let parsed = self.parse_finish()?;
         self.observe(parsed)?;
-        if !self.terminal.is_complete() {
+        if self.failure.failure().is_none() && !self.terminal.is_complete() {
             return Err(ChannelError::Decode(
                 "Gemini stream ended without terminal candidate or block reason".into(),
-            ));
+            )
+            .into());
         }
         Ok(StreamTail {
+            estimated_output_chars: None,
             frames: Vec::new(),
             usage: self.usage.take(),
             actual_service_tier: self.response_tier.take(),
         })
+    }
+
+    fn recover_tail(&mut self) -> StreamTail {
+        StreamTail {
+            usage: self.usage.take(),
+            actual_service_tier: self.response_tier.take(),
+            ..Default::default()
+        }
     }
 }
 

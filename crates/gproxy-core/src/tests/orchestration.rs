@@ -29,8 +29,7 @@ fn continuation_channels_fail_loudly_without_host_state() {
     ));
 }
 
-#[test]
-fn claudeweb_new_and_resume_turns_transfer_one_scoped_stream() {
+fn claudeweb_core() -> (MemoryHost, Core<MemoryHost>) {
     let host = MemoryHost::with_continuations();
     let target = Target {
         provider: ProviderRef {
@@ -66,7 +65,12 @@ fn claudeweb_new_and_resume_turns_transfer_one_scoped_stream() {
         ChannelRegistry::new([Box::new(gproxy_channels::ClaudeWebChannel) as Box<dyn Channel>])
             .expect("channel registry");
     let core = Core::new(host.clone(), channels).expect("continuation-capable core");
+    (host, core)
+}
 
+#[test]
+fn claudeweb_new_and_resume_turns_transfer_one_scoped_stream() {
+    let (host, core) = claudeweb_core();
     let first = request(
         "web-first",
         json!({
@@ -125,6 +129,66 @@ fn claudeweb_new_and_resume_turns_transfer_one_scoped_stream() {
             .iter()
             .all(|capture| capture.provider_id == Some(44))
     );
+}
+
+#[test]
+fn claudeweb_late_decode_error_relays_completed_output_before_settling_interrupted() {
+    let body = b"data: {\"completion\":\"kept-prefix\"}\n\ndata: {broken}\n\n";
+    for chunk_size in [1, body.len()] {
+        let (host, core) = claudeweb_core();
+        host.state.lock().unwrap().run_spawned = true;
+        host.state.lock().unwrap().scripted.extend([
+            (http::StatusCode::OK, vec![Bytes::from_static(b"{}")]),
+            (http::StatusCode::OK, vec![Bytes::from_static(b"{}")]),
+            (
+                http::StatusCode::OK,
+                body.chunks(chunk_size)
+                    .map(Bytes::copy_from_slice)
+                    .collect(),
+            ),
+        ]);
+        let outcome = block_on(core.execute(
+            &host,
+            request(
+                "web-partial",
+                json!({
+                    "model":"claude-opus-4-8",
+                    "stream":true,
+                    "messages":[{"role":"user","content":"hello"}]
+                }),
+            ),
+        ))
+        .unwrap();
+        let ResponseBody::Stream(mut stream) = outcome.body else {
+            panic!("expected an operation stream");
+        };
+        let (output, errors) = block_on(async {
+            let mut output = Vec::new();
+            let mut errors = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        assert!(errors.is_empty(), "output followed the terminal error");
+                        output.extend_from_slice(&chunk);
+                    }
+                    Err(error) => errors.push(error.to_string()),
+                }
+            }
+            (String::from_utf8(output).unwrap(), errors)
+        });
+        assert_eq!(output.matches("kept-prefix").count(), 1, "{output}");
+        assert!(!output.contains("message_stop"), "{output}");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("ClaudeWeb SSE JSON"), "{errors:?}");
+        let state = host.state.lock().unwrap();
+        assert_eq!(state.settlements.len(), 1);
+        assert_eq!(state.settlements[0].ended, crate::Ended::Interrupted);
+        assert_eq!(
+            state.health.last().unwrap().2,
+            crate::CredentialHealth::Degraded
+        );
+        assert!(state.continuations.is_empty());
+    }
 }
 
 fn request(id: &str, body: serde_json::Value) -> RequestCtx {

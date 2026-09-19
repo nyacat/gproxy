@@ -1,6 +1,7 @@
 //! Shared OpenAI SSE observation and usage extraction.
 
 use bytes::Bytes;
+use gproxy_channel_api::StreamDecodeError;
 use gproxy_channel_api::{
     ChannelError, Frame, NormalizedUsage, StreamCtx, StreamDecoder, StreamEnd, StreamTail,
 };
@@ -11,12 +12,14 @@ use super::redact::B64Redactor;
 
 pub(crate) struct OpenAiSseDecoder {
     kind: Kind,
+    failure: gproxy_channel_api::FailureState,
     buffer: Vec<u8>,
     redactor: B64Redactor,
     service_tier: Option<String>,
     usage: Option<NormalizedUsage>,
     audio_bytes: u64,
     audio_bytes_per_second: Option<u64>,
+    output_meter: crate::shared::responses_meter::ResponsesMeter,
 }
 
 #[derive(Clone, Copy)]
@@ -58,12 +61,14 @@ impl OpenAiSseDecoder {
             .flatten();
         Some(Self {
             kind,
+            failure: gproxy_channel_api::FailureState::new("openai", ctx.response_headers),
             buffer: Vec::new(),
             redactor: B64Redactor::default(),
             service_tier: None,
             usage: None,
             audio_bytes: 0,
             audio_bytes_per_second,
+            output_meter: Default::default(),
         })
     }
 
@@ -81,15 +86,22 @@ impl OpenAiSseDecoder {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
             return;
         };
+        self.failure.observe(event.as_deref(), &value);
+        if matches!(self.kind, Kind::Responses) {
+            self.output_meter.observe(&value);
+        }
         if let Some(tier) = super::usage::service_tier(&value) {
             self.service_tier = Some(tier.to_owned());
         }
         let mut usage = match self.kind {
             Kind::Chat => value.get("usage").and_then(super::usage::from_usage),
             Kind::Responses => {
-                let completed = event.as_deref() == Some("response.completed")
-                    || value.get("type").and_then(serde_json::Value::as_str)
-                        == Some("response.completed");
+                let completed = matches!(
+                    event
+                        .as_deref()
+                        .or_else(|| value.get("type").and_then(serde_json::Value::as_str)),
+                    Some("response.completed" | "response.failed" | "response.incomplete")
+                );
                 completed
                     .then(|| value.pointer("/response/usage"))
                     .flatten()
@@ -123,12 +135,20 @@ impl OpenAiSseDecoder {
 }
 
 impl StreamDecoder for OpenAiSseDecoder {
-    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
+    fn terminal_failure(&self) -> Option<&gproxy_channel_api::UpstreamFailure> {
+        self.failure.failure()
+    }
+    fn terminal_disposition(&self) -> Option<gproxy_channel_api::Disposition> {
+        self.failure.disposition()
+    }
+
+    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
         self.buffer.extend(self.redactor.push(&chunk));
         if self.buffer.len() > 100 * 1024 * 1024 {
             return Err(ChannelError::Decode(
                 "OpenAI SSE frame exceeds 100 MiB after media redaction".into(),
-            ));
+            )
+            .into());
         }
         self.drain();
         if chunk.is_empty() {
@@ -138,7 +158,7 @@ impl StreamDecoder for OpenAiSseDecoder {
         }
     }
 
-    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, ChannelError> {
+    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
         if end == StreamEnd::Complete && !self.buffer.is_empty() {
             let raw = std::mem::take(&mut self.buffer);
             self.observe(&raw);
@@ -157,6 +177,8 @@ impl StreamDecoder for OpenAiSseDecoder {
             self.usage = Some(usage);
         }
         Ok(StreamTail {
+            estimated_output_chars: matches!(self.kind, Kind::Responses)
+                .then(|| self.output_meter.characters()),
             frames: Vec::new(),
             usage: self.usage.take(),
             actual_service_tier: self.service_tier.take(),

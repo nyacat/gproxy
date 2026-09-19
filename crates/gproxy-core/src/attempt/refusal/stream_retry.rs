@@ -51,7 +51,7 @@ impl<H: Host> Runner<H> {
             self.capture(
                 response.status(),
                 response.headers(),
-                response.body().clone(),
+                Some(response.body().clone()),
             )
             .await;
             let message = credit::message(response.body());

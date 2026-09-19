@@ -188,7 +188,7 @@ impl<H: Host> Runner<H> {
             self.capture(
                 response.status(),
                 response.headers(),
-                response.body().clone(),
+                Some(response.body().clone()),
             )
             .await;
             let message = credit::message(response.body());
@@ -275,9 +275,11 @@ impl<H: Host> Runner<H> {
         self.facts.request_body = prepared.request.body().clone();
         self.facts.request_headers = Some(prepared.request.headers().clone());
         if channel.quota_capabilities(&credential.secret).is_some() {
-            self.core
+            self.facts.activity = self
+                .core
                 .host
-                .begin_credential_usage(
+                .track_credential_usage(
+                    &self.facts.request_id,
                     &format!("{}:attempt:{}", self.facts.request_id, self.meter.len()),
                     &self.facts.target,
                     self.facts.upstream_started_at_ms.expect("send time"),
@@ -333,7 +335,7 @@ impl<H: Host> Runner<H> {
         &self,
         status: http::StatusCode,
         headers: &http::HeaderMap,
-        body: Bytes,
+        body: Option<Bytes>,
     ) {
         self.core
             .host
@@ -348,7 +350,7 @@ impl<H: Host> Runner<H> {
                 request_body: self.replay.body.clone(),
                 response_status: Some(status),
                 response_headers: Some(headers.clone()),
-                response_body: Some(body),
+                response_body: body,
             })
             .await;
     }

@@ -21,42 +21,55 @@ pub(crate) struct FrameParser {
     pending: BytesMut,
 }
 
+/// Parsing can produce complete frames before a later frame fails. Keeping
+/// that prefix lets protocol adapters deliver it before reporting the error.
+pub(crate) struct ParsedFrames {
+    pub(crate) frames: Vec<Frame>,
+    pub(crate) error: Option<ChannelError>,
+}
+
 impl FrameParser {
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn push(&mut self, mut chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
+    pub(crate) fn push(&mut self, mut chunk: Bytes) -> ParsedFrames {
         let mut frames = Vec::new();
-        while !chunk.is_empty() {
-            if self.pending.is_empty() && chunk.len() >= PRELUDE_LEN {
-                let layout = decode_prelude(&chunk[..PRELUDE_LEN])?;
-                if chunk.len() >= layout.total_len {
-                    let raw = chunk.split_to(layout.total_len);
-                    frames.push(decode_frame(raw, layout)?);
+        let result = (|| -> Result<(), ChannelError> {
+            while !chunk.is_empty() {
+                if self.pending.is_empty() && chunk.len() >= PRELUDE_LEN {
+                    let layout = decode_prelude(&chunk[..PRELUDE_LEN])?;
+                    if chunk.len() >= layout.total_len {
+                        let raw = chunk.split_to(layout.total_len);
+                        frames.push(decode_frame(raw, layout)?);
+                        continue;
+                    }
+                }
+
+                let needed = if self.pending.len() < PRELUDE_LEN {
+                    PRELUDE_LEN - self.pending.len()
+                } else {
+                    decode_prelude(&self.pending[..PRELUDE_LEN])?.total_len - self.pending.len()
+                };
+                let take = needed.min(chunk.len());
+                self.pending.extend_from_slice(&chunk[..take]);
+                chunk.advance(take);
+
+                if self.pending.len() < PRELUDE_LEN {
                     continue;
                 }
+                let layout = decode_prelude(&self.pending[..PRELUDE_LEN])?;
+                if self.pending.len() == layout.total_len {
+                    let raw = self.pending.split_to(layout.total_len).freeze();
+                    frames.push(decode_frame(raw, layout)?);
+                }
             }
-
-            let needed = if self.pending.len() < PRELUDE_LEN {
-                PRELUDE_LEN - self.pending.len()
-            } else {
-                decode_prelude(&self.pending[..PRELUDE_LEN])?.total_len - self.pending.len()
-            };
-            let take = needed.min(chunk.len());
-            self.pending.extend_from_slice(&chunk[..take]);
-            chunk.advance(take);
-
-            if self.pending.len() < PRELUDE_LEN {
-                continue;
-            }
-            let layout = decode_prelude(&self.pending[..PRELUDE_LEN])?;
-            if self.pending.len() == layout.total_len {
-                let raw = self.pending.split_to(layout.total_len).freeze();
-                frames.push(decode_frame(raw, layout)?);
-            }
+            Ok(())
+        })();
+        ParsedFrames {
+            frames,
+            error: result.err(),
         }
-        Ok(frames)
     }
 
     /// Validate a clean EOF. Callers decide whether an interrupted stream is

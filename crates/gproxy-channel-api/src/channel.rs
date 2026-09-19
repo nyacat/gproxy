@@ -64,9 +64,49 @@ pub struct ResponseShapeCtx<'a> {
 #[derive(Debug)]
 pub struct Frame(pub Bytes);
 
+/// A decoder may finish valid frames before a later event fails in the same
+/// transport chunk. Those frames must pass through every wrapper exactly once.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct StreamDecodeError {
+    pub error: ChannelError,
+    pub frames: Vec<Frame>,
+    pub diagnostic: Option<Box<StreamDecodeDiagnostic>>,
+}
+
+#[derive(Debug)]
+pub struct StreamDecodeDiagnostic {
+    pub event: Option<String>,
+    pub event_type: Option<String>,
+    pub payload_bytes: usize,
+    pub field_path: String,
+    pub fields: Vec<String>,
+}
+
+impl From<ChannelError> for StreamDecodeError {
+    fn from(error: ChannelError) -> Self {
+        Self {
+            error,
+            frames: Vec::new(),
+            diagnostic: None,
+        }
+    }
+}
+
+impl StreamDecodeError {
+    pub fn prepend(mut self, mut frames: Vec<Frame>) -> Self {
+        frames.append(&mut self.frames);
+        self.frames = frames;
+        self
+    }
+}
+
 /// What a finished stream reports.
 #[derive(Debug, Default)]
 pub struct StreamTail {
+    /// Content characters observed before framing or client-side conversion.
+    /// None means this decoder has no semantic output estimate.
+    pub estimated_output_chars: Option<u64>,
     /// Frames completed only when the decoder observed EOF, such as an SSE
     /// event whose final blank-line delimiter was omitted.
     pub frames: Vec<Frame>,
@@ -87,8 +127,27 @@ pub enum StreamEnd {
 /// the chunk lets an observe-only decoder relay it as a [`Frame`] without a
 /// copy while still collecting usage state.
 pub trait StreamDecoder: Send {
-    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError>;
-    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, ChannelError>;
+    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError>;
+    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError>;
+
+    /// The semantic result of a terminal event, independent of HTTP status.
+    /// Read after `finish`; wrappers must preserve the upstream result.
+    /// `None` means the decoder has no additional classification to report.
+    fn terminal_disposition(&self) -> Option<Disposition> {
+        self.terminal_failure().map(|failure| failure.disposition)
+    }
+
+    /// Safe metadata from an upstream failure, retained even if a wrapper fails.
+    fn terminal_failure(&self) -> Option<&crate::UpstreamFailure> {
+        None
+    }
+
+    /// Take metadata already collected when `finish` failed while producing
+    /// output. Recovery must not finish the decoder again or emit frames, and
+    /// transfers the retained metadata at most once.
+    fn recover_tail(&mut self) -> StreamTail {
+        StreamTail::default()
+    }
 }
 
 /// Minimal buffered HTTP the engine lends to `refresh` — refresh calls are
@@ -108,6 +167,11 @@ pub trait SimpleHttp: MaybeSync {
 /// logic; I/O and state live in the engine and the host.
 pub trait Channel: Send + Sync {
     fn descriptor(&self) -> &'static ChannelDescriptor;
+
+    /// The same client defaults used by request preparation and host presets.
+    fn client_fingerprint(&self) -> Option<crate::wire::ClientFingerprint> {
+        None
+    }
 
     /// Every route this channel declares, in priority order. The first row
     /// for a source is the provider default; further rows for the same source
@@ -158,6 +222,20 @@ pub trait Channel: Send + Sync {
     }
 
     fn classify(&self, response: ResponseView<'_>) -> Disposition;
+
+    fn response_failure(&self, response: ResponseView<'_>) -> Option<crate::UpstreamFailure> {
+        let mut failure = crate::UpstreamFailure::from_http(
+            self.descriptor().id,
+            response.status,
+            response.headers,
+            response.body,
+        )?;
+        // Health accounting must use the same provider policy as failover.
+        // Generic metadata extraction alone cannot decide what a bare 403
+        // means for this channel's credential family.
+        failure.disposition = self.classify(response);
+        Some(failure)
+    }
 
     fn stream_decoder(&self, ctx: StreamCtx<'_>) -> Option<Box<dyn StreamDecoder>> {
         let _ = ctx;

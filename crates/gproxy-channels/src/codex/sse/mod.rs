@@ -1,3 +1,4 @@
+mod diagnostic;
 mod event;
 mod framing;
 mod lifecycle;
@@ -7,8 +8,10 @@ mod tools;
 mod tests;
 
 use bytes::Bytes;
+use gproxy_channel_api::StreamDecodeError;
 use gproxy_channel_api::{
-    ChannelError, Frame, NormalizedUsage, StreamCtx, StreamDecoder, StreamEnd, StreamTail,
+    ChannelError, Disposition, Frame, NormalizedUsage, StreamCtx, StreamDecoder, StreamEnd,
+    StreamTail,
 };
 use gproxy_protocol::openai::generate_content::responses::ResponseStreamEvent;
 use gproxy_protocol::{ContentGenerationKind, Operation, OperationKind};
@@ -22,6 +25,8 @@ pub(super) struct CodexSseDecoder {
     usage: Option<NormalizedUsage>,
     actual_service_tier: Option<String>,
     done_seen: bool,
+    failure: gproxy_channel_api::FailureState,
+    output_meter: Option<crate::shared::responses_meter::ResponsesMeter>,
 }
 
 impl CodexSseDecoder {
@@ -40,19 +45,24 @@ impl CodexSseDecoder {
             usage: None,
             actual_service_tier: None,
             done_seen: false,
+            failure: gproxy_channel_api::FailureState::new("codex", ctx.response_headers),
+            output_meter: Some(Default::default()),
         })
     }
 
-    fn drain(&mut self) -> Result<Vec<Frame>, ChannelError> {
+    fn drain(&mut self) -> Result<Vec<Frame>, StreamDecodeError> {
         let mut output = Vec::new();
         while let Some((end, delimiter)) = delimiter(&self.buffer) {
             let raw = self.buffer.drain(..end + delimiter).collect::<Vec<_>>();
-            output.extend(self.frame(&raw[..end])?);
+            match self.frame(&raw[..end]) {
+                Ok(frames) => output.extend(frames),
+                Err(error) => return Err(error.prepend(output)),
+            }
         }
         Ok(output)
     }
 
-    fn frame(&mut self, raw: &[u8]) -> Result<Vec<Frame>, ChannelError> {
+    fn frame(&mut self, raw: &[u8]) -> Result<Vec<Frame>, StreamDecodeError> {
         let Some(frame) = parse(raw)? else {
             return Ok(Vec::new());
         };
@@ -60,8 +70,12 @@ impl CodexSseDecoder {
             self.done_seen = true;
             return Ok(Vec::new());
         }
-        let event: ResponseStreamEvent = serde_json::from_str(&frame.data)
-            .map_err(|error| ChannelError::Decode(format!("Responses event JSON: {error}")))?;
+        let (event, value) = diagnostic::decode(&frame.data, frame.event.as_deref())?;
+        // Observe before normalizers synthesize snapshots or rewrite tools.
+        if let Some(meter) = self.output_meter.as_mut() {
+            meter.observe(&value);
+        }
+        self.failure.observe(frame.event.as_deref(), &value);
         let events = self
             .lifecycle
             .normalize(event)
@@ -73,10 +87,14 @@ impl CodexSseDecoder {
         &mut self,
         events: Vec<ResponseStreamEvent>,
         fallback_event: Option<&str>,
-    ) -> Result<Vec<Frame>, ChannelError> {
+    ) -> Result<Vec<Frame>, StreamDecodeError> {
         let mut output = Vec::new();
         for event in events {
-            for event in self.tools.normalize(event)? {
+            let events = match self.tools.normalize(event) {
+                Ok(events) => events,
+                Err(error) => return Err(StreamDecodeError::from(error).prepend(output)),
+            };
+            for event in events {
                 if let ResponseStreamEvent::Known(known) = &event
                     && let Some(response) = event::response(known)
                 {
@@ -101,20 +119,29 @@ impl CodexSseDecoder {
 }
 
 impl StreamDecoder for CodexSseDecoder {
-    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, ChannelError> {
+    fn terminal_failure(&self) -> Option<&gproxy_channel_api::UpstreamFailure> {
+        self.failure.failure()
+    }
+
+    fn terminal_disposition(&self) -> Option<Disposition> {
+        self.failure.disposition()
+    }
+
+    fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
         self.buffer.extend_from_slice(&chunk);
         if self.buffer.len() > 100 * 1024 * 1024 {
-            return Err(ChannelError::Decode(
-                "Codex Responses SSE frame exceeds 100 MiB".into(),
-            ));
+            return Err(
+                ChannelError::Decode("Codex Responses SSE frame exceeds 100 MiB".into()).into(),
+            );
         }
         self.drain()
     }
 
-    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, ChannelError> {
+    fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
         if end == StreamEnd::Interrupted {
             self.buffer.clear();
             return Ok(StreamTail {
+                estimated_output_chars: self.output_meter.take().map(|meter| meter.characters()),
                 frames: Vec::new(),
                 usage: self.usage.take(),
                 actual_service_tier: self.actual_service_tier.take(),
@@ -127,17 +154,28 @@ impl StreamDecoder for CodexSseDecoder {
             self.frame(&raw)?
         };
         if !self.lifecycle.is_terminal() {
-            return Err(ChannelError::Decode(
+            return Err(StreamDecodeError::from(ChannelError::Decode(
                 "Codex Responses stream ended without a terminal response event".into(),
-            ));
+            ))
+            .prepend(frames));
         }
         if self.done_seen {
             frames.push(Frame(encode(None, "[DONE]")));
         }
         Ok(StreamTail {
+            estimated_output_chars: self.output_meter.take().map(|meter| meter.characters()),
             frames,
             usage: self.usage.take(),
             actual_service_tier: self.actual_service_tier.take(),
         })
+    }
+
+    fn recover_tail(&mut self) -> StreamTail {
+        StreamTail {
+            estimated_output_chars: self.output_meter.take().map(|meter| meter.characters()),
+            usage: self.usage.take(),
+            actual_service_tier: self.actual_service_tier.take(),
+            ..Default::default()
+        }
     }
 }

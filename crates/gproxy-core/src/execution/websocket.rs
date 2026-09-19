@@ -316,7 +316,19 @@ impl<H: Host> ResponsesBridge<H> {
     }
 
     async fn observe_native(&mut self, text: &str) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+            && let Some(active) = self.active.as_mut()
+        {
+            active.failure.observe(None, &value);
+        }
         let Ok(ResponseStreamEvent::Known(event)) = serde_json::from_str(text) else {
+            if self
+                .active
+                .as_ref()
+                .is_some_and(|active| active.failure.failure().is_some())
+            {
+                self.finish_active(Ended::Complete).await;
+            }
             return;
         };
         let Some(active) = self.active.as_mut() else {
@@ -350,13 +362,13 @@ impl<H: Host> ResponsesBridge<H> {
                 ));
             }
             KnownResponseStreamEvent::ResponseFailed(event) => {
-                active.terminal = Some(Ended::Interrupted);
+                active.terminal = Some(Ended::Complete);
                 active.responses.push(Bytes::from(
                     serde_json::to_vec(&event.response).expect("response serializes"),
                 ));
             }
             KnownResponseStreamEvent::Error(_) => {
-                active.terminal = Some(Ended::Interrupted);
+                active.terminal = Some(Ended::Complete);
             }
             _ => {}
         }
@@ -374,12 +386,29 @@ impl<H: Host> ResponsesBridge<H> {
             return;
         };
         let ended = active.terminal.take().unwrap_or(fallback);
+        let terminal_disposition = active.failure.disposition();
         let channel = self
             .core
             .channels
             .get(&active.facts.target.provider.channel)
             .expect("pinned channel remains registered");
         let usage = combined_response_usage(channel, &active.facts, &active.responses);
+        if let Some(failure) = active.failure.failure() {
+            crate::funnel::diagnostic::log(
+                &active.facts,
+                http::StatusCode::SWITCHING_PROTOCOLS,
+                failure,
+                true,
+                usage.is_some(),
+            );
+            crate::funnel::health::record_failure(
+                self.core.host.as_ref(),
+                &active.facts,
+                http::StatusCode::SWITCHING_PROTOCOLS,
+                failure,
+            )
+            .await;
+        }
         let tier = active.responses.last().and_then(|response| {
             crate::control::response_service_tier(&http::HeaderMap::new(), response)
         });
@@ -387,9 +416,14 @@ impl<H: Host> ResponsesBridge<H> {
             self.core.host.clone(),
             active.facts,
             http::StatusCode::SWITCHING_PROTOCOLS,
-            usage,
-            tier,
-            Some(active.output_chars),
+            crate::funnel::StreamDetails {
+                usage,
+                actual_service_tier: tier,
+                estimated_output_chars: Some(crate::usage::OutputEstimate::Wire(
+                    active.output_chars,
+                )),
+                terminal_disposition,
+            },
             ended,
         )
         .await;

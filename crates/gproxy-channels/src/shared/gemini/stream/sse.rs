@@ -1,7 +1,7 @@
 //! SSE framing used by Gemini streaming responses.
 
 use gproxy_channel_api::ChannelError;
-use gproxy_protocol::gemini::GenerateContentResponse;
+use serde_json::Value;
 
 const MAX_FRAME_BYTES: usize = 100 * 1024 * 1024;
 
@@ -11,10 +11,7 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
-    pub(super) fn push(
-        &mut self,
-        chunk: &[u8],
-    ) -> Result<Vec<GenerateContentResponse>, ChannelError> {
+    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Vec<Value>, ChannelError> {
         self.buffer.extend_from_slice(chunk);
         if self.buffer.len() > MAX_FRAME_BYTES {
             return Err(ChannelError::Decode(
@@ -31,7 +28,7 @@ impl Decoder {
         Ok(output)
     }
 
-    pub(super) fn finish(&mut self) -> Result<Vec<GenerateContentResponse>, ChannelError> {
+    pub(super) fn finish(&mut self) -> Result<Vec<Value>, ChannelError> {
         if self.buffer.is_empty() {
             return Ok(Vec::new());
         }
@@ -40,7 +37,7 @@ impl Decoder {
     }
 }
 
-fn parse(raw: &[u8]) -> Result<Option<GenerateContentResponse>, ChannelError> {
+fn parse(raw: &[u8]) -> Result<Option<Value>, ChannelError> {
     let text = std::str::from_utf8(raw)
         .map_err(|_| ChannelError::Decode("Gemini SSE frame is not UTF-8".into()))?;
     let data = text

@@ -1,3 +1,4 @@
+mod failure;
 mod framing;
 
 use bytes::Bytes;
@@ -12,6 +13,9 @@ pub struct ResponseStream {
     decoder: FrameDecoder,
     converter: Box<dyn Converter>,
     encoder: FrameEncoder,
+    source: OperationKey,
+    failed: bool,
+    translate_errors: bool,
 }
 
 pub(crate) trait Converter: Send {
@@ -44,6 +48,9 @@ impl ResponseStream {
             decoder: FrameDecoder::new(target_framing)?,
             converter,
             encoder: FrameEncoder::new(source_framing)?,
+            source,
+            failed: false,
+            translate_errors: source.kind() != target.kind(),
         })
     }
 
@@ -55,7 +62,11 @@ impl ResponseStream {
     pub fn finish(&mut self) -> Result<Vec<Bytes>, TransformError> {
         let frames = self.decoder.finish()?;
         let mut output = self.convert(frames)?;
-        let terminal = self.converter.finish()?;
+        let terminal = if self.failed {
+            Vec::new()
+        } else {
+            self.converter.finish()?
+        };
         output.extend(self.encoder.push(terminal)?);
         output.extend(self.encoder.finish()?);
         Ok(output)
@@ -64,7 +75,17 @@ impl ResponseStream {
     fn convert(&mut self, frames: Vec<SseFrame>) -> Result<Vec<Bytes>, TransformError> {
         let mut output = Vec::new();
         for frame in frames {
-            output.extend(self.encoder.push(self.converter.frame(frame)?)?);
+            if self.failed {
+                continue;
+            }
+            if self.translate_errors
+                && let Some(error) = failure::frame(self.source.kind(), &frame)?
+            {
+                self.failed = true;
+                output.extend(self.encoder.push(vec![error])?);
+            } else {
+                output.extend(self.encoder.push(self.converter.frame(frame)?)?);
+            }
         }
         Ok(output)
     }

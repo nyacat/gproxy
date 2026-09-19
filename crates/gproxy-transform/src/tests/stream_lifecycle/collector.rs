@@ -41,7 +41,12 @@ fn empty_claude_streams_preserve_refusal_and_distinguish_incomplete_streams() {
             Err(TransformError::IncompleteStream)
         ));
         let mut failed = ResponseCollector::new(Kind::ClaudeMessages).unwrap();
-        assert!(failed.push(Bytes::from_static(b"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n")).is_err());
+        failed.push(Bytes::from_static(b"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n")).unwrap();
+        assert!(failed.is_complete());
+        let body: serde_json::Value =
+            serde_json::from_slice(&failed.finish().unwrap().into_bytes().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert_eq!(body["error"]["message"], "busy");
     }
 }
 

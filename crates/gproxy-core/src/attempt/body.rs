@@ -6,6 +6,7 @@ use gproxy_protocol::ContentGenerationKind;
 use crate::boundary::ByteStream;
 
 pub(crate) struct BodyFailure {
+    pub upstream_failure: Option<gproxy_channel_api::UpstreamFailure>,
     pub status: http::StatusCode,
     pub headers: http::HeaderMap,
     pub body: Bytes,
@@ -13,10 +14,12 @@ pub(crate) struct BodyFailure {
 }
 
 pub(crate) struct CollectedStream {
+    pub upstream_failure: Option<gproxy_channel_api::UpstreamFailure>,
     pub response: http::Response<Bytes>,
     pub usage: Option<NormalizedUsage>,
     pub actual_service_tier: Option<String>,
     pub capture_body: Bytes,
+    pub terminal_disposition: Option<gproxy_channel_api::Disposition>,
 }
 
 pub(crate) async fn collect(
@@ -29,6 +32,7 @@ pub(crate) async fn collect(
             Ok(chunk) => body.extend_from_slice(&chunk),
             Err(error) => {
                 return Err(Box::new(BodyFailure {
+                    upstream_failure: None,
                     status: parts.status,
                     headers: parts.headers,
                     body: body.freeze(),
@@ -51,6 +55,7 @@ pub(crate) async fn collect_stream(
         Ok(collector) => collector,
         Err(error) => {
             return Err(Box::new(BodyFailure {
+                upstream_failure: decoder.as_ref().and_then(|d| d.terminal_failure()).cloned(),
                 status: parts.status,
                 headers: parts.headers,
                 body: Bytes::new(),
@@ -63,6 +68,7 @@ pub(crate) async fn collect_stream(
             Ok(chunk) => chunk,
             Err(error) => {
                 return Err(Box::new(BodyFailure {
+                    upstream_failure: decoder.as_ref().and_then(|d| d.terminal_failure()).cloned(),
                     status: parts.status,
                     headers: parts.headers,
                     body: capture.freeze(),
@@ -79,6 +85,7 @@ pub(crate) async fn collect_stream(
             Ok(frames) => frames,
             Err(error) => {
                 return Err(Box::new(BodyFailure {
+                    upstream_failure: decoder.as_ref().and_then(|d| d.terminal_failure()).cloned(),
                     status: parts.status,
                     headers: parts.headers,
                     body: capture.freeze(),
@@ -89,6 +96,7 @@ pub(crate) async fn collect_stream(
         for frame in frames {
             if let Err(error) = collector.push(frame.0) {
                 return Err(Box::new(BodyFailure {
+                    upstream_failure: decoder.as_ref().and_then(|d| d.terminal_failure()).cloned(),
                     status: parts.status,
                     headers: parts.headers,
                     body: capture.freeze(),
@@ -107,6 +115,7 @@ pub(crate) async fn collect_stream(
         Ok(tail) => tail,
         Err(error) => {
             return Err(Box::new(BodyFailure {
+                upstream_failure: decoder.as_ref().and_then(|d| d.terminal_failure()).cloned(),
                 status: parts.status,
                 headers: parts.headers,
                 body: capture.freeze(),
@@ -117,6 +126,7 @@ pub(crate) async fn collect_stream(
     for frame in tail.frames {
         if let Err(error) = collector.push(frame.0) {
             return Err(Box::new(BodyFailure {
+                upstream_failure: decoder.as_ref().and_then(|d| d.terminal_failure()).cloned(),
                 status: parts.status,
                 headers: parts.headers,
                 body: capture.freeze(),
@@ -131,6 +141,7 @@ pub(crate) async fn collect_stream(
         Ok(body) => body,
         Err(error) => {
             return Err(Box::new(BodyFailure {
+                upstream_failure: decoder.as_ref().and_then(|d| d.terminal_failure()).cloned(),
                 status: parts.status,
                 headers: parts.headers,
                 body: capture.freeze(),
@@ -144,9 +155,13 @@ pub(crate) async fn collect_stream(
         http::HeaderValue::from_static("application/json"),
     );
     Ok(CollectedStream {
+        upstream_failure: decoder.as_ref().and_then(|d| d.terminal_failure()).cloned(),
         response: http::Response::from_parts(parts, body),
         usage: tail.usage,
         actual_service_tier: tail.actual_service_tier,
         capture_body: capture.freeze(),
+        terminal_disposition: decoder
+            .as_ref()
+            .and_then(|decoder| decoder.terminal_disposition()),
     })
 }

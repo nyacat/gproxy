@@ -114,6 +114,12 @@ impl Lifecycle {
                 output.push(event);
                 return Ok(output);
             }
+            Known::Error(_) => {
+                // An explicit error followed by EOF is a failed response,
+                // not a truncated successful response. Preserve the error
+                // frame without manufacturing a response.completed event.
+                self.terminal = true;
+            }
             Known::ResponseCreated(_)
             | Known::ResponseInProgress(_)
             | Known::ResponseQueued(_)
@@ -159,8 +165,7 @@ impl Lifecycle {
             | Known::ResponseInjectFailed(_)
             | Known::ResponseSteerAccepted(_)
             | Known::ResponseSteerPending(_)
-            | Known::ResponseSteerFailed(_)
-            | Known::Error(_) => {}
+            | Known::ResponseSteerFailed(_) => {}
         }
         Ok(vec![event])
     }

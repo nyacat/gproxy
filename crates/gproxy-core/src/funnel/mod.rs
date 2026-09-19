@@ -1,3 +1,4 @@
+pub(crate) mod diagnostic;
 use web_time::Instant;
 
 use bytes::Bytes;
@@ -14,6 +15,7 @@ pub(crate) mod error;
 pub(crate) mod health;
 mod session;
 pub(crate) use session::realtime;
+pub(crate) mod inline;
 mod settlement;
 mod socket;
 mod stream;
@@ -25,8 +27,24 @@ use self::stream::FunnelStream;
 #[derive(Debug)]
 pub(crate) struct Settled(());
 
+pub(crate) async fn cancel_outcome(outcome: ExecOutcome) {
+    use futures_util::StreamExt;
+
+    match (outcome.body, outcome.stream_cancellation) {
+        (ResponseBody::Stream(mut stream), Some(cancellation)) => {
+            cancellation.cancel();
+            while stream.next().await.is_some() {}
+        }
+        (ResponseBody::WebSocket(mut socket), _) => {
+            let _ = socket.send(gproxy_channel_api::WsFrame::Close(None)).await;
+        }
+        _ => {}
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct FunnelCtx {
+    pub activity: Option<crate::host::CredentialUsageLease>,
     pub upstream_started_at_ms: Option<i64>,
     pub request_id: String,
     pub target: Target,
@@ -138,6 +156,21 @@ pub(crate) async fn buffered<H: Host>(
     let upstream_headers = parts.headers;
     let (status, headers, outward, disposition) = if outward_ready {
         (upstream_status, upstream_headers, body.clone(), disposition)
+    } else if let Some(failure) = channel
+        .response_failure(gproxy_channel_api::ResponseView {
+            status: upstream_status,
+            headers: &upstream_headers,
+            body: &body,
+        })
+        .filter(|failure| failure.error_envelope)
+    {
+        let outward = match (ctx.source_key, ctx.key) {
+            (Some(source), Some(target)) if source.kind() != target.kind() => {
+                diagnostic::error_body(source.kind(), &body, &failure)
+            }
+            _ => body.clone(),
+        };
+        (upstream_status, upstream_headers, outward, disposition)
     } else {
         let shaped = ctx.key.map_or_else(
             || Ok(body.clone()),
@@ -171,6 +204,7 @@ pub(crate) async fn buffered<H: Host>(
         status: Some(upstream_status),
         response_body: Some(capture_body.unwrap_or_else(|| body.clone())),
         estimated_output_chars: None,
+        terminal_disposition: None,
         record_usage,
         usage,
         actual_service_tier,
@@ -187,6 +221,7 @@ pub(crate) async fn buffered<H: Host>(
         headers,
         body,
         disposition,
+        stream_cancellation: None,
         _settled: Settled(()),
     }
 }
@@ -284,11 +319,13 @@ pub(crate) async fn streaming<H: Host>(
     parts.headers = outward_headers(&ctx, parts.headers);
     let permit = reserve_settlement(&host).await;
     let body = FunnelStream::new(body, decoder, host, ctx, parts.status, permit);
+    let stream_cancellation = body.cancellation();
     ExecOutcome {
         status: parts.status,
         headers: parts.headers,
         body: ResponseBody::Stream(Box::pin(body)),
         disposition,
+        stream_cancellation,
         _settled: Settled(()),
     }
 }
@@ -308,6 +345,7 @@ pub(crate) async fn free_buffered<H: Host>(
             status: Some(status),
             response_body: Some(body.clone()),
             estimated_output_chars: None,
+            terminal_disposition: None,
             record_usage: false,
             usage: None,
             actual_service_tier: None,
@@ -323,6 +361,7 @@ pub(crate) async fn free_buffered<H: Host>(
         headers,
         body: ResponseBody::Full(body),
         disposition,
+        stream_cancellation: None,
         _settled: Settled(()),
     }
 }
@@ -342,6 +381,7 @@ pub(crate) async fn free_uncaptured_buffered<H: Host>(
             status: Some(status),
             response_body: None,
             estimated_output_chars: None,
+            terminal_disposition: None,
             record_usage: false,
             usage: None,
             actual_service_tier: None,
@@ -356,6 +396,7 @@ pub(crate) async fn free_uncaptured_buffered<H: Host>(
         headers: outward_headers(&ctx, headers),
         body: ResponseBody::Full(body),
         disposition,
+        stream_cancellation: None,
         _settled: Settled(()),
     }
 }
@@ -375,6 +416,7 @@ pub(crate) async fn local_buffered<H: Host>(
             status: Some(status),
             response_body: Some(body.clone()),
             estimated_output_chars: None,
+            terminal_disposition: None,
             record_usage: false,
             usage: Some(NormalizedUsage::default()),
             actual_service_tier: None,
@@ -389,6 +431,7 @@ pub(crate) async fn local_buffered<H: Host>(
         headers,
         body: ResponseBody::Full(body),
         disposition,
+        stream_cancellation: None,
         _settled: Settled(()),
     }
 }
@@ -401,14 +444,29 @@ pub(crate) async fn free_streaming<H: Host>(
     body: crate::boundary::ByteStream,
     disposition: Disposition,
 ) -> ExecOutcome {
+    free_streaming_with_completions(host, ctx, status, headers, body, disposition, Vec::new()).await
+}
+
+pub(crate) async fn free_streaming_with_completions<H: Host>(
+    host: Shared<H>,
+    ctx: FunnelCtx,
+    status: http::StatusCode,
+    headers: http::HeaderMap,
+    body: crate::boundary::ByteStream,
+    disposition: Disposition,
+    completions: Vec<inline::InlineCompletion>,
+) -> ExecOutcome {
     let headers = outward_headers(&ctx, headers);
     let permit = reserve_settlement(&host).await;
     let body = FunnelStream::new(body, None, host, ctx, status, permit);
+    let body = body.with_inline_completions(completions);
+    let stream_cancellation = body.cancellation();
     ExecOutcome {
         status,
         headers,
         body: ResponseBody::Stream(Box::pin(body)),
         disposition,
+        stream_cancellation,
         _settled: Settled(()),
     }
 }
@@ -460,6 +518,7 @@ pub(crate) async fn interrupted<H: Host>(
             status: Some(status),
             response_body: Some(body),
             estimated_output_chars: None,
+            terminal_disposition: None,
             record_usage,
             usage,
             actual_service_tier,
@@ -471,15 +530,27 @@ pub(crate) async fn interrupted<H: Host>(
     .await;
 }
 
+#[derive(Default)]
+pub(crate) struct StreamDetails {
+    pub usage: Option<NormalizedUsage>,
+    pub actual_service_tier: Option<String>,
+    pub estimated_output_chars: Option<crate::usage::OutputEstimate>,
+    pub terminal_disposition: Option<gproxy_channel_api::Disposition>,
+}
+
 pub(crate) async fn complete_stream<H: Host>(
     host: Shared<H>,
     ctx: FunnelCtx,
     status: http::StatusCode,
-    usage: Option<NormalizedUsage>,
-    actual_service_tier: Option<String>,
-    estimated_output_chars: Option<u64>,
+    details: StreamDetails,
     ended: Ended,
 ) {
+    let StreamDetails {
+        usage,
+        actual_service_tier,
+        estimated_output_chars,
+        terminal_disposition,
+    } = details;
     let record_usage = matches!(ctx.settle, SettleMode::OnResponse);
     settlement::complete(
         host.as_ref(),
@@ -488,6 +559,7 @@ pub(crate) async fn complete_stream<H: Host>(
             status: Some(status),
             response_body: None,
             estimated_output_chars,
+            terminal_disposition,
             record_usage,
             usage,
             actual_service_tier,

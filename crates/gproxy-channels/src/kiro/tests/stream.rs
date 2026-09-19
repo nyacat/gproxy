@@ -139,7 +139,69 @@ fn maps_responses_request_and_fragmented_smithy_stream_without_false_terminal() 
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find(|value| value.get("type").and_then(Value::as_str) == Some("error"))
         .expect("error event");
-    assert_eq!(error["code"], "kiro_eventstream_error");
+    assert_eq!(error["code"], "invalidStateEvent");
     assert!(error.get("error").is_none());
-    assert!(failed.finish(StreamEnd::Complete).is_err());
+    assert!(failed.finish(StreamEnd::Complete).is_ok());
+    assert_eq!(
+        failed.terminal_disposition(),
+        Some(gproxy_channel_api::Disposition::Terminal)
+    );
+}
+
+#[test]
+fn valid_kiro_prefix_survives_later_crc_or_json_errors() {
+    let key = OperationKey::content(
+        Operation::StreamGenerateContent,
+        ContentGenerationKind::OpenAiResponses,
+    );
+    let prepared = prepare(
+        key,
+        "claude-sonnet-4-6",
+        &Bytes::from_static(br#"{"input":"hello"}"#),
+        &json!({"access_token":"access"}),
+        &json!({}),
+    );
+    let decoder = || {
+        KiroChannel
+            .stream_decoder(StreamCtx {
+                key,
+                framing: StreamFraming::Sse,
+                request_body: prepared.request.body(),
+                response_headers: &http::HeaderMap::new(),
+            })
+            .unwrap()
+    };
+    let valid = event("assistantResponseEvent", br#"{"content":"visible"}"#);
+    let mut corrupt = event("metadataEvent", br#"{}"#).to_vec();
+    *corrupt.last_mut().unwrap() ^= 1;
+    let expected = decoder()
+        .push(valid.clone())
+        .unwrap()
+        .into_iter()
+        .map(|frame| frame.0)
+        .collect::<Vec<_>>();
+    assert!(!expected.is_empty());
+    for invalid in [Bytes::from(corrupt), event("assistantResponseEvent", b"{")] {
+        let wire = [valid.as_ref(), invalid.as_ref()].concat();
+        for split in 0..=wire.len() {
+            let mut decoder = decoder();
+            let mut delivered = Vec::new();
+            let mut failed = false;
+            for chunk in [&wire[..split], &wire[split..]] {
+                let frames = match decoder.push(Bytes::copy_from_slice(chunk)) {
+                    Ok(frames) => frames,
+                    Err(error) => {
+                        failed = true;
+                        error.frames
+                    }
+                };
+                delivered.extend(frames.into_iter().map(|frame| frame.0));
+                if failed {
+                    break;
+                }
+            }
+            assert!(failed, "split={split}");
+            assert_eq!(delivered, expected, "split={split}");
+        }
+    }
 }

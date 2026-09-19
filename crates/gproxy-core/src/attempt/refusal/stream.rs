@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::boundary::ByteStream;
 use crate::error::CoreError;
-use crate::host::Host;
+use crate::host::{CaptureSink, Host};
 
 use super::{retry::Runner, stream_events::Events};
 
@@ -19,9 +19,11 @@ struct State<H: Host> {
     events: Events,
     raw: Vec<Bytes>,
     raw_len: usize,
+    capture_body: bool,
     pending: VecDeque<Bytes>,
     completion: Option<(Value, bool)>,
     done: bool,
+    terminal_error: Option<CoreError>,
 }
 
 pub(super) fn wrap<H: Host>(
@@ -36,9 +38,11 @@ pub(super) fn wrap<H: Host>(
         events: Events::new(),
         raw: Vec::new(),
         raw_len: 0,
+        capture_body: false,
         pending: VecDeque::new(),
         completion: None,
         done: false,
+        terminal_error: None,
     };
     state.start();
     let body = futures_util::stream::unfold(state, |mut state| async move {
@@ -61,6 +65,7 @@ pub(super) fn wrap<H: Host>(
 
 impl<H: Host> State<H> {
     fn start(&mut self) {
+        self.capture_body = self.runner.core.host.capture().captures_response_body();
         let channel = self
             .runner
             .core
@@ -85,6 +90,9 @@ impl<H: Host> State<H> {
             if let Some(frame) = self.pending.pop_front() {
                 return Ok(Some(frame));
             }
+            if let Some(error) = self.terminal_error.take() {
+                return Err(error);
+            }
             if self.done {
                 return Ok(None);
             }
@@ -100,18 +108,22 @@ impl<H: Host> State<H> {
                             "fallback response history exceeds 100 MiB".into(),
                         ));
                     }
-                    self.raw.push(chunk.clone());
-                    for frame in self.runner.meter.push(chunk)? {
-                        self.pending.extend(self.events.push(frame.0)?);
+                    if self.capture_body {
+                        self.raw.push(chunk.clone());
                     }
+                    self.accept_frames(self.runner.meter.push(chunk))?;
                 }
                 Some(Err(error)) => {
-                    self.runner.meter.finish(StreamEnd::Interrupted, false)?;
+                    self.runner
+                        .meter
+                        .finish(StreamEnd::Interrupted, false)
+                        .map_err(|error| error.error)?;
                     return Err(error.into());
                 }
                 None => {
-                    for frame in self.runner.meter.finish(StreamEnd::Complete, false)? {
-                        self.pending.extend(self.events.push(frame.0)?);
+                    self.accept_frames(self.runner.meter.finish(StreamEnd::Complete, false))?;
+                    if self.done {
+                        continue;
                     }
                     let (frames, body, open_tool) = self.events.end()?;
                     self.pending.extend(frames);
@@ -121,13 +133,32 @@ impl<H: Host> State<H> {
         }
     }
 
+    fn accept_frames(
+        &mut self,
+        result: Result<Vec<gproxy_channel_api::Frame>, gproxy_channel_api::StreamDecodeError>,
+    ) -> Result<(), CoreError> {
+        let frames = match result {
+            Ok(frames) => frames,
+            Err(error) => {
+                self.terminal_error = Some(error.error.into());
+                self.done = true;
+                error.frames
+            }
+        };
+        for frame in frames {
+            self.pending.extend(self.events.push(frame.0)?);
+        }
+        Ok(())
+    }
+
     async fn complete(&mut self, mut body: Value, open_tool: bool) -> Result<(), CoreError> {
-        let capture = Bytes::from(
-            self.raw
-                .iter()
-                .flat_map(|chunk| chunk.iter().copied())
-                .collect::<Vec<_>>(),
-        );
+        let capture = self.capture_body.then(|| {
+            let mut body = Vec::with_capacity(self.raw_len);
+            for chunk in self.raw.drain(..) {
+                body.extend_from_slice(&chunk);
+            }
+            Bytes::from(body)
+        });
         self.runner
             .capture(http::StatusCode::OK, &self.headers, capture)
             .await;
@@ -152,7 +183,7 @@ impl<H: Host> State<H> {
                 .await
                 .map_err(|error| CoreError::Transport(error.error))?;
             self.runner
-                .capture(next.status(), next.headers(), next.body().clone())
+                .capture(next.status(), next.headers(), Some(next.body().clone()))
                 .await;
             if matches!(next.status().as_u16(), 429 | 503) {
                 super::buffered::recommended(&mut body, &self.runner.facts.target.upstream_model);

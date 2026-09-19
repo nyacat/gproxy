@@ -1,4 +1,5 @@
 mod routes;
+mod stream_health;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -141,6 +142,9 @@ fn codex_forced_stream_collects_or_relays_and_settles_terminal_usage() -> Result
             r#"{{"model":"alias","stream":{stream},"input":"hi","future_request":true}}"#
         ));
         let outcome = block_on(core.execute(&host, request)).expect("Codex response");
+        if stream {
+            assert!(host.state.lock().unwrap().health.is_empty());
+        }
         match outcome.body {
             ResponseBody::Full(body) => {
                 let body: serde_json::Value =
@@ -164,6 +168,8 @@ fn codex_forced_stream_collects_or_relays_and_settles_terminal_usage() -> Result
         assert_eq!(state.settlements.len(), 1);
         assert_eq!(state.settlements[0].usage.input_tokens, 10);
         assert_eq!(state.settlements[0].usage.output_tokens, 5);
+        assert_eq!(state.health.len(), 1);
+        assert_eq!(state.health[0].2, crate::CredentialHealth::Healthy);
         assert_eq!(
             state.settlements[0].usage.metrics["reasoning_tokens"],
             rust_decimal::Decimal::from(2)
@@ -174,6 +180,138 @@ fn codex_forced_stream_collects_or_relays_and_settles_terminal_usage() -> Result
             assert!(state.captures[0].body.as_ref().is_some_and(|body| {
                 String::from_utf8_lossy(body).contains("event: response.completed")
             }));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn codex_terminal_failures_do_not_restore_health_or_replay_a_committed_response()
+-> Result<(), InitError> {
+    for (event_type, stream, rules, transformed) in [
+        ("response.failed", false, false, false),
+        ("response.failed", true, false, false),
+        ("error", true, false, false),
+        ("response.failed", true, true, false),
+        ("response.failed", true, false, true),
+        ("error", true, true, true),
+        ("response.failed", false, true, false),
+    ] {
+        for (code, health_update) in [
+            ("server_error", true),
+            ("rate_limit_exceeded", true),
+            ("vector_store_timeout", true),
+            ("data_residency_mismatch", false),
+            ("invalid_prompt", false),
+            ("invalid_image", false),
+            ("misalignment_policy_violation", false),
+            ("future_error", true),
+        ] {
+            let host = MemoryHost::new(false);
+            let mut selected = codex_target();
+            if rules {
+                selected.rules.process = crate::process::compile_all(&[crate::process::RuleSpec {
+                    id: 1,
+                    kind: "transform".into(),
+                    config: json!({"phase": "response", "locate": {"path": "model"},
+                        "actions": [{"op": "replace_text", "with": "rewritten"}]}),
+                    filter_model_pattern: None,
+                    filter_operations: None,
+                    filter_header_pattern: None,
+                    sort_order: 0,
+                    enabled: true,
+                }])
+                .unwrap()
+                .into();
+            }
+            let prior = (
+                selected.credential,
+                selected.upstream_model.clone(),
+                crate::CredentialHealth::Degraded,
+            );
+            {
+                let mut state = host.state.lock().unwrap();
+                state.credential.channel = "codex".into();
+                state.credential.secret["expires_at"] = json!(i64::MAX);
+                state.plan = Some(Plan {
+                    targets: vec![selected.clone(), selected],
+                    budget: FailoverBudget { max_attempts: 2 },
+                });
+                state.health.push(prior.clone());
+                let event = if event_type == "error" {
+                    json!({"type": "error", "code": code, "message": "upstream rejected this request", "param": null})
+                } else {
+                    json!({
+                        "type": "response.failed", "response": {
+                            "id": "failed", "object": "response", "created_at": 1,
+                            "status": "failed", "model": "upstream-model", "output": [],
+                            "error": {"code": code, "message": "upstream rejected this request"}
+                        }
+                    })
+                };
+                state.scripted.push_back((
+                    http::StatusCode::OK,
+                    vec![Bytes::from(format!("data: {}\n\n", event))],
+                ));
+            }
+            let core = codex_core(&host)?;
+            let mut input = request(stream, "terminal-failure");
+            input.body = Bytes::from(if transformed {
+                input.path = "/v1/chat/completions".into();
+                json!({"model": "alias", "messages": [{"role": "user", "content": "hello"}], "stream": stream})
+            } else {
+                json!({"model": "alias", "input": "hello", "stream": stream})
+            }.to_string());
+            let outcome = block_on(core.execute(&host, input)).unwrap();
+            match outcome.body {
+                ResponseBody::Full(body) => {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["status"],
+                        if !stream && health_update {
+                            "completed"
+                        } else {
+                            "failed"
+                        },
+                        "code={code} stream={stream} rules={rules} transformed={transformed} body={}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+                ResponseBody::Stream(mut body) => {
+                    assert_eq!(host.state.lock().unwrap().health, [prior]);
+                    let mut output = Vec::new();
+                    block_on(async {
+                        while let Some(frame) = body.next().await {
+                            output.extend_from_slice(&frame.unwrap());
+                        }
+                    });
+                    assert!(String::from_utf8(output).unwrap().contains(if transformed {
+                        "upstream rejected this request"
+                    } else {
+                        event_type
+                    }));
+                }
+                ResponseBody::WebSocket(_) => panic!("HTTP response"),
+            }
+            let state = host.state.lock().unwrap();
+            let retried = !stream && health_update;
+            assert_eq!(state.upstream_requests.len(), if retried { 2 } else { 1 });
+            assert_eq!(
+                state.health.len(),
+                1 + usize::from(health_update) + usize::from(retried),
+                "{code}, stream={stream}"
+            );
+            assert!(state.health.iter().enumerate().all(|(i, entry)| entry.2
+                == if retried && i == 2 {
+                    crate::CredentialHealth::Healthy
+                } else {
+                    crate::CredentialHealth::Degraded
+                }));
+            assert_eq!(state.settlements.len(), 1);
+            assert_eq!(
+                state.settlements[0].ended,
+                crate::Ended::Complete,
+                "a valid error event is still a complete stream"
+            );
         }
     }
     Ok(())

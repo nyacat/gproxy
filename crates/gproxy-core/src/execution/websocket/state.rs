@@ -13,11 +13,20 @@ pub(super) struct ActiveResponse {
     pub(super) terminal: Option<Ended>,
     pub(super) responses: Vec<Bytes>,
     pub(super) output_chars: u64,
+    pub(super) failure: gproxy_channel_api::FailureState,
 }
 
 impl ActiveResponse {
     pub(super) fn new(facts: crate::funnel::FunnelCtx) -> Self {
+        let failure = gproxy_channel_api::FailureState::new(
+            "responses_websocket",
+            facts
+                .response_headers
+                .as_ref()
+                .unwrap_or(&http::HeaderMap::new()),
+        );
         Self {
+            failure,
             facts,
             response_id: None,
             pending_injections: 0,

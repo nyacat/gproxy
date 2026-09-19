@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::{ChannelError, Frame, PreparedRequest, StreamEnd};
+use crate::{ChannelError, Frame, PreparedRequest, StreamDecodeError, StreamEnd};
 
 pub struct StepResponse {
     pub status: http::StatusCode,
@@ -71,6 +71,12 @@ pub struct Pause {
 }
 
 pub trait OperationStream: Send {
-    fn push(&mut self, chunk: Bytes) -> Result<StreamOutput, ChannelError>;
-    fn finish(&mut self, end: StreamEnd) -> Result<Vec<Frame>, ChannelError>;
+    fn terminal_failure(&self) -> Option<&crate::UpstreamFailure> {
+        None
+    }
+
+    /// Preserve completed output when a later event in the same chunk fails,
+    /// with the same ownership rules as [`crate::StreamDecoder`].
+    fn push(&mut self, chunk: Bytes) -> Result<StreamOutput, StreamDecodeError>;
+    fn finish(&mut self, end: StreamEnd) -> Result<Vec<Frame>, StreamDecodeError>;
 }
