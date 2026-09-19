@@ -29,7 +29,7 @@ pub(super) fn probe_request(
     http::Request::get(uri)
         .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
         .header(http::header::ACCEPT, "application/json, text/plain, */*")
-        .header(http::header::USER_AGENT, super::auth::CLI_USER_AGENT)
+        .header(http::header::USER_AGENT, super::auth::fallback_user_agent())
         .header("anthropic-beta", super::auth::OAUTH_BETA)
         .body(Bytes::new())
         .map(Some)

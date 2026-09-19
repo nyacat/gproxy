@@ -16,6 +16,7 @@ mod channel_descriptor;
 mod channel_error;
 pub mod disposition;
 pub mod endpoint;
+pub mod failure;
 mod fallback;
 pub use fallback::{ClaudeFallbackCapabilities, claude_fallback_setting, has_fallback_credit};
 pub mod login;
@@ -37,11 +38,13 @@ pub mod wire;
 pub use channel::{
     Channel, ChannelDescriptor, ChannelError, ChannelField, ChannelFieldControl,
     ChannelRouteAction, ChannelSupport, ChannelTrafficPolicy, Frame, PrepareCtx, PreparedRequest,
-    ResponseShapeCtx, ResponseView, SimpleHttp, StreamCtx, StreamDecoder, StreamEnd, StreamTail,
-    UsageCtx, default_route, executable_routes,
+    ResponseShapeCtx, ResponseView, SimpleHttp, StreamCtx, StreamDecodeDiagnostic,
+    StreamDecodeError, StreamDecoder, StreamEnd, StreamTail, UsageCtx, default_route,
+    executable_routes,
 };
 pub use disposition::Disposition;
 pub use endpoint::endpoint_override_key;
+pub use failure::{FailureState, UpstreamFailure};
 pub use login::{
     AuthCodeExchangeCtx, AuthCodeStart, AuthCodeStartCtx, ChannelLogin, ChannelLoginRef,
     CookieExchangeCtx, CredentialAcquisition, CredentialKind, DeviceInit, DevicePoll,
@@ -72,9 +75,9 @@ pub use usage::{
     QuotaResetOutcome, QuotaResetResult, QuotaSample, QuotaSampleSource, QuotaScope, UsageAttempt,
 };
 pub use wire::{
-    Alpn, ByteStream, ClientProfile, ClientProfilePreset, CredentialId, Http2Profile, Http2Setting,
-    MaybeSend, MaybeSync, PseudoHeader, RequiredClientProfile, TlsVersion, TransportError,
-    WsDuplex, WsFrame,
+    Alpn, ByteStream, ClientFingerprint, ClientProfile, ClientProfilePreset, CredentialId,
+    Http2Profile, Http2Setting, MaybeSend, MaybeSync, PseudoHeader, RequiredClientProfile,
+    TlsVersion, TransportError, WsDuplex, WsFrame,
 };
 
 /// Boxed future with the wasm `Send` split — the one language-level tax

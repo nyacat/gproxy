@@ -29,15 +29,37 @@ fn model_discovery_uses_upstream_cli_identity() {
 
     assert_eq!(
         prepared.request.uri(),
-        "https://chatgpt.com/backend-api/codex/models?client_version=0.153.2"
+        "https://chatgpt.com/backend-api/codex/models?client_version=0.154.0"
     );
-    assert_eq!(prepared.request.headers()["version"], "0.153.2");
-    assert!(
-        prepared.request.headers()[http::header::USER_AGENT]
-            .to_str()
-            .unwrap()
-            .starts_with("codex_cli_rs/0.153.2 ")
+    assert_eq!(prepared.request.headers()["version"], "0.154.0");
+    assert_eq!(
+        prepared.request.headers()[http::header::USER_AGENT],
+        "codex_cli_rs/0.154.0 (Debian 13.0.0; x86_64) xterm-256color"
     );
+    let defaults = super::super::CodexChannel.client_fingerprint().unwrap();
+    assert_eq!(prepared.profile, Some(defaults.profile));
+    for (name, value) in &defaults.headers {
+        assert_eq!(prepared.request.headers()[name], *value, "{name}");
+    }
+}
+
+#[test]
+fn default_fingerprint_keeps_caller_client_identity() {
+    let mut headers = HeaderMap::new();
+    for (name, value) in [
+        ("user-agent", "my-codex-client/1.0"),
+        ("originator", "my-codex-client"),
+        ("version", "0.153.2"),
+        ("x-client-request-id", "caller-request"),
+    ] {
+        headers.insert(name, value.parse().unwrap());
+    }
+    let original = headers.clone();
+    super::super::auth::apply_headers(&mut headers, &json!({"access_token":"token"}), "session")
+        .unwrap();
+    for (name, value) in &original {
+        assert_eq!(headers[name], *value, "{name}");
+    }
 }
 
 #[test]

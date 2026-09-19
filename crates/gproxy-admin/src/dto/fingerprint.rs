@@ -3,6 +3,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+mod profile;
+pub use profile::client_fingerprint_dto;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum FingerprintHeadersDto {

@@ -7,15 +7,34 @@ use sha2::{Digest, Sha256};
 pub(super) const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub(super) const ORIGINATOR: &str = "codex_cli_rs";
 // Catalog compatibility is keyed by Codex identity, not by gproxy's release version.
-pub(super) const CODEX_CLI_VERSION: &str = "0.153.2";
-const GPROXY_VERSION: &str = env!("CARGO_PKG_VERSION");
+// Release baseline: https://developers.openai.com/codex/changelog/ (2026-09-11).
+pub(super) const CODEX_CLI_VERSION: &str = "0.154.0";
+// Keep the existing preset's simulated desktop environment in Codex's UA format.
+const CLI_ENVIRONMENT: &str = "(Debian 13.0.0; x86_64) xterm-256color";
 
 pub(super) const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub(super) use gproxy_channel_api::CODEX_OAUTH_CLIENT_ID as CLIENT_ID;
 const EXPIRY_SKEW_SECONDS: i64 = 5 * 60;
 
 pub(super) fn fallback_user_agent() -> String {
-    format!("{ORIGINATOR}/{CODEX_CLI_VERSION} (gproxy; {GPROXY_VERSION})")
+    format!("{ORIGINATOR}/{CODEX_CLI_VERSION} {CLI_ENVIRONMENT}")
+}
+
+pub(super) fn fingerprint_headers() -> http::HeaderMap {
+    http::HeaderMap::from_iter([
+        (
+            http::header::USER_AGENT,
+            HeaderValue::from_str(&fallback_user_agent()).expect("built-in user-agent is valid"),
+        ),
+        (
+            HeaderName::from_static("originator"),
+            HeaderValue::from_static(ORIGINATOR),
+        ),
+        (
+            HeaderName::from_static("version"),
+            HeaderValue::from_static(CODEX_CLI_VERSION),
+        ),
+    ])
 }
 
 pub(super) fn access_token(secret: &Value) -> Result<&str, ChannelError> {
@@ -117,20 +136,8 @@ pub(super) fn apply_headers(
         AUTHORIZATION,
         &format!("Bearer {}", access_token(secret)?),
     )?;
-    if !headers.contains_key(http::header::USER_AGENT) {
-        insert(headers, http::header::USER_AGENT, &fallback_user_agent())?;
-    }
-    if !headers.contains_key("originator") {
-        headers.insert(
-            HeaderName::from_static("originator"),
-            HeaderValue::from_static(ORIGINATOR),
-        );
-    }
-    if !headers.contains_key("version") {
-        headers.insert(
-            HeaderName::from_static("version"),
-            HeaderValue::from_static(CODEX_CLI_VERSION),
-        );
+    for (name, value) in &fingerprint_headers() {
+        headers.entry(name).or_insert_with(|| value.clone());
     }
     insert(headers, HeaderName::from_static("session-id"), session_id)?;
     if !headers.contains_key("x-client-request-id") {

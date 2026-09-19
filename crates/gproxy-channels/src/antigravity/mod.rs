@@ -45,6 +45,18 @@ static LOGIN: LoginDescriptor = LoginDescriptor {
 };
 
 impl Channel for AntigravityChannel {
+    fn client_fingerprint(&self) -> Option<gproxy_channel_api::ClientFingerprint> {
+        Some(gproxy_channel_api::ClientFingerprint {
+            id: "antigravity",
+            label: "Antigravity",
+            headers: http::HeaderMap::from_iter([(
+                http::header::USER_AGENT,
+                http::HeaderValue::from_static(prepare::USER_AGENT_VALUE),
+            )]),
+            profile: &profile::PROFILE,
+        })
+    }
+
     fn login(&self) -> Option<ChannelLoginRef<'_>> {
         Some(ChannelLoginRef {
             adapter: self,

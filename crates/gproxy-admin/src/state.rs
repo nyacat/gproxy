@@ -99,6 +99,14 @@ pub trait State: MaybeSend + MaybeSync {
         force: bool,
     ) -> BoxFuture<'a, Result<QuotaProbeResponse, AdminError>>;
 
+    fn quota_probe_lightweight<'a>(
+        &'a self,
+        credential_id: i64,
+        force: bool,
+    ) -> BoxFuture<'a, Result<QuotaProbeResponse, AdminError>> {
+        self.quota_probe(credential_id, force)
+    }
+
     fn quota_reset<'a>(
         &'a self,
         credential_id: i64,
@@ -209,6 +217,10 @@ pub trait State: MaybeSend + MaybeSync {
     ) -> BoxFuture<'a, Result<gproxy_channel_api::CredentialAcquisition, AdminError>>;
 
     fn channel_catalogue(&self) -> Vec<ChannelDto>;
+
+    fn tls_presets(&self) -> Vec<crate::dto::TlsPresetDto> {
+        Vec::new()
+    }
 
     fn portal_models(&self, identity: &PortalIdentity) -> Vec<PortalModelDto>;
 

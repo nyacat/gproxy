@@ -40,6 +40,15 @@ static LOGIN: LoginDescriptor = LoginDescriptor {
 };
 
 impl Channel for ClaudeCodeChannel {
+    fn client_fingerprint(&self) -> Option<gproxy_channel_api::ClientFingerprint> {
+        Some(gproxy_channel_api::ClientFingerprint {
+            id: "claude",
+            label: "Claude Code",
+            headers: auth::fingerprint_headers(),
+            profile: &profile::CLIENT_PROFILE,
+        })
+    }
+
     fn routing_table(&self) -> &'static [ChannelSupport] {
         routes::ROUTES
     }

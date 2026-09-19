@@ -34,6 +34,18 @@ static LOGIN: LoginDescriptor = LoginDescriptor {
 };
 
 impl Channel for CopilotCliChannel {
+    fn client_fingerprint(&self) -> Option<gproxy_channel_api::ClientFingerprint> {
+        Some(gproxy_channel_api::ClientFingerprint {
+            id: "copilot",
+            label: "GitHub Copilot CLI",
+            headers: http::HeaderMap::from_iter([(
+                http::header::USER_AGENT,
+                http::HeaderValue::from_static(identity::CLI_USER_AGENT),
+            )]),
+            profile: &profile::CLIENT_PROFILE,
+        })
+    }
+
     fn login(&self) -> Option<ChannelLoginRef<'_>> {
         Some(ChannelLoginRef {
             adapter: self,

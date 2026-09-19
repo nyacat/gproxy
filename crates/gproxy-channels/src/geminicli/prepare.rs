@@ -133,7 +133,7 @@ pub(super) fn apply_headers(
     Ok(())
 }
 
-fn user_agent(model: &str) -> String {
+pub(super) fn user_agent(model: &str) -> String {
     let suffix = if model.trim().is_empty() {
         String::new()
     } else {

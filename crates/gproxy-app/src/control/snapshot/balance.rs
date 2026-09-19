@@ -95,7 +95,7 @@ pub(super) fn order(
     seeds
 }
 
-fn health_rank(seed: &TargetSeed, health: &CredentialHealthMap) -> u8 {
+pub(super) fn health_rank(seed: &TargetSeed, health: &CredentialHealthMap) -> u8 {
     ["*", seed.upstream_model.as_str()]
         .into_iter()
         .filter_map(|model| health.get(&seed.credential)?.get(model))

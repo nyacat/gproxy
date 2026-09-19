@@ -3,7 +3,7 @@ use http::header::{CONTENT_TYPE, HeaderName, HeaderValue, USER_AGENT};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const CLI_USER_AGENT: &str = "copilot/1.0.61 (linux v24.16.0) term/unknown";
+pub(super) const CLI_USER_AGENT: &str = "copilot/1.0.61 (linux v24.16.0) term/unknown";
 
 pub(super) fn apply(
     headers: &mut http::HeaderMap,

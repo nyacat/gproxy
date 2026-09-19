@@ -15,15 +15,19 @@ pub(crate) fn key_payload(api_key: &str) -> &str {
 }
 
 pub(crate) fn user_key_digest(version: u32, api_key: &str) -> Option<Vec<u8>> {
+    user_key_digest_bytes(version, api_key).map(|digest| digest.to_vec())
+}
+
+pub(crate) fn user_key_digest_bytes(version: u32, api_key: &str) -> Option<[u8; 32]> {
     match version {
-        1 => Some(Sha256::digest(key_payload(api_key).as_bytes()).to_vec()),
+        1 => Some(Sha256::digest(key_payload(api_key).as_bytes()).into()),
         _ => None,
     }
 }
 
-pub(crate) fn user_key_digests(api_key: &str) -> impl Iterator<Item = (u32, Vec<u8>)> + '_ {
+pub(crate) fn user_key_digests(api_key: &str) -> impl Iterator<Item = (u32, [u8; 32])> + '_ {
     SUPPORTED_DIGEST_VERSIONS.iter().filter_map(move |version| {
-        user_key_digest(*version, api_key).map(|digest| (*version, digest))
+        user_key_digest_bytes(*version, api_key).map(|digest| (*version, digest))
     })
 }
 

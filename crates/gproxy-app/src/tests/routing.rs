@@ -4,6 +4,105 @@ use serde_json::json;
 use super::setup;
 
 #[tokio::test]
+async fn sticky_plans_keep_degraded_credentials_as_fallbacks_without_affinity() {
+    use gproxy_core::CredentialId;
+    use gproxy_store::records::{CredentialHealthInput, CredentialHealthState};
+
+    let fixture = setup::fixture().await;
+    let app = &fixture.app;
+    let store = &app.inner.host.services.store;
+    store
+        .update_provider(
+            fixture.provider,
+            &gproxy_store::records::ProviderInput {
+                name: "provider".into(),
+                label: None,
+                channel: "openai".into(),
+                settings: json!({}),
+                credential_strategy: "sticky".into(),
+                proxy_url: None,
+                tls_fingerprint: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+    let secondary = setup::id(
+        app.mutate(crate::ControlMutation::Credential {
+            provider_id: fixture.provider,
+            label: None,
+            secret: json!({"api_key": setup::random_key()}),
+            enabled: true,
+        })
+        .await
+        .unwrap(),
+    );
+    app.reload().await.unwrap();
+    let snapshot = store.control_snapshot().await.unwrap();
+    let version = snapshot
+        .credentials
+        .iter()
+        .find(|c| c.id == fixture.credential)
+        .unwrap()
+        .version;
+    let control = &app.inner.host.services.control;
+    for (model, credential_version, state, affinity) in [
+        (
+            "upstream-model",
+            version,
+            CredentialHealthState::Degraded,
+            false,
+        ),
+        (
+            "upstream-model",
+            version,
+            CredentialHealthState::Healthy,
+            true,
+        ),
+        ("*", version, CredentialHealthState::Degraded, false),
+        // A health observation for a different credential version cannot
+        // suppress affinity on the current version.
+        ("*", version + 1, CredentialHealthState::Degraded, true),
+    ] {
+        control.observe_credential_health(&CredentialHealthInput {
+            credential_id: fixture.credential,
+            model: model.into(),
+            credential_version,
+            version: 1,
+            state,
+            observed_at: 1,
+            response_status: Some(200),
+            detail: None,
+        });
+        let plan = control
+            .resolve(Some("public-model"), &RoutingMode::Aggregated, Some(42))
+            .unwrap();
+        assert_eq!(
+            plan.targets.len(),
+            2,
+            "degraded credentials remain usable as a fallback"
+        );
+        let primary = plan
+            .targets
+            .iter()
+            .find(|t| t.credential == CredentialId(fixture.credential))
+            .unwrap();
+        assert_eq!(primary.rules.session_affinity, affinity);
+        assert!(
+            plan.targets
+                .iter()
+                .find(|t| t.credential == CredentialId(secondary))
+                .unwrap()
+                .rules
+                .session_affinity
+        );
+        if !affinity {
+            assert_eq!(plan.targets[0].credential, CredentialId(secondary));
+        }
+    }
+}
+
+#[tokio::test]
 async fn aggregated_provider_models_match_the_catalogue_and_provider_preprocessing() {
     let setup::Fixture {
         app,

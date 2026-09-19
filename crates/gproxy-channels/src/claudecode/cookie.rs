@@ -122,7 +122,7 @@ async fn authorize(
             .header("origin", auth::CLAUDE_AI_BASE_URL)
             .header("anthropic-version", auth::ANTHROPIC_VERSION)
             .header("anthropic-beta", auth::OAUTH_BETA)
-            .header(USER_AGENT, auth::CLI_USER_AGENT)
+            .header(USER_AGENT, auth::fallback_user_agent())
             .body(Bytes::copy_from_slice(&body))
             .map_err(|error| ChannelError::Login(error.to_string()))?;
         Ok(browser_request(request))
@@ -157,7 +157,7 @@ async fn token_exchange(
         .header("anthropic-version", auth::ANTHROPIC_VERSION)
         .header("anthropic-beta", auth::OAUTH_BETA)
         .header("origin", auth::CLAUDE_AI_BASE_URL)
-        .header(USER_AGENT, auth::CLI_USER_AGENT)
+        .header(USER_AGENT, auth::fallback_user_agent())
         .body(Bytes::from(body))
         .map_err(|error| ChannelError::Login(error.to_string()))?;
     let response = http.send(browser_request(request)).await?;

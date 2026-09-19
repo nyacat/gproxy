@@ -8,12 +8,21 @@ pub const PRICING_SERVICE_TIERS: [&str; 7] = [
     "reserved",
 ];
 
+#[derive(serde::Deserialize)]
+struct RequestTierHints {
+    #[serde(default)]
+    speed: Option<serde_json::Value>,
+    #[serde(default)]
+    service_tier: Option<serde_json::Value>,
+    #[serde(default, rename = "serviceTier")]
+    service_tier_camel: Option<serde_json::Value>,
+}
+
 pub(super) fn request_service_tier(body: &[u8]) -> Option<String> {
-    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    let object = value.as_object()?;
-    ["speed", "service_tier", "serviceTier"]
+    let hints = serde_json::from_slice::<RequestTierHints>(body).ok()?;
+    [hints.speed, hints.service_tier, hints.service_tier_camel]
         .into_iter()
-        .find_map(|name| object.get(name).and_then(tier_value))
+        .find_map(|value| value.as_ref().and_then(tier_value))
 }
 
 pub fn response_service_tier(headers: &http::HeaderMap, body: &[u8]) -> Option<String> {

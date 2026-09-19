@@ -6,7 +6,8 @@ use gproxy_channel_api::{
 
 pub(super) static CLIENT_PROFILE: ClientProfile = ClientProfile {
     preset: None,
-    alpn: Some(Cow::Borrowed(&[Alpn::Http2])),
+    // Codex's reqwest client also permits HTTP/1.1 (including proxy endpoints).
+    alpn: Some(Cow::Borrowed(&[Alpn::Http2, Alpn::Http1])),
     min_tls_version: Some(TlsVersion::Tls12),
     max_tls_version: Some(TlsVersion::Tls13),
     cipher_list: Some(Cow::Borrowed(concat!(
@@ -17,7 +18,8 @@ pub(super) static CLIENT_PROFILE: ClientProfile = ClientProfile {
     ))),
     curves_list: Some(Cow::Borrowed("X25519:P-256:P-384")),
     sigalgs_list: None,
-    preserve_tls13_cipher_list: Some(false),
+    // Otherwise BoringSSL replaces the explicitly configured TLS 1.3 ordering.
+    preserve_tls13_cipher_list: Some(true),
     grease: Some(false),
     extension_permutation: None,
     http2: Some(Http2Profile {

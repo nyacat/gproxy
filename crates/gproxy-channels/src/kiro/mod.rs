@@ -84,6 +84,18 @@ static LOGIN: LoginDescriptor = LoginDescriptor {
 };
 
 impl Channel for KiroChannel {
+    fn client_fingerprint(&self) -> Option<gproxy_channel_api::ClientFingerprint> {
+        Some(gproxy_channel_api::ClientFingerprint {
+            id: "kiro",
+            label: "Kiro CLI",
+            headers: http::HeaderMap::from_iter([(
+                http::header::USER_AGENT,
+                http::HeaderValue::from_static(prepare::UA_RUNTIME),
+            )]),
+            profile: &profile::CLIENT_PROFILE,
+        })
+    }
+
     fn login(&self) -> Option<ChannelLoginRef<'_>> {
         Some(ChannelLoginRef {
             adapter: self,

@@ -15,7 +15,7 @@ pub(super) static CLIENT_PROFILE: ClientProfile = ClientProfile {
     ))),
     curves_list: Some(Cow::Borrowed("X25519:P-256:P-384")),
     sigalgs_list: None,
-    preserve_tls13_cipher_list: Some(false),
+    preserve_tls13_cipher_list: Some(true),
     grease: Some(false),
     extension_permutation: None,
     http2: None,

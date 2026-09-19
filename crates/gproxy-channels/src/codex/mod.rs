@@ -39,6 +39,15 @@ static LOGIN: LoginDescriptor = LoginDescriptor {
 };
 
 impl Channel for CodexChannel {
+    fn client_fingerprint(&self) -> Option<gproxy_channel_api::ClientFingerprint> {
+        Some(gproxy_channel_api::ClientFingerprint {
+            id: "codex",
+            label: "Codex CLI",
+            headers: auth::fingerprint_headers(),
+            profile: &profile::CLIENT_PROFILE,
+        })
+    }
+
     fn routing_table(&self) -> &'static [ChannelSupport] {
         routes::ROUTES
     }

@@ -64,8 +64,11 @@ pub(crate) async fn dispatch(
         Route::UsageTrend => observability::usage_trend(state, parts).await,
         Route::QuotaWindows => observability::quota_windows(state, parts).await,
         Route::CredentialCycles => observability::credential_cycles(state, parts).await,
+        Route::CredentialCyclesQuery => {
+            observability::credential_cycles_query(state, parts, body).await
+        }
         Route::Channels => catalogue::channels(state),
-        Route::TlsPresets => catalogue::tls_presets(),
+        Route::TlsPresets => catalogue::tls_presets(state),
         Route::RulePresets => rule_presets::list(),
         Route::ApplyRulePreset {
             rule_set_id,

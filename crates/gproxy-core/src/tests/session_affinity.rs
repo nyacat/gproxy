@@ -11,6 +11,27 @@ use crate::host::CredentialId;
 use crate::{Core, InitError};
 
 #[test]
+fn an_ineligible_fallback_cannot_override_a_healthy_target_with_an_old_pin() -> Result<(), InitError>
+{
+    let host = MemoryHost::new(false);
+    let core = core(&host)?;
+    set_plan(&host, [target(7), target(8)]);
+    execute(&core, &host, request("same", "question", false));
+    assert_eq!(take_loaded(&host), [CredentialId(7)]);
+    let mut degraded = target(7);
+    degraded.rules.session_affinity = false;
+    set_plan(&host, [target(8), degraded]);
+    execute(&core, &host, request("same", "question", true));
+    assert_eq!(take_loaded(&host), [CredentialId(8)]);
+    // A successful healthy replacement owns the session even if the old
+    // credential later becomes eligible again.
+    set_plan(&host, [target(7), target(8)]);
+    execute(&core, &host, request("same", "question", true));
+    assert_eq!(take_loaded(&host), [CredentialId(8)]);
+    Ok(())
+}
+
+#[test]
 fn explicit_session_pins_winner_and_rebinds_after_failover() -> Result<(), InitError> {
     let host = MemoryHost::new(false);
     let core = core(&host)?;

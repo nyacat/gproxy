@@ -17,10 +17,39 @@ pub(super) const LOGIN_SCOPE: &str = concat!(
     "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 );
 pub(super) const OAUTH_BETA: &str = "oauth-2025-04-20";
-pub(super) const CLI_VERSION: &str = "2.1.258";
-pub(super) const CLI_USER_AGENT: &str = "claude-cli/2.1.258 (external, cli)";
+// Release baseline: https://code.claude.com/docs/en/changelog (2026-09-11).
+pub(super) const CLI_VERSION: &str = "2.1.268";
 pub(super) const ANTHROPIC_VERSION: &str = "2023-06-01";
 const EXPIRY_SKEW_SECONDS: i64 = 30 * 60;
+
+pub(super) fn fallback_user_agent() -> String {
+    format!("claude-cli/{CLI_VERSION} (external, cli)")
+}
+
+pub(super) fn fingerprint_headers() -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in [
+        ("anthropic-version", ANTHROPIC_VERSION),
+        ("anthropic-dangerous-direct-browser-access", "true"),
+        ("x-app", "cli"),
+        ("x-stainless-lang", "js"),
+        ("x-stainless-package-version", "0.112.1"),
+        ("x-stainless-runtime", "node"),
+        ("x-stainless-runtime-version", "v26.3.0"),
+        ("x-stainless-os", stainless_os()),
+        ("x-stainless-arch", stainless_arch()),
+    ] {
+        headers.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+    headers.insert(
+        http::header::USER_AGENT,
+        HeaderValue::from_str(&fallback_user_agent()).expect("built-in user-agent is valid"),
+    );
+    headers
+}
 
 pub(super) fn access_token(secret: &Value) -> Result<&str, ChannelError> {
     secret_string(secret, "access_token")
@@ -132,10 +161,10 @@ pub(super) fn apply_headers(
     client_user_agent: Option<&str>,
 ) -> Result<(), ChannelError> {
     insert(headers, AUTHORIZATION, &format!("Bearer {token}"))?;
-    headers.insert(
-        HeaderName::from_static("anthropic-version"),
-        HeaderValue::from_static("2023-06-01"),
-    );
+    headers.extend(fingerprint_headers());
+    if let Some(user_agent) = client_user_agent.filter(|value| valid_cli_user_agent(value)) {
+        insert(headers, http::header::USER_AGENT, user_agent)?;
+    }
     let client_beta = headers
         .get("anthropic-beta")
         .and_then(|value| value.to_str().ok());
@@ -145,14 +174,8 @@ pub(super) fn apply_headers(
         &merge_beta(client_beta),
     )?;
     for (name, value) in [
-        ("anthropic-dangerous-direct-browser-access", "true"),
-        ("x-app", "cli"),
         ("x-stainless-retry-count", "0"),
         ("x-stainless-timeout", "600"),
-        ("x-stainless-lang", "js"),
-        ("x-stainless-package-version", "0.112.1"),
-        ("x-stainless-runtime", "node"),
-        ("x-stainless-runtime-version", "v26.3.0"),
     ] {
         headers.insert(
             HeaderName::from_static(name),
@@ -164,25 +187,6 @@ pub(super) fn apply_headers(
         HeaderName::from_static("x-claude-code-session-id"),
         session_id,
     )?;
-    insert(
-        headers,
-        HeaderName::from_static("x-stainless-os"),
-        stainless_os(),
-    )?;
-    insert(
-        headers,
-        HeaderName::from_static("x-stainless-arch"),
-        stainless_arch(),
-    )?;
-    headers.insert(
-        http::header::USER_AGENT,
-        HeaderValue::from_str(
-            client_user_agent
-                .filter(|value| valid_cli_user_agent(value))
-                .unwrap_or(CLI_USER_AGENT),
-        )
-        .map_err(|error| ChannelError::Prepare(format!("invalid user-agent: {error}")))?,
-    );
     headers.insert(
         http::header::ACCEPT,
         HeaderValue::from_static("application/json"),
