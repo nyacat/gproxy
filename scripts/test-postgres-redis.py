@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TESTS = [
     ("gproxy-store", "backend::tests::usage_records::postgres_usage_pages_and_summary_index_work"),
     ("gproxy-store", "backend::tests::quota_activity::postgres_activity_migration_retry_identity_and_atomic_settlement"),
+    ("gproxy-store", "backend::tests::credential_health::postgres_credential_health_backoff_and_ordering"),
     ("gproxy-store", "backend::tests::cycle_reads::postgres_long_gap_estimates_and_index_work"),
     ("gproxy-store", "backend::tests::parity::postgres_schema_queries_and_rollback"),
     ("gproxy-store", "backend::tests::quota_migration::postgres_legacy_local_schema_completes_upstream_migrations"),

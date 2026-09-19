@@ -30,6 +30,7 @@ pub(super) struct CompiledSnapshot {
     pub strategies: BTreeMap<i64, CredentialStrategy>,
     pub provider_names: BTreeMap<String, i64>,
     pub credentials: BTreeMap<i64, Vec<CredentialSeed>>,
+    pub credential_versions: BTreeMap<i64, u64>,
     pub routes: BTreeMap<i64, CompiledRoute>,
     pub route_names: BTreeMap<String, i64>,
     pub exposed: BTreeMap<String, i64>,
@@ -92,7 +93,7 @@ pub(super) struct CredentialSeed {
 }
 
 pub(super) type CredentialHealthMap =
-    BTreeMap<CredentialId, BTreeMap<String, (u64, gproxy_store::records::CredentialHealthState)>>;
+    BTreeMap<CredentialId, BTreeMap<String, gproxy_store::records::CredentialHealthRecord>>;
 
 pub(super) struct CompiledPriceRule {
     pub id: i64,

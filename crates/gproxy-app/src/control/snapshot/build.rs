@@ -79,6 +79,11 @@ impl CompiledSnapshot {
             .map(|provider| (provider.name.clone(), provider.id))
             .collect();
         let credentials = credentials(&stored, &providers);
+        let credential_versions = stored
+            .credentials
+            .iter()
+            .map(|record| (record.id, record.version))
+            .collect();
         let routes = routes(&stored, &providers, &strategies, &credentials);
         let route_names = stored
             .routes
@@ -99,6 +104,7 @@ impl CompiledSnapshot {
             strategies,
             provider_names,
             credentials,
+            credential_versions,
             routes,
             route_names,
             exposed: model_index.routes,

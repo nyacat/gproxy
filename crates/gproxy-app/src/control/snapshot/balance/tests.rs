@@ -72,7 +72,11 @@ fn unhealthy_members_are_removed_before_the_rotation_slot_is_consumed() {
         gproxy_channel_api::CredentialId(11),
         BTreeMap::from([(
             "model-a".into(),
-            (0, gproxy_store::records::CredentialHealthState::Dead),
+            health_record(
+                11,
+                "model-a",
+                gproxy_store::records::CredentialHealthState::Dead,
+            ),
         )]),
     )]);
     let counters = RotationCounters::default();
@@ -102,7 +106,11 @@ fn unhealthy_members_are_removed_before_the_rotation_slot_is_consumed() {
         gproxy_channel_api::CredentialId(11),
         BTreeMap::from([(
             "model-a".into(),
-            (0, gproxy_store::records::CredentialHealthState::Degraded),
+            health_record(
+                11,
+                "model-a",
+                gproxy_store::records::CredentialHealthState::Degraded,
+            ),
         )]),
     )]);
     let ordered = order(
@@ -206,7 +214,7 @@ fn round_robin_rotates_complete_member_groups_and_failover_skips_dead_members() 
                 gproxy_channel_api::CredentialId(id),
                 BTreeMap::from([(
                     "*".into(),
-                    (0, gproxy_store::records::CredentialHealthState::Dead),
+                    health_record(id, "*", gproxy_store::records::CredentialHealthState::Dead),
                 )]),
             )
         })
@@ -260,4 +268,22 @@ fn weighted_rotation_resets_after_pool_members_or_weights_change() {
         .member_id,
         2
     );
+}
+
+fn health_record(
+    credential_id: i64,
+    model: &str,
+    state: gproxy_store::records::CredentialHealthState,
+) -> gproxy_store::records::CredentialHealthRecord {
+    gproxy_store::records::CredentialHealthRecord {
+        credential_id,
+        model: model.into(),
+        credential_version: 0,
+        version: 1,
+        state,
+        consecutive_failures: 1,
+        observed_at: 1,
+        response_status: None,
+        detail: None,
+    }
 }

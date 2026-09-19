@@ -14,7 +14,8 @@ pub(crate) use cleanup::{
 
 pub(crate) use cycle::*;
 pub(crate) use health::{
-    delete as delete_credential_health, select_all as select_credential_health,
+    delete as delete_credential_health, recover_degraded as recover_degraded_credential_health,
+    select_all as select_credential_health, select_one as select_credential_model_health,
     upsert as upsert_credential_health,
 };
 pub(crate) use log::*;

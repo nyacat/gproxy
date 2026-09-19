@@ -7,6 +7,150 @@ use super::setup;
 use crate::ControlMutation;
 
 #[tokio::test]
+async fn authorized_recovery_candidate_is_prioritized_after_a_denied_probe_is_filtered() {
+    use gproxy_core::CredentialId;
+    use gproxy_store::records::{CredentialHealthInput, CredentialHealthState};
+
+    let fixture = setup::fixture().await;
+    let app = &fixture.app;
+    app.shutdown();
+    app.drain_background().await;
+    let host = &app.inner.host;
+    let store = &host.services.store;
+    let control = &host.services.control;
+    let request = setup::request("authorized-health-recovery", "hi", &fixture.client_key);
+    let identity = host.authenticate(&request).await.unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let provider_input = |name: &str| ProviderInput {
+        name: name.into(),
+        label: None,
+        channel: "openai".into(),
+        settings: json!({"base_url":format!("http://{address}"),"auto_refresh_models":false}),
+        credential_strategy: "round_robin".into(),
+        proxy_url: None,
+        tls_fingerprint: None,
+        enabled: true,
+    };
+    store
+        .update_provider(fixture.provider, &provider_input("provider"))
+        .await
+        .unwrap();
+    let mut candidates = Vec::new();
+    for (name, model) in [
+        ("recoverable", "recoverable-model"),
+        ("denied", "denied-model"),
+    ] {
+        let provider = setup::id(
+            app.mutate(ControlMutation::Provider(provider_input(name)))
+                .await
+                .unwrap(),
+        );
+        let credential = setup::id(
+            app.mutate(ControlMutation::Credential {
+                provider_id: provider,
+                label: None,
+                secret: json!({"api_key":setup::random_key()}),
+                enabled: true,
+            })
+            .await
+            .unwrap(),
+        );
+        app.mutate(ControlMutation::RouteMember(RouteMemberInput {
+            route_id: fixture.route,
+            provider_id: provider,
+            upstream_model: model.into(),
+            tier: 0,
+            weight: 100,
+            enabled: true,
+        }))
+        .await
+        .unwrap();
+        candidates.push((provider, CredentialId(credential), model));
+    }
+    let (allowed_provider, allowed_credential, allowed_model) = candidates[0];
+    let (denied_provider, denied_credential, denied_model) = candidates[1];
+    app.mutate(ControlMutation::Permission(PermissionInput {
+        subject_kind: "user_key".into(),
+        subject_id: identity.user_key_id,
+        provider_id: Some(denied_provider),
+        operation_group: Some("generate_content".into()),
+        model_pattern: None,
+        allowed: false,
+    }))
+    .await
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    for (credential, model, elapsed) in [
+        (allowed_credential, allowed_model, 60),
+        (denied_credential, denied_model, 120),
+    ] {
+        store
+            .record_credential_health(&CredentialHealthInput {
+                credential_id: credential.0,
+                model: model.into(),
+                credential_version: control.known_credential_version(credential.0).unwrap(),
+                version: 1,
+                state: CredentialHealthState::Degraded,
+                observed_at: now - elapsed,
+                response_status: Some(503),
+                detail: Some("server_is_overloaded".into()),
+            })
+            .await
+            .unwrap();
+    }
+    app.reload().await.unwrap();
+    let original_health = store.credential_health().await.unwrap();
+    let plan = control
+        .resolve(Some("public-model"), &request.mode, None)
+        .unwrap();
+    assert_eq!(
+        plan.targets
+            .iter()
+            .map(|target| target.provider.id)
+            .collect::<Vec<_>>(),
+        [denied_provider, fixture.provider, allowed_provider],
+    );
+
+    let admitted = host
+        .admit(
+            &identity,
+            &request,
+            Some(super::generation_operation()),
+            Some("public-model"),
+            &plan,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        admitted
+            .targets
+            .iter()
+            .map(|target| target.provider.id)
+            .collect::<Vec<_>>(),
+        [allowed_provider, fixture.provider],
+    );
+    assert_eq!(admitted.targets[0].credential, allowed_credential);
+    assert_eq!(admitted.targets[0].upstream_model, allowed_model);
+    assert!(!admitted.targets[0].rules.session_affinity);
+    assert!(admitted.targets.iter().all(|target| target.tier == 0));
+    assert_eq!(admitted.budget.max_attempts, plan.budget.max_attempts);
+    for (_, credential, model) in candidates {
+        let version = control.known_credential_version(credential.0).unwrap();
+        assert!(control.health_probe_ready(credential, model, version, now));
+    }
+    assert_eq!(store.credential_health().await.unwrap(), original_health);
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    host.finish_admission(&request.request_id, None).await;
+}
+
+#[tokio::test]
 async fn partial_permissions_filter_catalogues_and_route_candidates() {
     let fixture = setup::fixture().await;
     let app = &fixture.app;

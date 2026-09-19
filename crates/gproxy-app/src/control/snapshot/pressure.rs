@@ -8,7 +8,10 @@ pub(super) fn apply(plan: &mut Plan, pressure: &CredentialPressureMap, now: i64)
         .sort_by_key(|target| (target.tier, tier(pressure.get(&target.credential), now)));
 }
 
-fn tier(pressure: Option<&std::collections::BTreeMap<String, CredentialPressure>>, now: i64) -> u8 {
+pub(super) fn tier(
+    pressure: Option<&std::collections::BTreeMap<String, CredentialPressure>>,
+    now: i64,
+) -> u8 {
     let pressure = pressure
         .into_iter()
         .flat_map(|windows| windows.values())

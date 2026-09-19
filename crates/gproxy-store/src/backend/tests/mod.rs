@@ -1,5 +1,6 @@
 mod cache;
 mod credential_budget;
+mod credential_health;
 mod cycle_page;
 mod cycle_reads;
 mod numeric_bounds;
