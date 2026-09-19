@@ -36,6 +36,8 @@ pub enum CoreError {
     CredentialCoolingDown { retry_after_secs: u32 },
     #[error("credential refresh is cooling down; retry after {retry_after_secs} seconds")]
     CredentialRefreshCoolingDown { retry_after_secs: u32 },
+    #[error("gateway stream inspection memory budget exhausted")]
+    StreamStartOverloaded,
     #[error("quota exceeded")]
     QuotaExceeded,
     #[error("no usable credential")]
@@ -70,6 +72,7 @@ impl CoreError {
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::CredentialCoolingDown { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::CredentialRefreshCoolingDown { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::StreamStartOverloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::QuotaExceeded => StatusCode::PAYMENT_REQUIRED,
             Self::NoCredentials | Self::UpstreamExhausted(_) => StatusCode::BAD_GATEWAY,
             Self::Transform(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -90,6 +93,11 @@ impl CoreError {
 
     /// OpenAI-style error envelope every host renders identically.
     pub fn body_json(&self) -> serde_json::Value {
+        if matches!(self, Self::StreamStartOverloaded) {
+            return serde_json::json!({"error": {
+                "message": self.to_string(), "type": "server_error", "code": "gateway_overloaded"
+            }});
+        }
         serde_json::json!({ "error": { "message": self.to_string() } })
     }
 }

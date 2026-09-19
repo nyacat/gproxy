@@ -193,5 +193,6 @@ fn core_error_kind(error: &CoreError) -> &'static str {
         CoreError::Channel(_) => "channel",
         CoreError::SurfaceState(_) => "surface_state",
         CoreError::Internal(_) => "internal",
+        CoreError::StreamStartOverloaded => "gateway_overloaded",
     }
 }

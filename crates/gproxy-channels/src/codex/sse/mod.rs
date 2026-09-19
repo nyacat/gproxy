@@ -2,12 +2,13 @@ mod diagnostic;
 mod event;
 mod framing;
 mod lifecycle;
+pub(super) mod start;
 mod tools;
 
 #[cfg(test)]
 mod tests;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use gproxy_channel_api::StreamDecodeError;
 use gproxy_channel_api::{
     ChannelError, Disposition, Frame, NormalizedUsage, StreamCtx, StreamDecoder, StreamEnd,
@@ -19,7 +20,8 @@ use gproxy_protocol::{ContentGenerationKind, Operation, OperationKind};
 use framing::{delimiter, encode, parse};
 
 pub(super) struct CodexSseDecoder {
-    buffer: Vec<u8>,
+    buffer: BytesMut,
+    scan_from: usize,
     lifecycle: lifecycle::Lifecycle,
     tools: tools::ToolAliases,
     usage: Option<NormalizedUsage>,
@@ -40,7 +42,8 @@ impl CodexSseDecoder {
         ) && ctx.key.kind()
             == OperationKind::ContentGeneration(ContentGenerationKind::OpenAiResponses))
         .then(|| Self {
-            buffer: Vec::new(),
+            buffer: BytesMut::new(),
+            scan_from: 0,
             lifecycle: Default::default(),
             tools: Default::default(),
             usage: None,
@@ -54,13 +57,29 @@ impl CodexSseDecoder {
 
     fn drain(&mut self) -> Result<Vec<Frame>, StreamDecodeError> {
         let mut output = Vec::new();
-        while let Some((end, delimiter)) = delimiter(&self.buffer) {
-            let raw = self.buffer.drain(..end + delimiter).collect::<Vec<_>>();
+        while let Some((relative, delimiter)) = delimiter(&self.buffer[self.scan_from..]) {
+            let end = self.scan_from + relative;
+            if end > 100 * 1024 * 1024 {
+                return Err(StreamDecodeError::from(ChannelError::Decode(
+                    "Codex Responses SSE frame exceeds 100 MiB".into(),
+                ))
+                .prepend(output));
+            }
+            let raw = self.buffer.split_to(end + delimiter);
+            self.scan_from = 0;
             match self.frame(&raw[..end]) {
                 Ok(frames) => output.extend(frames),
                 Err(error) => return Err(error.prepend(output)),
             }
         }
+        if self.buffer.len() > 100 * 1024 * 1024 {
+            return Err(StreamDecodeError::from(ChannelError::Decode(
+                "Codex Responses SSE frame exceeds 100 MiB".into(),
+            ))
+            .prepend(output));
+        }
+        // Only delimiter bytes overlapping the next fragment need rescanning.
+        self.scan_from = self.buffer.len().saturating_sub(3);
         Ok(output)
     }
 
@@ -137,17 +156,13 @@ impl StreamDecoder for CodexSseDecoder {
 
     fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
         self.buffer.extend_from_slice(&chunk);
-        if self.buffer.len() > 100 * 1024 * 1024 {
-            return Err(
-                ChannelError::Decode("Codex Responses SSE frame exceeds 100 MiB".into()).into(),
-            );
-        }
         self.drain()
     }
 
     fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
         if end == StreamEnd::Interrupted {
             self.buffer.clear();
+            self.scan_from = 0;
             return Ok(StreamTail {
                 estimated_output_chars: self.output_meter.take().map(|meter| meter.characters()),
                 frames: Vec::new(),
@@ -159,6 +174,7 @@ impl StreamDecoder for CodexSseDecoder {
             Vec::new()
         } else {
             let raw = std::mem::take(&mut self.buffer);
+            self.scan_from = 0;
             self.frame(&raw)?
         };
         if !self.lifecycle.is_terminal() {

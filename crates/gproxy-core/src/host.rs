@@ -25,6 +25,9 @@ use crate::error::CoreError;
 use crate::error::{StoreError, TransportError};
 use crate::usage::Settlement;
 
+pub mod stream_start;
+pub use stream_start::StreamStartBudget;
+
 /// Credential identity — defined at the contract layer (bindings reference
 /// it), re-exported here for hosts.
 pub use gproxy_channel_api::CredentialId;
@@ -511,6 +514,12 @@ pub trait Host: MaybeSend + MaybeSync + 'static {
     /// Runtime timer used by bounded service-surface polling. Hosts implement
     /// this with their native timer; the core never selects an executor.
     fn wait<'a>(&'a self, duration: Duration) -> BoxFuture<'a, ()>;
+    /// All uncommitted stream inspections share this memory budget, including
+    /// replay buffers and parser scratch. Embedders can supply a smaller pool.
+    fn stream_start_budget(&self) -> std::sync::Arc<StreamStartBudget> {
+        StreamStartBudget::process_default()
+    }
+
     /// Build the caller/provider/selected-credential usage view lent to a synthesizer.
     fn surface_usage<'a>(
         &'a self,

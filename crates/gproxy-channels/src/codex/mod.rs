@@ -74,6 +74,14 @@ impl Channel for CodexChannel {
         crate::shared::openai::disposition::classify(response)
     }
 
+    fn stream_start(
+        &self,
+        ctx: StreamCtx<'_>,
+    ) -> Option<Box<dyn gproxy_channel_api::channel::StreamStart>> {
+        sse::start::CodexStreamStart::for_operation(ctx)
+            .map(|probe| Box::new(probe) as Box<dyn gproxy_channel_api::channel::StreamStart>)
+    }
+
     fn stream_decoder(&self, ctx: StreamCtx<'_>) -> Option<Box<dyn StreamDecoder>> {
         sse::CodexSseDecoder::for_operation(ctx)
             .map(|decoder| Box::new(decoder) as Box<dyn StreamDecoder>)

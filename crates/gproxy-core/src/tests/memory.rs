@@ -55,6 +55,7 @@ pub(super) struct State {
     pub(super) fail_usage_begin: bool,
     pub(super) captures: Vec<Captured>,
     pub(super) capture_response_body: bool,
+    pub(super) stream_start_budget: Arc<crate::host::StreamStartBudget>,
     pub(super) auth_calls: usize,
     pub(super) admit_calls: usize,
     pub(super) exhausted_credentials: Vec<CredentialId>,
@@ -155,6 +156,7 @@ impl MemoryHost {
                 fail_usage_begin: false,
                 captures: Vec::new(),
                 capture_response_body: true,
+                stream_start_budget: crate::host::StreamStartBudget::new(256 * 1024 * 1024),
                 auth_calls: 0,
                 admit_calls: 0,
                 exhausted_credentials: Vec::new(),
@@ -228,6 +230,10 @@ impl MemoryHost {
 }
 
 impl Host for MemoryHost {
+    fn stream_start_budget(&self) -> Arc<crate::host::StreamStartBudget> {
+        self.state.lock().unwrap().stream_start_budget.clone()
+    }
+
     type Credentials = Self;
     type Cache = Self;
     type Transport = Self;

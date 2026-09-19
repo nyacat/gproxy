@@ -42,6 +42,27 @@ pub struct StreamCtx<'a> {
     pub response_headers: &'a http::HeaderMap,
 }
 
+/// Result of inspecting an uncommitted response. Unknown events, output and
+/// tool activity must produce `Ready`; only a proven pre-generation failure
+/// may be retried. `Pending` at EOF means an interrupted attempt.
+#[derive(Debug)]
+pub enum StreamStartState {
+    Pending,
+    Ready,
+    Failed(crate::UpstreamFailure),
+}
+
+/// A lightweight classifier over the engine's append-only, budgeted prefix.
+/// It must not retain or normalize response bodies. The engine reserves the
+/// declared scratch bound and 128 KiB for bounded classifier metadata.
+pub trait StreamStart: Send {
+    /// Upper bound on temporary allocations during the next inspect call.
+    /// This includes framing copies and the JSON parser's scratch capacity.
+    fn scratch_bytes(&self, prefix: &[u8]) -> usize;
+
+    fn inspect(&mut self, prefix: &[u8], eof: bool) -> Result<StreamStartState, ChannelError>;
+}
+
 /// The complete buffered exchange visible to usage extraction.
 pub struct UsageCtx<'a> {
     pub key: OperationKey,
@@ -131,9 +152,10 @@ pub trait StreamDecoder: Send {
     fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError>;
 
     /// Whether the observed prefix contains only connection/lifecycle metadata
-    /// or a failure before generation began. Opting in lets the engine inspect
-    /// a bounded prefix before committing a stream to the caller. Once output,
-    /// tool activity, usage, or an unknown event appears, this must stay false.
+    /// or a failure before generation began. Once output, tool activity, usage,
+    /// or an unknown event appears, this must stay false. The engine uses the
+    /// separate [`Channel::stream_start`] classifier for budgeted inspection;
+    /// it must not run a second full response decoder to obtain this property.
     fn replay_safe(&self) -> bool {
         false
     }
@@ -243,6 +265,11 @@ pub trait Channel: Send + Sync {
         // means for this channel's credential family.
         failure.disposition = self.classify(response);
         Some(failure)
+    }
+
+    fn stream_start(&self, ctx: StreamCtx<'_>) -> Option<Box<dyn StreamStart>> {
+        let _ = ctx;
+        None
     }
 
     fn stream_decoder(&self, ctx: StreamCtx<'_>) -> Option<Box<dyn StreamDecoder>> {
