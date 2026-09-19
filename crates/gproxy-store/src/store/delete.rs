@@ -2,11 +2,26 @@ use crate::{Store, StoreError};
 
 impl Store {
     pub async fn delete_provider(&self, id: i64) -> Result<bool, StoreError> {
-        self.delete_owned("providers", id).await
+        let mut statements = vec![crate::query::runtime::quota_provider::lock_credentials(id)?];
+        statements.extend(crate::query::delete_owned("providers", id)?);
+        Ok(self
+            .backend()
+            .batch(statements)
+            .await?
+            .last()
+            .is_some_and(|r| r.affected_rows == 1))
     }
 
     pub async fn delete_credential(&self, id: i64) -> Result<bool, StoreError> {
-        self.delete_owned("credentials", id).await
+        let mut statements =
+            vec![crate::query::runtime::quota_snapshot::lock_credential_version(id, None)?];
+        statements.extend(crate::query::delete_owned("credentials", id)?);
+        Ok(self
+            .backend()
+            .batch(statements)
+            .await?
+            .last()
+            .is_some_and(|r| r.affected_rows == 1))
     }
 
     pub async fn delete_route(&self, id: i64) -> Result<bool, StoreError> {
