@@ -26,6 +26,12 @@ pub(super) struct State {
     pub(super) credential: CredentialRecord,
     pub(super) cached_credential: Option<CredentialRecord>,
     pub(super) conflict: bool,
+    pub(super) metadata_conflicts: usize,
+    pub(super) refresh_calls: usize,
+    pub(super) refresh_pending: bool,
+    pub(super) refresh_error: bool,
+    pub(super) refresh_body: Option<Bytes>,
+    pub(super) long_waits_pending: bool,
     pub(super) peer_refresh_on_wait: bool,
     pub(super) lease_calls: usize,
     pub(super) wait_calls: usize,
@@ -119,6 +125,12 @@ impl MemoryHost {
                 },
                 cached_credential: None,
                 conflict,
+                metadata_conflicts: 0,
+                refresh_calls: 0,
+                refresh_pending: false,
+                refresh_error: false,
+                refresh_body: None,
+                long_waits_pending: false,
                 peer_refresh_on_wait: false,
                 lease_calls: 0,
                 wait_calls: 0,
@@ -387,8 +399,11 @@ impl Host for MemoryHost {
             ));
         })
     }
-    fn wait<'a>(&'a self, _: std::time::Duration) -> BoxFuture<'a, ()> {
+    fn wait<'a>(&'a self, duration: std::time::Duration) -> BoxFuture<'a, ()> {
         let mut state = self.state.lock().expect("state lock");
+        if state.long_waits_pending && duration >= std::time::Duration::from_secs(30) {
+            return Box::pin(std::future::pending());
+        }
         state.wait_calls += 1;
         if state.peer_refresh_on_wait {
             state.peer_refresh_on_wait = false;

@@ -28,7 +28,7 @@ pub(super) fn refresh<'a>(
     secret: &'a Value,
     settings: &'a Value,
     http: &'a dyn SimpleHttp,
-) -> BoxFuture<'a, Result<Value, ChannelError>> {
+) -> BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>> {
     let request = refresh_request(secret, settings);
     let request = match request {
         Ok(request) => request,
@@ -85,7 +85,10 @@ fn refresh_request(secret: &Value, settings: &Value) -> Result<http::Request<Byt
     Ok(request)
 }
 
-fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
+fn rotate(
+    secret: &Value,
+    token: &Value,
+) -> Result<gproxy_channel_api::RefreshResult, ChannelError> {
     let access = field(token, "accessToken")
         .ok_or_else(|| ChannelError::Refresh("response missing accessToken".into()))?;
     let mut output = secret.clone();
@@ -93,13 +96,8 @@ fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
         .as_object_mut()
         .ok_or_else(|| ChannelError::Refresh("Kiro secret must be an object".into()))?;
     root.insert("access_token".into(), Value::String(access.into()));
-    for (source, target) in [
-        ("refreshToken", "refresh_token"),
-        ("profileArn", "profile_arn"),
-    ] {
-        if let Some(value) = field(token, source) {
-            root.insert(target.into(), Value::String(value.into()));
-        }
+    if let Some(value) = field(token, "profileArn") {
+        root.insert("profile_arn".into(), Value::String(value.into()));
     }
     if let Some(expires) = token.get("expiresIn").and_then(Value::as_i64) {
         root.insert(
@@ -109,7 +107,7 @@ fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
     } else {
         root.remove("expires_at_ms");
     }
-    Ok(output)
+    crate::shared::refresh::oauth(output, token.get("refreshToken").and_then(Value::as_str))
 }
 
 fn is_sso(secret: &Value) -> bool {

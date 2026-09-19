@@ -51,7 +51,7 @@ pub(super) fn refresh<'a>(
     secret: &'a Value,
     settings: &'a Value,
     http: &'a dyn SimpleHttp,
-) -> BoxFuture<'a, Result<Value, ChannelError>> {
+) -> BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>> {
     let request = refresh_request(secret, settings);
     let request = match request {
         Ok(request) => request,
@@ -97,9 +97,11 @@ fn refresh_request(secret: &Value, settings: &Value) -> Result<http::Request<Byt
     Ok(request)
 }
 
-fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
+fn rotate(
+    secret: &Value,
+    token: &Value,
+) -> Result<gproxy_channel_api::RefreshResult, ChannelError> {
     let access = required(token, "access_token")?;
-    let refresh = required(token, "refresh_token")?;
     let expires = token
         .get("expires_in")
         .and_then(Value::as_i64)
@@ -110,12 +112,11 @@ fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
         .as_object_mut()
         .ok_or_else(|| ChannelError::Refresh("Kimi secret is not an object".into()))?;
     root.insert("access_token".into(), Value::String(access.into()));
-    root.insert("refresh_token".into(), Value::String(refresh.into()));
     root.insert(
         "expires_at_ms".into(),
         Value::from(unix_now_ms().saturating_add(expires.saturating_mul(1_000))),
     );
-    Ok(output)
+    crate::shared::refresh::oauth(output, token.get("refresh_token").and_then(Value::as_str))
 }
 
 pub(super) fn apply(

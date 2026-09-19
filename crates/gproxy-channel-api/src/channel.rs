@@ -453,14 +453,21 @@ pub trait Channel: Send + Sync {
         None
     }
 
-    /// Refresh the secret. Returns the full replacement secret; the engine
-    /// persists it through the host's version-guarded `CredentialStore`.
+    /// Whether the stored credential supports an explicit refresh-token grant.
+    fn can_refresh(&self, secret: &Value) -> bool {
+        let _ = secret;
+        false
+    }
+
+    /// Refresh the secret and report whether the upstream returned a refresh
+    /// token. The engine persists the full replacement secret through the
+    /// host's version-guarded `CredentialStore`.
     fn refresh<'a>(
         &'a self,
         secret: &'a Value,
         provider_settings: &'a Value,
         http: &'a dyn SimpleHttp,
-    ) -> Option<BoxFuture<'a, Result<Value, ChannelError>>> {
+    ) -> Option<BoxFuture<'a, Result<crate::RefreshResult, ChannelError>>> {
         let _ = (secret, provider_settings, http);
         None
     }

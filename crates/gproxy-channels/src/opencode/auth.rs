@@ -34,7 +34,7 @@ pub(super) fn refresh<'a>(
     secret: &'a Value,
     settings: &'a Value,
     http: &'a dyn SimpleHttp,
-) -> BoxFuture<'a, Result<Value, ChannelError>> {
+) -> BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>> {
     let request = match refresh_request(secret, settings) {
         Ok(request) => request,
         Err(error) => return Box::pin(async move { Err(error) }),
@@ -81,7 +81,10 @@ struct TokenReply {
     rest: serde_json::Map<String, Value>,
 }
 
-fn rotate(secret: &Value, token: TokenReply) -> Result<Value, ChannelError> {
+fn rotate(
+    secret: &Value,
+    token: TokenReply,
+) -> Result<gproxy_channel_api::RefreshResult, ChannelError> {
     let TokenReply {
         access_token,
         refresh_token,
@@ -98,9 +101,6 @@ fn rotate(secret: &Value, token: TokenReply) -> Result<Value, ChannelError> {
         .ok_or_else(|| ChannelError::Refresh("OpenCode secret is not an object".into()))?;
     object.insert("api_key".into(), Value::String(access.clone()));
     object.insert("access_token".into(), Value::String(access));
-    if let Some(refresh) = refresh_token.filter(|token| !token.trim().is_empty()) {
-        object.insert("refresh_token".into(), Value::String(refresh));
-    }
     if let Some(seconds) = expires_in {
         object.insert(
             "expires_at_ms".into(),
@@ -111,7 +111,7 @@ fn rotate(secret: &Value, token: TokenReply) -> Result<Value, ChannelError> {
         object.remove("expires_at_ms");
         object.insert("expiry_unknown".into(), Value::Bool(true));
     }
-    Ok(output)
+    crate::shared::refresh::oauth(output, refresh_token.as_deref())
 }
 
 pub(super) fn field<'a>(value: &'a Value, name: &str) -> Option<&'a str> {

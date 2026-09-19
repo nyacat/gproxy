@@ -104,7 +104,11 @@ pub(super) async fn run<H: Host>(
                 admission_error = Some(error);
                 last = "credential admission limit reached";
             }
-            Err(error @ (CoreError::CredentialCoolingDown { .. } | CoreError::NoCredentials)) => {
+            Err(
+                error @ (CoreError::CredentialCoolingDown { .. }
+                | CoreError::CredentialRefreshCoolingDown { .. }
+                | CoreError::NoCredentials),
+            ) => {
                 admission_error = Some(error);
                 last = "credential model unavailable or recovery probe in flight";
             }

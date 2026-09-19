@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use gproxy_channel_api::{BoxFuture, ChannelError, SimpleHttp};
 use http::header::{AUTHORIZATION, HeaderName, HeaderValue};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 pub(super) const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -20,7 +20,7 @@ pub(super) const OAUTH_BETA: &str = "oauth-2025-04-20";
 // Release baseline: https://code.claude.com/docs/en/changelog (2026-09-11).
 pub(super) const CLI_VERSION: &str = "2.1.268";
 pub(super) const ANTHROPIC_VERSION: &str = "2023-06-01";
-const EXPIRY_SKEW_SECONDS: i64 = 30 * 60;
+const EXPIRY_SKEW_SECONDS: i64 = 5 * 60;
 
 pub(super) fn fallback_user_agent() -> String {
     format!("claude-cli/{CLI_VERSION} (external, cli)")
@@ -57,17 +57,23 @@ pub(super) fn access_token(secret: &Value) -> Result<&str, ChannelError> {
 }
 
 pub(super) fn refresh_due(secret: &Value) -> Option<i64> {
+    if secret_string(secret, "refresh_token").is_none() && secret_string(secret, "cookie").is_none()
+    {
+        return None;
+    }
     if secret_string(secret, "access_token").is_none() {
         return Some(i64::MIN);
     }
     let expires_at_ms = secret.get("expires_at_ms")?.as_i64()?;
-    (expires_at_ms != 0).then(|| expires_at_ms / 1000 - EXPIRY_SKEW_SECONDS)
+    (expires_at_ms > 0).then(|| {
+        crate::shared::oauth_expiry::refresh_due(secret, expires_at_ms, EXPIRY_SKEW_SECONDS * 1_000)
+    })
 }
 
 pub(super) fn refresh<'a>(
     secret: &'a Value,
     http: &'a dyn SimpleHttp,
-) -> BoxFuture<'a, Result<Value, ChannelError>> {
+) -> BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>> {
     let refresh_token = match secret_string(secret, "refresh_token") {
         Some(token) => token,
         None if secret_string(secret, "cookie").is_some() => {
@@ -100,19 +106,17 @@ pub(super) fn refresh<'a>(
     };
     let send = http.send(request);
     Box::pin(async move {
-        let response = send.await?;
+        let response = send
+            .await
+            .map_err(|_| ChannelError::Refresh("token endpoint request failed".into()))?;
         if !response.status().is_success() {
-            let snippet: String = String::from_utf8_lossy(response.body())
-                .chars()
-                .take(256)
-                .collect();
             return Err(ChannelError::Refresh(format!(
-                "token endpoint {}: {snippet}",
+                "token endpoint returned {}",
                 response.status()
             )));
         }
         let token: Value = serde_json::from_slice(response.body())
-            .map_err(|error| ChannelError::Refresh(format!("invalid token response: {error}")))?;
+            .map_err(|_| ChannelError::Refresh("invalid token response".into()))?;
         rotate(secret, &token)
     })
 }
@@ -217,22 +221,33 @@ fn valid_cli_user_agent(value: &str) -> bool {
         })
 }
 
-fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
+fn rotate(
+    secret: &Value,
+    token: &Value,
+) -> Result<gproxy_channel_api::RefreshResult, ChannelError> {
     let access = secret_string(token, "access_token")
         .ok_or_else(|| ChannelError::Refresh("token response missing access_token".into()))?;
-    let expires_in = token
-        .get("expires_in")
-        .and_then(Value::as_i64)
-        .unwrap_or(3600)
-        .max(0);
     let mut output = secret.clone();
     let object = output
         .as_object_mut()
         .ok_or_else(|| ChannelError::Refresh("secret must be a JSON object".into()))?;
     object.insert("access_token".into(), Value::String(access.into()));
-    if let Some(refresh) = secret_string(token, "refresh_token") {
-        object.insert("refresh_token".into(), Value::String(refresh.into()));
+    update_token_metadata(object, token, unix_now_ms());
+    if secret_string(secret, "device_id").is_none() {
+        object.insert("device_id".into(), Value::String(device_id(secret)));
     }
+    crate::shared::refresh::oauth(output, token.get("refresh_token").and_then(Value::as_str))
+}
+
+pub(super) fn update_token_metadata(object: &mut Map<String, Value>, token: &Value, now_ms: i64) {
+    crate::shared::oauth_expiry::apply(
+        object,
+        now_ms,
+        crate::shared::oauth_expiry::from_lifetime(
+            now_ms,
+            token.get("expires_in").and_then(Value::as_i64),
+        ),
+    );
     if let Some(scope) = secret_string(token, "scope") {
         object.insert(
             "scopes".into(),
@@ -244,14 +259,20 @@ fn rotate(secret: &Value, token: &Value) -> Result<Value, ChannelError> {
             ),
         );
     }
-    object.insert(
-        "expires_at_ms".into(),
-        Value::from(unix_now_ms().saturating_add(expires_in.saturating_mul(1000))),
-    );
-    if !object.contains_key("device_id") {
-        object.insert("device_id".into(), Value::String(device_id(secret)));
+    for (pointer, field) in [
+        ("/account/uuid", "account_uuid"),
+        ("/account/email_address", "user_email"),
+        ("/organization/uuid", "organization_uuid"),
+    ] {
+        if let Some(value) = token
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            object.insert(field.into(), Value::String(value.into()));
+        }
     }
-    Ok(output)
 }
 
 fn refresh_scope(secret: &Value) -> String {

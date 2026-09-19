@@ -268,6 +268,13 @@ impl Channel for MemoryHost {
             .collect())
     }
 
+    fn can_refresh(&self, secret: &serde_json::Value) -> bool {
+        secret
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|token| !token.is_empty())
+    }
+
     fn refresh_due(&self, secret: &serde_json::Value) -> Option<i64> {
         secret.get("expires_at")?.as_i64()
     }
@@ -277,15 +284,19 @@ impl Channel for MemoryHost {
         _: &'a serde_json::Value,
         _: &'a serde_json::Value,
         http: &'a dyn SimpleHttp,
-    ) -> Option<BoxFuture<'a, Result<serde_json::Value, ChannelError>>> {
+    ) -> Option<BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>>> {
         let request = http::Request::post("https://auth.test/refresh")
             .body(Bytes::new())
             .expect("refresh request");
         let send = http.send(request);
         Some(Box::pin(async move {
             let response = send.await?;
-            serde_json::from_slice(response.body())
-                .map_err(|error| ChannelError::Refresh(error.to_string()))
+            let secret = serde_json::from_slice(response.body())
+                .map_err(|error| ChannelError::Refresh(error.to_string()))?;
+            Ok(gproxy_channel_api::RefreshResult {
+                secret,
+                refresh_token: gproxy_channel_api::RefreshTokenStatus::NotReturned,
+            })
         }))
     }
 

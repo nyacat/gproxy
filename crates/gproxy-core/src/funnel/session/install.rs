@@ -20,7 +20,7 @@ pub(super) struct Installed {
 }
 
 pub(super) async fn open<H: Host>(
-    host: &H,
+    host: &crate::Shared<H>,
     channel: std::sync::Arc<dyn Channel>,
     control: &dyn ControlPlane,
     ctx: &FunnelCtx,
@@ -35,7 +35,8 @@ pub(super) async fn open<H: Host>(
             .expect("session funnel retained its request headers"),
         response_headers.clone(),
     );
-    let prepared = connector.prepare(host, false).await?;
+    let prepared = connector.prepare(host).await?;
+    let host = host.as_ref();
     let lease = super::ownership::claim(host, channel.as_ref(), ctx, &prepared.id).await?;
     let attempt = prepared.open(host).await;
     super::capture::sideband(

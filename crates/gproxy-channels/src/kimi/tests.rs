@@ -116,7 +116,7 @@ fn refreshes_rotating_oauth_and_preserves_kimi_cache_usage() {
     let std::task::Poll::Ready(refreshed) = future.as_mut().poll(&mut context) else {
         panic!("mock refresh future must be ready")
     };
-    let refreshed = refreshed.unwrap();
+    let refreshed = refreshed.unwrap().secret;
     assert_eq!(refreshed["access_token"], "new-access");
     assert_eq!(refreshed["refresh_token"], "new-refresh");
     assert_eq!(refreshed["future"], "kept");

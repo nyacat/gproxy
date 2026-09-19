@@ -103,12 +103,18 @@ impl Channel for ClineChannel {
         refresh::due(secret)
     }
 
+    fn can_refresh(&self, secret: &Value) -> bool {
+        crate::shared::refresh::can_refresh(secret)
+    }
+
     fn refresh<'a>(
         &'a self,
         secret: &'a Value,
         provider_settings: &'a Value,
         http: &'a dyn SimpleHttp,
-    ) -> Option<BoxFuture<'a, Result<Value, gproxy_channel_api::ChannelError>>> {
+    ) -> Option<
+        BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, gproxy_channel_api::ChannelError>>,
+    > {
         auth::field(secret, "refresh_token")
             .is_some()
             .then(|| refresh::refresh(secret, provider_settings, http))

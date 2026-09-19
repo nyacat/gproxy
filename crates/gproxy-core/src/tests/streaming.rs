@@ -208,6 +208,7 @@ fn forward_socket_close_hands_settlement_to_spawner_before_drop() {
     let host = MemoryHost::with_session_spawner();
     {
         let mut state = host.state.lock().unwrap();
+        state.credential.secret["expires_at"] = json!(i64::MAX);
         state.defer_spawned = true;
         state.plan = Some(plan(vec![target()]));
         state.bindings.insert(

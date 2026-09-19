@@ -22,16 +22,45 @@ pub(super) fn exchange<'a>(
     http: &'a dyn SimpleHttp,
     input: &'a str,
 ) -> BoxFuture<'a, Result<Value, ChannelError>> {
+    exchange_for_organization(http, input, None)
+}
+
+fn exchange_for_organization<'a>(
+    http: &'a dyn SimpleHttp,
+    input: &'a str,
+    organization_uuid: Option<&'a str>,
+) -> BoxFuture<'a, Result<Value, ChannelError>> {
     Box::pin(async move {
         let cookie = crate::shared::claude::cookie::normalize(input)
             .ok_or_else(|| ChannelError::Login("cookie is missing sessionKey".into()))?;
-        let organization = discover_organization(http, &cookie).await?;
+        let identity = discover_identity(http, &cookie, organization_uuid).await?;
         let (verifier, challenge, state) = pkce()?;
-        let code = authorize(http, &cookie, &organization, &state, &challenge).await?;
+        let code = authorize(
+            http,
+            &cookie,
+            &identity.organization_uuid,
+            &state,
+            &challenge,
+        )
+        .await?;
         let mut secret = token_exchange(http, &verifier, &state, &code).await?;
         secret["cookie"] = Value::String(cookie);
-        secret["account_uuid"] = Value::String(organization);
+        if secret.get("organization_uuid").is_none() {
+            secret["organization_uuid"] = Value::String(identity.organization_uuid);
+        }
+        if let Some(account_uuid) = identity.account_uuid
+            && secret.get("account_uuid").is_none()
+        {
+            secret["account_uuid"] = Value::String(account_uuid);
+        }
         account::enrich(http, &mut secret).await;
+        if organization_uuid.is_some()
+            && secret.get("organization_uuid").and_then(Value::as_str) != organization_uuid
+        {
+            return Err(ChannelError::Login(
+                "cookie refresh returned a different organization".into(),
+            ));
+        }
         ensure_device_id(&mut secret);
         Ok(secret)
     })
@@ -40,25 +69,38 @@ pub(super) fn exchange<'a>(
 pub(super) fn refresh<'a>(
     secret: &'a Value,
     http: &'a dyn SimpleHttp,
-) -> BoxFuture<'a, Result<Value, ChannelError>> {
+) -> BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>> {
     let cookie = secret
         .get("cookie")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let organization_uuid = secret
+        .get("organization_uuid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     Box::pin(async move {
         let cookie = cookie.ok_or_else(|| ChannelError::Refresh("cookie missing".into()))?;
-        let minted = exchange(http, cookie)
+        let minted = exchange_for_organization(http, cookie, organization_uuid)
             .await
             .map_err(|error| ChannelError::Refresh(error.to_string()))?;
-        Ok(overlay(secret, &minted))
+        let returned = minted.get("refresh_token").and_then(Value::as_str);
+        let replacement = overlay_without_refresh_token(secret, &minted);
+        crate::shared::refresh::oauth(replacement, returned)
     })
 }
 
-async fn discover_organization(
+struct CookieIdentity {
+    account_uuid: Option<String>,
+    organization_uuid: String,
+}
+
+async fn discover_identity(
     http: &dyn SimpleHttp,
     cookie: &str,
-) -> Result<String, ChannelError> {
+    preferred_organization: Option<&str>,
+) -> Result<CookieIdentity, ChannelError> {
     let body = send_ok(http, "bootstrap", || {
         let request = http::Request::get(format!("{}/api/bootstrap", auth::CLAUDE_AI_BASE_URL))
             .header(ACCEPT, "application/json")
@@ -73,7 +115,7 @@ async fn discover_organization(
     })
     .await?;
     let value = parse_bootstrap(&body)?;
-    value
+    let organization_uuid = value
         .get("account")
         .and_then(|account| account.get("memberships"))
         .and_then(Value::as_array)
@@ -81,14 +123,34 @@ async fn discover_organization(
             memberships
                 .iter()
                 .filter_map(|membership| membership.get("organization"))
-                .find(|organization| has_subscription(organization))
+                .filter(|organization| has_subscription(organization))
+                .filter_map(|organization| organization.get("uuid"))
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .find(|uuid| preferred_organization.is_none_or(|preferred| preferred == *uuid))
         })
-        .and_then(|organization| organization.get("uuid"))
-        .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| {
-            ChannelError::Login("cookie has no subscription-capable organization".into())
-        })
+            ChannelError::Login(
+                if preferred_organization.is_some() {
+                    "saved organization is unavailable for cookie refresh"
+                } else {
+                    "cookie has no subscription-capable organization"
+                }
+                .into(),
+            )
+        })?;
+    let account_uuid = value
+        .pointer("/account/uuid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    Ok(CookieIdentity {
+        account_uuid,
+        organization_uuid,
+    })
 }
 
 async fn authorize(
@@ -129,12 +191,12 @@ async fn authorize(
     })
     .await?;
     let response: Value = serde_json::from_slice(&response)
-        .map_err(|error| ChannelError::Login(format!("invalid authorize response: {error}")))?;
-    response
+        .map_err(|_| ChannelError::Login("invalid authorize response".into()))?;
+    let uri = response
         .get("redirect_uri")
         .and_then(Value::as_str)
-        .and_then(|uri| query_parameter(uri, "code"))
-        .ok_or_else(|| ChannelError::Login("authorize response missing code".into()))
+        .ok_or_else(|| ChannelError::Login("authorize response missing redirect_uri".into()))?;
+    authorization_code(uri, state)
 }
 
 async fn token_exchange(
@@ -160,37 +222,32 @@ async fn token_exchange(
         .header(USER_AGENT, auth::fallback_user_agent())
         .body(Bytes::from(body))
         .map_err(|error| ChannelError::Login(error.to_string()))?;
-    let response = http.send(browser_request(request)).await?;
+    let response = http
+        .send(browser_request(request))
+        .await
+        .map_err(|_| ChannelError::Login("token endpoint request failed".into()))?;
     if !response.status().is_success() {
-        return Err(endpoint_error("token", response.status(), response.body()));
+        return Err(endpoint_error("token", response.status()));
     }
     let token: Value = serde_json::from_slice(response.body())
-        .map_err(|error| ChannelError::Login(format!("invalid token response: {error}")))?;
+        .map_err(|_| ChannelError::Login("invalid token response".into()))?;
     let access_token = required(&token, "access_token")?;
-    let expires_in = token
-        .get("expires_in")
-        .and_then(Value::as_i64)
-        .unwrap_or(3_600)
-        .max(0);
     let mut secret = json!({
         "access_token": access_token,
-        "expires_at_ms": auth::unix_now_ms().saturating_add(expires_in.saturating_mul(1_000)),
     });
     if let Some(refresh_token) = token
         .get("refresh_token")
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|value| !value.is_empty())
     {
         secret["refresh_token"] = Value::String(refresh_token.into());
     }
-    if let Some(scope) = token.get("scope").and_then(Value::as_str) {
-        secret["scopes"] = Value::Array(
-            scope
-                .split_whitespace()
-                .map(|value| Value::String(value.into()))
-                .collect(),
-        );
-    }
+    auth::update_token_metadata(
+        secret.as_object_mut().expect("cookie secret is an object"),
+        &token,
+        auth::unix_now_ms(),
+    );
     Ok(secret)
 }
 
@@ -200,18 +257,21 @@ where
 {
     let mut challenge = None;
     for _ in 0..COOKIE_MAX_ATTEMPTS {
-        let response = http.send(build()?).await?;
+        let response = http
+            .send(build()?)
+            .await
+            .map_err(|_| ChannelError::Login(format!("{name} endpoint request failed")))?;
         if response.status().is_success() {
             return Ok(response.into_body());
         }
         if is_cloudflare_challenge(response.status(), response.body()) {
-            challenge = Some((response.status(), response.into_body()));
+            challenge = Some(response.status());
             continue;
         }
-        return Err(endpoint_error(name, response.status(), response.body()));
+        return Err(endpoint_error(name, response.status()));
     }
-    let (status, body) = challenge.expect("only challenges exhaust the retry loop");
-    Err(endpoint_error(name, status, &body))
+    let status = challenge.expect("only challenges exhaust the retry loop");
+    Err(endpoint_error(name, status))
 }
 
 fn browser_request(mut request: http::Request<Bytes>) -> http::Request<Bytes> {
@@ -259,19 +319,43 @@ fn is_cloudflare_challenge(status: http::StatusCode, body: &[u8]) -> bool {
         .any(|marker| text.contains(marker))
 }
 
-fn endpoint_error(name: &str, status: http::StatusCode, body: &[u8]) -> ChannelError {
-    let snippet = String::from_utf8_lossy(body)
-        .chars()
-        .take(256)
-        .collect::<String>();
-    ChannelError::Login(format!("{name} endpoint {status}: {snippet}"))
+fn endpoint_error(name: &str, status: http::StatusCode) -> ChannelError {
+    ChannelError::Login(format!("{name} endpoint returned {status}"))
 }
 
-fn query_parameter(uri: &str, name: &str) -> Option<String> {
-    uri.split_once('?')?.1.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
-        (key == name).then(|| value.to_owned())
-    })
+fn authorization_code(uri: &str, expected_state: &str) -> Result<String, ChannelError> {
+    let invalid = || ChannelError::Login("invalid authorization callback".into());
+    if uri.contains('#') {
+        return Err(invalid());
+    }
+    let callback: http::Uri = uri.parse().map_err(|_| invalid())?;
+    let expected: http::Uri = auth::DEFAULT_REDIRECT_URI
+        .parse()
+        .expect("built-in callback is valid");
+    if callback.scheme() != expected.scheme()
+        || callback.authority() != expected.authority()
+        || callback.path() != expected.path()
+    {
+        return Err(invalid());
+    }
+    let mut code = None;
+    let mut state = None;
+    for (key, value) in form_urlencoded::parse(callback.query().unwrap_or_default().as_bytes()) {
+        let target = match key.as_ref() {
+            "code" => &mut code,
+            "state" => &mut state,
+            "error" => return Err(ChannelError::Login("authorization was rejected".into())),
+            _ => continue,
+        };
+        if target.is_some() || value.trim().is_empty() {
+            return Err(invalid());
+        }
+        *target = Some(value.into_owned());
+    }
+    if state.as_deref() != Some(expected_state) || expected_state.is_empty() {
+        return Err(invalid());
+    }
+    code.ok_or_else(invalid)
 }
 
 fn pkce() -> Result<(String, String, String), ChannelError> {
@@ -291,6 +375,7 @@ fn required<'a>(value: &'a Value, name: &str) -> Result<&'a str, ChannelError> {
     value
         .get(name)
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ChannelError::Login(format!("token response missing {name}")))
 }
@@ -301,12 +386,22 @@ fn ensure_device_id(secret: &mut Value) {
     }
 }
 
-fn overlay(old: &Value, minted: &Value) -> Value {
+fn overlay_without_refresh_token(old: &Value, minted: &Value) -> Value {
     let mut output = old.clone();
     if let (Some(output), Some(minted)) = (output.as_object_mut(), minted.as_object()) {
         for (key, value) in minted {
-            output.insert(key.clone(), value.clone());
+            if key != "refresh_token" && key != "device_id" {
+                output.insert(key.clone(), value.clone());
+            }
         }
+        if let Some(received) = minted.get("token_received_at_ms").and_then(Value::as_i64) {
+            crate::shared::oauth_expiry::apply(
+                output,
+                received,
+                minted.get("expires_at_ms").and_then(Value::as_i64),
+            );
+        }
+        output.insert("device_id".into(), Value::String(auth::device_id(old)));
     }
     output
 }

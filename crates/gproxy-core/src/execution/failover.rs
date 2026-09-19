@@ -117,7 +117,11 @@ pub(crate) async fn run<H: Host>(
                 pre_send_error = Some(error);
                 continue;
             }
-            Err(error @ (CoreError::CredentialCoolingDown { .. } | CoreError::NoCredentials)) => {
+            Err(
+                error @ (CoreError::CredentialCoolingDown { .. }
+                | CoreError::CredentialRefreshCoolingDown { .. }
+                | CoreError::NoCredentials),
+            ) => {
                 let reason = "credential model unavailable or recovery probe in flight";
                 last_reason = Some(reason);
                 funnel_error::pre_send(&ctx, target, request.classified.key, reason);

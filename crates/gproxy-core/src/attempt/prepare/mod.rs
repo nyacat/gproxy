@@ -75,7 +75,7 @@ pub(crate) async fn prepare<H: Host>(
         return Err(CoreError::Unsupported);
     }
     let credential = crate::execution::credential::load_fresh(
-        core.host.as_ref(),
+        core,
         channel,
         target.credential,
         &target.provider,

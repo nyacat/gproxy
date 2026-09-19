@@ -389,7 +389,7 @@ fn refresh_uses_codex_client_profile() {
         captured_profile: Mutex::new(false),
     };
     let secret = json!({"access_token":"old", "refresh_token":"refresh"});
-    let rotated = ready(super::auth::refresh(&secret, &http)).unwrap();
+    let rotated = ready(super::auth::refresh(&secret, &http)).unwrap().secret;
     assert_eq!(rotated["access_token"], "new");
     assert!(*http.captured_profile.lock().unwrap());
 }

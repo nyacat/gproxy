@@ -58,6 +58,7 @@ fn refresh(channel: &dyn Channel, http: &MockHttp, secret: &Value, settings: &Va
         .refresh(secret, settings, http)
         .expect("refresh supported"))
     .expect("first refresh")
+    .secret
 }
 
 #[test]

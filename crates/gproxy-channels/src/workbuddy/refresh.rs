@@ -25,7 +25,7 @@ pub(super) fn refresh<'a>(
     secret: &'a Value,
     settings: &'a Value,
     http: &'a dyn SimpleHttp,
-) -> BoxFuture<'a, Result<Value, ChannelError>> {
+) -> BoxFuture<'a, Result<gproxy_channel_api::RefreshResult, ChannelError>> {
     let request = match request(secret, settings) {
         Ok(request) => request,
         Err(error) => return Box::pin(async move { Err(error) }),
@@ -115,7 +115,10 @@ struct Tokens {
     rest: serde_json::Map<String, Value>,
 }
 
-fn rotate(secret: &Value, token: Tokens) -> Result<Value, ChannelError> {
+fn rotate(
+    secret: &Value,
+    token: Tokens,
+) -> Result<gproxy_channel_api::RefreshResult, ChannelError> {
     let Tokens {
         access_token,
         refresh_token,
@@ -138,9 +141,6 @@ fn rotate(secret: &Value, token: Tokens) -> Result<Value, ChannelError> {
         .ok_or_else(|| ChannelError::Refresh("WorkBuddy secret is not an object".into()))?;
     object.insert("access_token".into(), Value::String(access_token));
     let refresh_token = refresh_token.filter(|token| !token.trim().is_empty());
-    if let Some(refresh) = refresh_token.as_ref() {
-        object.insert("refresh_token".into(), Value::String(refresh.clone()));
-    }
     if let Some(expires) = expires_at.or_else(|| relative(expires_in)) {
         object.insert("expires_at_ms".into(), Value::from(expires));
         object.remove("expiry_unknown");
@@ -156,7 +156,7 @@ fn rotate(secret: &Value, token: Tokens) -> Result<Value, ChannelError> {
     } else if refresh_token.is_some() {
         object.remove("refresh_expires_at_ms");
     }
-    Ok(output)
+    crate::shared::refresh::oauth(output, refresh_token.as_deref())
 }
 
 fn relative(seconds: Option<i64>) -> Option<i64> {

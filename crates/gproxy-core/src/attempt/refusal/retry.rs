@@ -160,6 +160,7 @@ impl<H: Host> Runner<H> {
                     CoreError::QuotaExceeded
                     | CoreError::RateLimited { .. }
                     | CoreError::CredentialCoolingDown { .. }
+                    | CoreError::CredentialRefreshCoolingDown { .. }
                     | CoreError::NoCredentials,
                 ) => return Ok(None),
                 Err(error) => return Err(error),
@@ -239,7 +240,7 @@ impl<H: Host> Runner<H> {
             .admit_retry(&self.facts.request_id, &target, &body, self.facts.settle)
             .await?;
         let credential = crate::execution::credential::load_fresh(
-            self.core.host.as_ref(),
+            &self.core,
             channel,
             target.credential,
             &target.provider,

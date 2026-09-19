@@ -78,7 +78,7 @@ pub(crate) async fn request<H: Host>(
         )
         .await?;
     let credential = crate::execution::credential::load_fresh(
-        core.host.as_ref(),
+        core,
         channel,
         target.credential,
         &target.provider,

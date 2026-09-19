@@ -19,6 +19,7 @@ gproxy-protocol = { workspace = true, features = ["exhaustive"] }
 gproxy-transform.workspace = true
 bytes.workspace = true
 futures-core.workspace = true
+futures-channel.workspace = true
 futures-util.workspace = true
 form_urlencoded.workspace = true
 getrandom.workspace = true

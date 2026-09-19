@@ -154,7 +154,10 @@ fn exchange<'a>(
         .extensions_mut()
         .insert(profile::CLIENT_PROFILE.clone());
     Box::pin(async move {
-        let response = http.send(request).await?;
+        let response = http
+            .send(request)
+            .await
+            .map_err(|_| ChannelError::Login("token endpoint request failed".into()))?;
         if !response.status().is_success() {
             return Err(ChannelError::Login(format!(
                 "token endpoint returned {}",
@@ -174,12 +177,17 @@ async fn send_json(
 ) -> Result<http::Response<Bytes>, ChannelError> {
     let payload = serde_json::to_vec(body)
         .map_err(|_| ChannelError::Login("invalid login request".into()))?;
-    let request = http::Request::post(uri)
+    let mut request = http::Request::post(uri)
         .header(http::header::CONTENT_TYPE, "application/json")
         .header(http::header::ACCEPT, "application/json")
         .body(Bytes::from(payload))
         .map_err(|error| ChannelError::Login(error.to_string()))?;
-    http.send(request).await
+    request
+        .extensions_mut()
+        .insert(profile::CLIENT_PROFILE.clone());
+    http.send(request)
+        .await
+        .map_err(|_| ChannelError::Login("device endpoint request failed".into()))
 }
 
 #[derive(Deserialize)]
