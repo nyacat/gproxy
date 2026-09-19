@@ -3,6 +3,7 @@ name = "gproxy-upstream"
 description = "GPROXY v3 canonical native and edge upstream transport"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

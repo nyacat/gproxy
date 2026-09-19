@@ -3,6 +3,7 @@ name = "gproxy-host-edge"
 description = "GPROXY v3 fetch-based wasm host"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
@@ -19,6 +20,7 @@ gproxy-channel-api.workspace = true
 gproxy-core.workspace = true
 http.workspace = true
 js-sys.workspace = true
+tracing.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 web-sys = { workspace = true, features = [
@@ -30,3 +32,9 @@ web-sys = { workspace = true, features = [
     "ResponseInit",
     "Url",
 ] }
+
+[dev-dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+gproxy-channel-api.workspace = true
+gproxy-core.workspace = true

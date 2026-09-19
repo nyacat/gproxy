@@ -3,6 +3,7 @@ name = "gproxy-protocol-macros"
 description = "Construction helpers for extensible gproxy-protocol wire structs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license = "MIT"
 repository.workspace = true
 authors = ["LeenHawk <leenhawk@leenhawk.com>"]

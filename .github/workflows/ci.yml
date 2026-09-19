@@ -31,6 +31,21 @@ jobs:
       - run: cargo test --workspace
       - run: cargo check --workspace --target wasm32-unknown-unknown
 
+  postgres-redis:
+    name: PostgreSQL and Redis integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/perf/test_compare.py
+      - run: python3 scripts/test-postgres-redis.py
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: postgres-redis-results
+          path: target/perf-review/integration.json
+
   console:
     name: Console (typecheck · test · build · i18n)
     runs-on: ubuntu-latest

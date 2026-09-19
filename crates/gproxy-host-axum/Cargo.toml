@@ -3,6 +3,7 @@ name = "gproxy-host-axum"
 description = "GPROXY v3 native axum listener and binary"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

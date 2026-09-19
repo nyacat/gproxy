@@ -3,6 +3,7 @@ name = "gproxy-app"
 description = "GPROXY v3 bootstrap, control snapshot, and core host services"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

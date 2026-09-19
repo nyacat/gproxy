@@ -3,6 +3,7 @@ name = "gproxy-admin"
 description = "GPROXY v3 framework-free admin and portal dispatch"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
