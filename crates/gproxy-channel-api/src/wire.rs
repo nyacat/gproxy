@@ -108,9 +108,17 @@ impl ClientProfile {
         }
     }
 
-    pub fn is_usable(&self) -> bool {
-        self.preset.is_some()
-            || self.alpn.is_some()
+    pub const fn is_usable(&self) -> bool {
+        self.preset.is_some() || self.has_transport_overrides()
+    }
+
+    /// Whether anything besides [`ClientProfile::preset`] is set. A preset is a
+    /// captured browser fingerprint applied whole, so hosts take it in place of
+    /// these fields rather than layering the two: a half-applied capture is a
+    /// fingerprint no real client has. Setting both is an authoring mistake,
+    /// and this is what a host checks before saying so.
+    pub const fn has_transport_overrides(&self) -> bool {
+        self.alpn.is_some()
             || self.min_tls_version.is_some()
             || self.max_tls_version.is_some()
             || self.cipher_list.is_some()

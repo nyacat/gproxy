@@ -7,8 +7,48 @@ use wreq::IntoEmulation;
 use wreq::http2::{Http2Options, PseudoId, PseudoOrder, SettingId, SettingsOrder};
 use wreq::tls::{AlpnProtocol, ExtensionType, TlsOptions, TlsVersion as WreqTlsVersion};
 
-pub(super) fn client_emulation(profile: &ClientProfile) -> wreq::Emulation {
+/// Built emulations, keyed by the profile that produced them.
+///
+/// A profile is either a channel constant or a provider's configured
+/// fingerprint, so the live set is small and changes only on reload, while
+/// building one costs a copy of every cipher string, extension list and
+/// default header it carries — a browser preset is the better part of a
+/// hundred allocations. Editing a provider's fingerprint leaves the previous
+/// profile behind with nothing to evict it, so the map is emptied rather than
+/// grown past anything a real deployment holds.
+#[derive(Default)]
+pub(super) struct Emulations {
+    built: std::sync::RwLock<std::collections::HashMap<ClientProfile, wreq::Emulation>>,
+}
+
+const MAX_CACHED_EMULATIONS: usize = 64;
+
+impl Emulations {
+    pub(super) fn get(&self, profile: &ClientProfile) -> wreq::Emulation {
+        if let Some(found) = self.built.read().expect("emulation cache").get(profile) {
+            return found.clone();
+        }
+        let built = client_emulation(profile);
+        let mut cache = self.built.write().expect("emulation cache");
+        if cache.len() >= MAX_CACHED_EMULATIONS {
+            cache.clear();
+        }
+        cache.insert(profile.clone(), built.clone());
+        built
+    }
+}
+
+fn client_emulation(profile: &ClientProfile) -> wreq::Emulation {
     if let Some(preset) = profile.preset {
+        // A capture is applied whole or not at all, so the rest of the profile
+        // is dropped here. Nothing in tree sets both; say so loudly rather than
+        // let a channel ship a fingerprint it does not actually send.
+        if profile.has_transport_overrides() {
+            tracing::warn!(
+                preset = ?preset,
+                "client profile preset is applied whole; its transport overrides are ignored"
+            );
+        }
         return match preset {
             ClientProfilePreset::Chrome148 => wreq_util::Emulation::Chrome148.into_emulation(),
         };
@@ -32,16 +72,18 @@ pub(super) fn client_emulation(profile: &ClientProfile) -> wreq::Emulation {
         tls = tls.max_tls_version(map_version(value));
         has_tls = true;
     }
+    // wreq keeps these as `Cow`, and a channel constant is already borrowed:
+    // hand the same `Cow` over instead of copying the string out of it.
     if let Some(value) = &profile.cipher_list {
-        tls = tls.cipher_list(value.to_string());
+        tls = tls.cipher_list(value.clone());
         has_tls = true;
     }
     if let Some(value) = &profile.curves_list {
-        tls = tls.curves_list(value.to_string());
+        tls = tls.curves_list(value.clone());
         has_tls = true;
     }
     if let Some(value) = &profile.sigalgs_list {
-        tls = tls.sigalgs_list(value.to_string());
+        tls = tls.sigalgs_list(value.clone());
         has_tls = true;
     }
     if let Some(value) = profile.preserve_tls13_cipher_list {
@@ -142,5 +184,60 @@ fn map_setting(value: &Http2Setting) -> SettingId {
         Http2Setting::InitialWindowSize => SettingId::InitialWindowSize,
         Http2Setting::MaxFrameSize => SettingId::MaxFrameSize,
         Http2Setting::MaxHeaderListSize => SettingId::MaxHeaderListSize,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use super::*;
+
+    #[test]
+    fn a_preset_is_applied_whole_and_keeps_none_of_the_fields_beside_it() {
+        let mixed = ClientProfile {
+            cipher_list: Some(Cow::Borrowed("TLS_AES_128_GCM_SHA256")),
+            ..ClientProfile::preset(ClientProfilePreset::Chrome148)
+        };
+        assert!(mixed.has_transport_overrides());
+
+        let captured = client_emulation(&ClientProfile::preset(ClientProfilePreset::Chrome148));
+        let built = client_emulation(&mixed);
+
+        // The capture wins outright. Splicing one field into a browser
+        // fingerprint yields a client nobody ships, which is why the override
+        // is dropped and logged rather than merged.
+        assert_eq!(
+            built.tls_options.unwrap().cipher_list,
+            captured.tls_options.unwrap().cipher_list
+        );
+    }
+
+    #[test]
+    fn equal_profiles_share_one_build_and_the_cache_stays_bounded() {
+        let cache = Emulations::default();
+        // Borrowed channel defaults and an owned copy of the same values are
+        // the same profile, so they must not occupy two entries — the
+        // connection pool already keys them together.
+        cache.get(&ClientProfile {
+            alpn: Some(Cow::Borrowed(&[Alpn::Http1])),
+            ..Default::default()
+        });
+        cache.get(&ClientProfile {
+            alpn: Some(Cow::Owned(vec![Alpn::Http1])),
+            ..Default::default()
+        });
+        assert_eq!(cache.built.read().unwrap().len(), 1);
+
+        for value in 0..MAX_CACHED_EMULATIONS as u32 {
+            cache.get(&ClientProfile {
+                http2: Some(gproxy_channel_api::Http2Profile {
+                    initial_window_size: Some(value),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        assert!(cache.built.read().unwrap().len() <= MAX_CACHED_EMULATIONS);
     }
 }

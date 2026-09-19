@@ -11,6 +11,7 @@ pub struct WreqTransport {
     system_client: wreq::Client,
     inherit_system_proxy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     default_proxy: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    emulations: std::sync::Arc<profile::Emulations>,
 }
 
 impl WreqTransport {
@@ -31,6 +32,7 @@ impl WreqTransport {
                 inherit_system_proxy,
             )),
             default_proxy: Default::default(),
+            emulations: Default::default(),
         }
     }
 
@@ -40,6 +42,7 @@ impl WreqTransport {
             system_client: client,
             inherit_system_proxy: Default::default(),
             default_proxy: Default::default(),
+            emulations: Default::default(),
         }
     }
 
@@ -92,15 +95,18 @@ impl UpstreamTransport for WreqTransport {
     ) -> BoxFuture<'a, Result<http::Response<ByteStream>, TransportError>> {
         let client = self.client();
         Box::pin(async move {
-            let profile = request.extensions().get::<ClientProfile>().cloned();
+            let emulation = request
+                .extensions()
+                .get::<ClientProfile>()
+                .map(|profile| self.emulations.get(profile));
             let proxy = self.proxy(&request);
             let (parts, body) = request.into_parts();
             let mut request = client
                 .request(parts.method, parts.uri.to_string())
                 .headers(parts.headers)
                 .body(body);
-            if let Some(profile) = profile {
-                request = request.emulation(profile::client_emulation(&profile));
+            if let Some(emulation) = emulation {
+                request = request.emulation(emulation);
             }
             if let Some(proxy) = proxy {
                 request = request.proxy(wreq::Proxy::all(&proxy.0).map_err(connect_error)?);
@@ -127,16 +133,19 @@ impl UpstreamTransport for WreqTransport {
         request: http::Request<Bytes>,
     ) -> BoxFuture<'a, Result<Box<dyn WsDuplex>, TransportError>> {
         let client = self.client();
-        let profile = request.extensions().get::<ClientProfile>().cloned();
+        let emulation = request
+            .extensions()
+            .get::<ClientProfile>()
+            .map(|profile| self.emulations.get(profile));
         let proxy = self.proxy(&request);
         let (parts, _) = request.into_parts();
         Box::pin(async move {
             let mut request = client
                 .request(http::Method::GET, parts.uri.to_string())
                 .headers(parts.headers);
-            request = match profile {
+            request = match emulation {
                 None => request,
-                Some(profile) => request.emulation(profile::client_emulation(&profile)),
+                Some(emulation) => request.emulation(emulation),
             };
             let mut request = wreq::ws::WebSocketRequestBuilder::new(request);
             if let Some(proxy) = proxy {
