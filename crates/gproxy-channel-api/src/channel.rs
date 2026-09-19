@@ -130,6 +130,14 @@ pub trait StreamDecoder: Send {
     fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError>;
     fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError>;
 
+    /// Whether the observed prefix contains only connection/lifecycle metadata
+    /// or a failure before generation began. Opting in lets the engine inspect
+    /// a bounded prefix before committing a stream to the caller. Once output,
+    /// tool activity, usage, or an unknown event appears, this must stay false.
+    fn replay_safe(&self) -> bool {
+        false
+    }
+
     /// The semantic result of a terminal event, independent of HTTP status.
     /// Read after `finish`; wrappers must preserve the upstream result.
     /// `None` means the decoder has no additional classification to report.

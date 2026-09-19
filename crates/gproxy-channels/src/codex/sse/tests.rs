@@ -56,6 +56,52 @@ fn decoder() -> CodexSseDecoder {
 }
 
 #[test]
+fn retry_safety_stops_at_output_tools_usage_or_unknown_events() {
+    use serde_json::json;
+
+    let failure =
+        "data: {\"type\":\"error\",\"code\":\"server_is_overloaded\",\"message\":\"busy\"}\n\n";
+    for (event, safe) in [
+        (
+            json!({"type":"response.created","response":{"id":"r","object":"response","created_at":1,"status":"in_progress","output":[],"usage":null}}),
+            true,
+        ),
+        (
+            json!({"type":"response.failed","response":{"id":"r","object":"response","created_at":1,"status":"failed","output":[],"error":{"code":"server_is_overloaded","message":"busy"}}}),
+            true,
+        ),
+        (
+            json!({"type":"response.failed","response":{"id":"r","object":"response","created_at":1,"status":"failed","output":[],"usage":{"input_tokens":13,"output_tokens":7,"total_tokens":20},"error":{"code":"server_is_overloaded","message":"busy"}}}),
+            false,
+        ),
+        (
+            json!({"type":"response.output_text.delta","output_index":0,"item_id":"m","delta":"visible"}),
+            false,
+        ),
+        (
+            json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"tool","delta":"{}"}),
+            false,
+        ),
+        (json!({"type":"response.future_event"}), false),
+    ] {
+        let wire = format!("data: {event}\n\n{failure}data: [DONE]\n\n");
+        for chunk_size in [1, wire.len()] {
+            let mut decoder = decoder();
+            for chunk in wire.as_bytes().chunks(chunk_size) {
+                decoder.push(Bytes::copy_from_slice(chunk)).unwrap();
+            }
+            assert_eq!(decoder.replay_safe(), safe, "{event}");
+            decoder.finish(StreamEnd::Complete).unwrap();
+            assert_eq!(decoder.replay_safe(), safe, "{event}");
+            assert_eq!(
+                decoder.terminal_disposition(),
+                Some(gproxy_channel_api::Disposition::Retryable)
+            );
+        }
+    }
+}
+
+#[test]
 fn malformed_event_preserves_prefix_across_every_chunk_boundary() {
     let valid = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"m1\",\"delta\":\"你好hello\"}\n\n";
     let invalid = "event: response.code_interpreter_call_code.done\ndata: {\"type\":\"response.code_interpreter_call_code.done\",\"item_id\":\"tool\",\"output_index\":1}\n\n";

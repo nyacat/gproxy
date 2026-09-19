@@ -67,6 +67,15 @@ fn claude_error_conversion_preserves_terminal_health_and_usage() {
                     response_event(event_type, Some(code))
                 };
                 let host = host_with_event(event, false, delimited);
+                if event_type == "error" {
+                    let mut state = host.state.lock().unwrap();
+                    state
+                        .scripted
+                        .front_mut()
+                        .unwrap()
+                        .1
+                        .insert(0, super::stream_failover::output_prefix());
+                }
                 let selected = codex_target();
                 let prior = (
                     selected.credential,

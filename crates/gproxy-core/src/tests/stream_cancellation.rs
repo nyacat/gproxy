@@ -90,7 +90,7 @@ fn context() -> FunnelCtx {
         activity: None,
         health_activity: None,
         health_delegated: false,
-        upstream_started_at_ms: None,
+        upstream_started_at_ms: Some(1),
         request_id: "cancel-inline".into(),
         target: target(),
         credential_version: Some(4),

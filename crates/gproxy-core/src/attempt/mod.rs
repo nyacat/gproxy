@@ -13,11 +13,13 @@ pub(crate) mod body;
 mod media;
 mod prepare;
 mod refusal;
+mod stream_start;
 mod transform;
 
 #[cfg(test)]
 pub(crate) use prepare::executable;
 pub(crate) use prepare::{native_support, prepare, support};
+pub(crate) use stream_start::inspect as inspect_stream_start;
 
 pub(crate) enum Egress {
     Http(Box<http::Request<Bytes>>),

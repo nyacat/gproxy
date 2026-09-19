@@ -1,4 +1,5 @@
 mod routes;
+mod stream_failover;
 mod stream_health;
 
 use bytes::Bytes;
@@ -249,10 +250,13 @@ fn codex_terminal_failures_do_not_restore_health_or_replay_a_committed_response(
                         }
                     })
                 };
-                state.scripted.push_back((
-                    http::StatusCode::OK,
-                    vec![Bytes::from(format!("data: {}\n\n", event))],
-                ));
+                let mut frames = Vec::new();
+                if stream {
+                    // Already emitted output cannot be replayed on another account.
+                    frames.push(stream_failover::output_prefix());
+                }
+                frames.push(Bytes::from(format!("data: {event}\n\n")));
+                state.scripted.push_back((http::StatusCode::OK, frames));
             }
             let core = codex_core(&host)?;
             let mut input = request(stream, "terminal-failure");

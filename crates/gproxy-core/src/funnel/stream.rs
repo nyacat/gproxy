@@ -314,19 +314,23 @@ impl<H: Host> FunnelStream<H> {
                 && let Some(version) = ctx.credential_version
                 && let Some((health, detail)) = health
             {
-                host.record_credential_health(
-                    ctx.target.credential,
-                    &ctx.target.upstream_model,
-                    version,
-                    health,
-                    Some(status),
-                    upstream_failure
-                        .as_ref()
-                        .map(|failure| failure.health_detail())
-                        .as_deref()
-                        .unwrap_or(detail),
-                )
-                .await;
+                if health == crate::CredentialHealth::Healthy {
+                    super::health::record_success(host.as_ref(), &ctx, status, detail).await;
+                } else {
+                    host.record_credential_health(
+                        ctx.target.credential,
+                        &ctx.target.upstream_model,
+                        version,
+                        health,
+                        Some(status),
+                        upstream_failure
+                            .as_ref()
+                            .map(|failure| failure.health_detail())
+                            .as_deref()
+                            .unwrap_or(detail),
+                    )
+                    .await;
+                }
             }
             complete_stream(
                 host,

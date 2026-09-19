@@ -37,6 +37,7 @@ pub(super) struct State {
     pub(super) wait_calls: usize,
     pub(super) rotations: Vec<u64>,
     pub(super) health: Vec<(CredentialId, String, CredentialHealth)>,
+    pub(super) health_successes: Vec<(CredentialId, String, u64, i64)>,
     pub(super) health_writes_pending: bool,
     pub(super) track_health_attempts: bool,
     pub(super) health_attempts: Vec<(CredentialId, String, u64)>,
@@ -136,6 +137,7 @@ impl MemoryHost {
                 wait_calls: 0,
                 rotations: Vec::new(),
                 health: Vec::new(),
+                health_successes: Vec::new(),
                 health_writes_pending: false,
                 track_health_attempts: false,
                 health_attempts: Vec::new(),
@@ -399,6 +401,34 @@ impl Host for MemoryHost {
             ));
         })
     }
+    fn record_credential_health_success<'a>(
+        &'a self,
+        credential: CredentialId,
+        model: &'a str,
+        version: u64,
+        started_at_ms: i64,
+        status: Option<http::StatusCode>,
+        detail: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.record_credential_health(
+                credential,
+                model,
+                version,
+                CredentialHealth::Healthy,
+                status,
+                detail,
+            )
+            .await;
+            self.state.lock().unwrap().health_successes.push((
+                credential,
+                model.into(),
+                version,
+                started_at_ms,
+            ));
+        })
+    }
+
     fn wait<'a>(&'a self, duration: std::time::Duration) -> BoxFuture<'a, ()> {
         let mut state = self.state.lock().expect("state lock");
         if state.long_waits_pending && duration >= std::time::Duration::from_secs(30) {

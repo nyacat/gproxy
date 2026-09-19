@@ -138,6 +138,7 @@ pub(crate) async fn run<H: Host>(
         attempts += 1;
         match attempt::send(core, prepared).await {
             Ok(completed) => {
+                let completed = attempt::inspect_stream_start(core, completed).await;
                 let disposition = completed.disposition;
                 if !disposition.should_failover() {
                     if disposition == Disposition::Success
