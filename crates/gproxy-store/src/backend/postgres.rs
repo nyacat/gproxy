@@ -208,8 +208,7 @@ impl Executor for Postgres {
                 } = &mut *conn;
                 run(cache, client, statement, None).await
             };
-            conn.reusable = result.is_ok();
-            result
+            conn.settle(result)
         })
     }
 
@@ -222,7 +221,7 @@ impl Executor for Postgres {
                     statements: cache,
                     ..
                 } = &mut *conn;
-                let transaction = client.transaction().await.map_err(database_error)?;
+                let transaction = client.transaction().await.map_err(failure)?;
                 let mut results = Vec::with_capacity(statements.len());
                 for statement in statements {
                     let changes = results
@@ -230,13 +229,50 @@ impl Executor for Postgres {
                         .map(|result: &QueryResult| result.affected_rows);
                     results.push(run(cache, &transaction, statement, changes).await?);
                 }
-                transaction.commit().await.map_err(database_error)?;
+                // Dropping an aborted transaction queues its ROLLBACK ahead of
+                // whatever the next caller sends, so the connection survives a
+                // rejected statement here too.
+                transaction.commit().await.map_err(failure)?;
                 Ok(results)
             }
             .await;
-            conn.reusable = result.is_ok();
-            result
+            conn.settle(result)
         })
+    }
+}
+
+/// A statement the server rejected and a connection the server lost are not the
+/// same failure. The first leaves the session in a known state and the second
+/// does not, so only the second may discard the connection: treating every
+/// error alike turns one burst of rejected statements into a full pool
+/// reconnect, and throws away every prepared statement those connections held.
+struct Failure {
+    error: StoreError,
+    reusable: bool,
+}
+
+impl From<StoreError> for Failure {
+    // Failures raised after the server answered leave nothing in flight.
+    fn from(error: StoreError) -> Self {
+        Self {
+            error,
+            reusable: true,
+        }
+    }
+}
+
+impl Lease {
+    fn settle<T>(&mut self, result: Result<T, Failure>) -> Result<T, StoreError> {
+        match result {
+            Ok(value) => {
+                self.reusable = true;
+                Ok(value)
+            }
+            Err(failure) => {
+                self.reusable = failure.reusable;
+                Err(failure.error)
+            }
+        }
     }
 }
 
@@ -245,19 +281,18 @@ async fn run(
     client: &impl GenericClient,
     statement: Statement,
     changes: Option<u64>,
-) -> Result<QueryResult, StoreError> {
+) -> Result<QueryResult, Failure> {
     let sql = replace_changes(statement.sql_for(Dialect::Postgres), changes);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    sql.hash(&mut hasher);
-    let query_id = hasher.finish();
     let cache_hit = cache.get(&sql).is_some();
     let started = web_time::Instant::now();
-    let result = run_query(cache, client, statement, changes).await;
+    let result = run_query(cache, client, statement, &sql).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let rows = result.as_ref().map_or(0, |result| result.rows.len());
+    // Identifying the statement costs a hash of the whole text, so leave it to
+    // the logging macros: they skip their arguments when nothing is listening.
     if elapsed_ms >= 200 {
         tracing::warn!(
-            query_id,
+            query_id = query_id(&sql),
             elapsed_ms,
             rows,
             cache_hit,
@@ -266,7 +301,7 @@ async fn run(
         );
     } else {
         tracing::debug!(
-            query_id,
+            query_id = query_id(&sql),
             elapsed_ms,
             rows,
             cache_hit,
@@ -277,13 +312,18 @@ async fn run(
     result
 }
 
+fn query_id(sql: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sql.hash(&mut hasher);
+    hasher.finish()
+}
+
 async fn run_query(
     cache: &mut StatementCache,
     client: &impl GenericClient,
     statement: Statement,
-    changes: Option<u64>,
-) -> Result<QueryResult, StoreError> {
-    let sql = replace_changes(statement.sql_for(Dialect::Postgres), changes);
+    sql: &str,
+) -> Result<QueryResult, Failure> {
     let values = statement
         .args
         .into_iter()
@@ -293,18 +333,18 @@ async fn run_query(
         .iter()
         .map(|value| value as &(dyn ToSql + Sync))
         .collect::<Vec<_>>();
-    let prepared = if let Some(prepared) = cache.get(&sql) {
+    let prepared = if let Some(prepared) = cache.get(sql) {
         prepared.clone()
     } else {
-        let prepared = client.prepare(&sql).await.map_err(database_error)?;
-        cache.insert(sql.clone(), prepared.clone());
+        let prepared = client.prepare(sql).await.map_err(failure)?;
+        cache.insert(sql.to_owned(), prepared.clone());
         prepared
     };
     if prepared.columns().is_empty() {
         let affected_rows = client
             .execute(&prepared, &parameters)
             .await
-            .map_err(|error| query_error(error, &prepared, &values, &sql))?;
+            .map_err(|error| query_error(error, &prepared, &values, sql))?;
         return Ok(QueryResult {
             rows: Vec::new(),
             affected_rows,
@@ -314,8 +354,11 @@ async fn run_query(
     let selected = client
         .query(&prepared, &parameters)
         .await
-        .map_err(|error| query_error(error, &prepared, &values, &sql))?;
-    let writes = !sql.trim_start().to_ascii_uppercase().starts_with("SELECT");
+        .map_err(|error| query_error(error, &prepared, &values, sql))?;
+    let writes = !sql
+        .trim_start()
+        .get(..6)
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("SELECT"));
     let last_insert_id = selected.first().and_then(|row| {
         row.columns()
             .iter()
@@ -446,21 +489,33 @@ fn database_error(error: tokio_postgres::Error) -> StoreError {
     }
 }
 
+// An ErrorResponse means the server rejected the statement and is ready for the
+// next one. Anything else — a closed socket, a driver that gave up mid-exchange
+// — leaves a connection nobody may lend out again.
+fn failure(error: tokio_postgres::Error) -> Failure {
+    Failure {
+        reusable: error.as_db_error().is_some(),
+        error: database_error(error),
+    }
+}
+
 fn query_error(
     error: tokio_postgres::Error,
     statement: &tokio_postgres::Statement,
     values: &[PgValue],
     sql: &str,
-) -> StoreError {
+) -> Failure {
     for (index, (value, ty)) in values.iter().zip(statement.params()).enumerate() {
         if value.to_sql_checked(ty, &mut BytesMut::new()).is_err() {
+            // The driver rejected the arguments before writing anything.
             return StoreError::Database(format!(
                 "PostgreSQL cannot encode parameter {index} as {ty} for {}",
                 sql.split_whitespace().take(4).collect::<Vec<_>>().join(" ")
-            ));
+            ))
+            .into();
         }
     }
-    database_error(error)
+    failure(error)
 }
 
 #[cfg(test)]
@@ -619,6 +674,54 @@ mod tests {
             held.push(pool.checkout().await.unwrap());
         }
         assert_eq!(held.len(), 8);
+    }
+
+    // A rejected statement is the server working, not the connection failing.
+    // Recycling the connection for it would answer an error burst by
+    // reconnecting the pool and re-preparing everything it had cached.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL via GPROXY_TEST_POSTGRES_DSN"]
+    async fn postgres_rejected_statements_keep_their_connection_and_prepared_statements() {
+        use crate::backend::{DbValue, Executor, Statement};
+        let dsn = std::env::var("GPROXY_TEST_POSTGRES_DSN").expect("GPROXY_TEST_POSTGRES_DSN");
+        let pool = super::Postgres::connect(&dsn, 8, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let backend = || async {
+            pool.execute(Statement::plain("SELECT pg_backend_pid()::bigint AS value"))
+                .await
+                .unwrap()
+                .rows[0]
+                .i64("value")
+                .unwrap()
+        };
+        let first = backend().await;
+        // The divisor is a parameter so the planner cannot reject this while
+        // preparing it: the connection must survive a failure raised mid-query.
+        let divide = || {
+            Statement::with_args(
+                "SELECT 1::bigint / $1::bigint AS value",
+                vec![DbValue::Integer(0)],
+            )
+        };
+        assert!(pool.execute(divide()).await.is_err());
+        assert_eq!(backend().await, first);
+        assert!(pool.batch(vec![divide()]).await.is_err());
+        assert_eq!(backend().await, first);
+        let mut lease = pool.checkout().await.unwrap();
+        assert!(
+            lease
+                .statements
+                .get("SELECT 1::bigint / $1::bigint AS value")
+                .is_some()
+        );
+        assert!(
+            lease
+                .statements
+                .get("SELECT pg_backend_pid()::bigint AS value")
+                .is_some()
+        );
+        lease.reusable = true;
     }
 
     #[tokio::test]
