@@ -8,7 +8,7 @@ use crate::dto::{
 };
 use crate::{AdminError, State};
 
-pub(super) fn provider(
+pub(in crate::handlers) fn provider(
     state: &impl State,
     request: ProviderWriteRequest,
 ) -> Result<ProviderInput, AdminError> {
@@ -59,7 +59,7 @@ pub(super) fn provider(
     })
 }
 
-pub(super) fn route(request: RouteWriteRequest) -> Result<RouteInput, AdminError> {
+pub(in crate::handlers) fn route(request: RouteWriteRequest) -> Result<RouteInput, AdminError> {
     if request.name.trim().is_empty() || request.max_attempts == 0 {
         return Err(AdminError::BadRequest(
             "route name must not be blank and max_attempts must be positive".into(),
@@ -73,7 +73,7 @@ pub(super) fn route(request: RouteWriteRequest) -> Result<RouteInput, AdminError
     })
 }
 
-pub(super) fn route_member(
+pub(in crate::handlers) fn route_member(
     request: RouteMemberWriteRequest,
 ) -> Result<RouteMemberInput, AdminError> {
     if request.upstream_model.trim().is_empty() {
@@ -96,7 +96,7 @@ pub(super) fn route_member(
     })
 }
 
-pub(super) fn alias(request: AliasWriteRequest) -> Result<AliasInput, AdminError> {
+pub(in crate::handlers) fn alias(request: AliasWriteRequest) -> Result<AliasInput, AdminError> {
     if request.alias.trim().is_empty() || request.target.trim().is_empty() {
         return Err(AdminError::BadRequest(
             "alias and target must not be blank".into(),
@@ -111,7 +111,7 @@ pub(super) fn alias(request: AliasWriteRequest) -> Result<AliasInput, AdminError
     })
 }
 
-pub(super) fn model_alias(
+pub(in crate::handlers) fn model_alias(
     request: ModelAliasWriteRequest,
 ) -> Result<ExposedModelInput, AdminError> {
     if request.name.trim().is_empty() {
