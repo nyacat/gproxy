@@ -97,3 +97,119 @@ release profile 保留 self 的 `opt-level=3`；需要体积优先时可显式�
 | `bash -n deploy/self/build.sh deploy/self/upload.sh` | 通过 |
 
 未连接生产数据库、MySQL、Upstash 或真实 Edge runtime；没有执行部署，也没有把历史跑分当作本轮性能结论。
+
+---
+
+# 2026-09-20：基底推进到 v3.0.17，历史按功能点重建
+
+以上记录的是上一轮整合（基底 `2b56d98b`）的逐提交取舍，结论继续有效。本轮没有重做那些取舍，只做两件事：把基底推进到最新上游，并把上一轮糊成一个 401 文件压扁提交的自有功能拆成可 review 的功能点。
+
+| 项 | 值 |
+| --- | --- |
+| 新基底 | `c29e5fdf`（上游 `LeenHawk/gproxy` v3.0.17） |
+| 旧基底 | `2b56d98b`（v3.0.13），相距 17 个上游提交 |
+| 重建前的 `self` | 备份为本地分支 `self_bk_20260920`（`faba3ed2`），按决定不推 origin |
+| 功能边界参照 | tag `self_bk_prev`（`5bd10281`）固定上一轮那 40 个原始功能点提交，它们原先只靠 reflog 存活 |
+| 重建后的 `self` | 25 个提交，base 在 `c29e5fdf` |
+
+## 做法：先 rebase 定内容，再拆分定形状
+
+两步分开，各有独立判据：
+
+1. `git rebase --onto c29e5fdf 2b56d98b` 产出中间分支 `self-rebased`，只解决自有功能与上游新代码的冲突，并在此跑完整套验证。这是**内容的唯一真相**。
+2. 在 `c29e5fdf` 上重新起 `self`，逐个功能点 `git checkout <阶段提交> -- <路径清单>` 落盘提交。拆分阶段不再碰上游冲突，只决定历史形状。
+
+因此有一条可机械验证的不变量，贯穿始终：
+
+```
+git diff self-rebased self    # 空 —— 拆分没有增、删、改任何一行
+```
+
+重建分 7 个阶段，每个阶段对应 rebase 后的一个提交；阶段收尾都核对过 `git diff <该阶段提交> HEAD` 为空，最后核对 tip 等于 `self-rebased`。
+
+文件归属是**整文件粒度**，不按 hunk 切：同一个文件被拆到两个提交里，会让两边都处于内部不自洽的状态（签名在一个提交、调用方在另一个）。判据是该文件被哪一组原始提交改得最多；只有两条例外需要人工定夺 —— `Cargo.toml`/`Cargo.lock` 必须与依赖变更同时落地，统一并入工具链提交；测试与实现文件跟随各自的功能点，而不是集中到测试工具提交。
+
+## 上游 17 个提交的处理
+
+`47d40363`..`c29e5fdf` 共 17 个提交、42 个文件，其中与 self 改动有交集的只有 16 个文件，所以本轮用 rebase 即可，不需要像上一轮那样从零重写。
+
+上游新增功能一律保留，交界处按上游现有接口整合：
+
+- `447b3e3a` 用量记录的确认式批量删除 —— 与 self 的 keyset 分页和统计限界同时保留；`usage-table.tsx` 是本轮唯一的 rebase 冲突，解法是保留上游的批量删除，套在 self 的内外层组件拆分与分页之上。
+- `380377c7` provider 维度的 catalogue 路由 —— 保留，self 的健康分类接在其后。
+- `12c7aeb1` Claude prefill 保留尾部 system 消息、`77d2353d` 保留可见 reasoning summary、`97987c3b` 接受 ToolSearch 引用 —— 全部保留。
+- `a49abfc1` about 页与赞助链接、`be3cdccb` 审计 TPS 下的 token 用量、`47d40363` Sponsors 链接 —— 全部保留。
+- 5 个依赖 bump 与 `59343b27` 的 workspace pin 对齐 —— 采用上游版本；self 侧只保留 Rust 1.98.1 基线和 release profile 的 `opt-level=3`。
+
+## 拆分结果
+
+| # | 提交 | 文件 | 单独 `cargo check` |
+| --- | --- | --- | --- |
+| 1 | `build(self)`: Rust 1.98.1 基线、self 部署工具与 CI | 31 | 通过 |
+| 2 | `perf(store)`: PostgreSQL 连接池、语句缓存、Redis EVALSHA | 9 | 不通过 |
+| 3 | `feat(quota)`: 周期重建限界与竞争窗口串行写 | 33 | 不通过 |
+| 4 | `feat(admission)`: 原子预留费用与幂等重放结算 | 58 | 不通过 |
+| 5 | `feat(routing)`: 轻量请求分类与 CLI 指纹隔离 | 45 | 不通过 |
+| 6 | `fix(stream)`: 保留部分输出、流尾与结构化失败 | 77 | 不通过 |
+| 7 | `fix(host)`: 后台任务跟踪与自更新重启前 drain | 18 | 不通过 |
+| 8 | `fix(import)`: 批量写入前校验引用与记录 | 13 | 不通过 |
+| 9 | `perf(usage)`: 统计读限界与按时间索引分页 | 38 | 不通过 |
+| 10 | `feat(quota)`: 重建配额快照与迁移 branch history | 16 | 通过 |
+| 11 | `perf(console)`: 渲染限界、取消过期查询、按需加载配额详情 | 63 | 通过 |
+| 12 | `fix(stream)`: envelope 失败时保留 channel 流尾 | 34 | 通过 |
+| 13 | `fix(credential)`: 刷新租约竞争时读权威行 | 3 | 不通过 |
+| 14 | `fix(quota)`: 硬化配额状态转移与内存费用预留 | 47 | 通过 |
+| 15 | `fix(console)`: 收尾用量与凭证界面；固定部署镜像基底 | 22 | 通过 |
+| 16 | `build(self)`: 按 commit 打镜像 tag 并更新 latest | 1 | 通过 |
+| 17 | `feat(health)`: 按模型探测并快照凭证健康 | 26 | 不通过 |
+| 18 | `feat(admin)`: 按模型重置降级的凭证健康 | 12 | 不通过 |
+| 19 | `fix(core)`: websocket 与 refusal 路径尊重按模型健康 | 48 | 通过 |
+| 20 | `feat(channel-api)`: 凭证刷新契约与各 channel 适配 | 73 | 不通过 |
+| 21 | `feat(admin)`: 暴露手动凭证刷新与 quota probe 来源 | 21 | 通过 |
+| 22 | `feat(console)`: provider 界面的手动凭证刷新 | 16 | 通过 |
+| 23 | `fix(core)`: 重试流起始处抛出的上游容量错误 | 12 | 不通过 |
+| 24 | `fix(health)`: 凭证健康恢复需要真实成功 | 12 | 通过 |
+| 25 | `feat(core)`: 流起始检查的内存预算 | 16 | 通过 |
+
+上一轮的 `1d03e280`（旧审查/跑分结果）按既定决策不带入，仍只留在备份分支。
+
+## 单独编译情况（如实记录）
+
+25 个提交里 **12 个 `cargo check --workspace` 单独通过，13 个不通过**（上表最后一列）。tip 全绿，见下节。
+
+不通过的根因不是归属算错，而是**上一轮整合时这些功能就是一起重写的**，跨 crate 的契约变更没有中间态：
+
+- **trait 声明与实现分居两个提交**：#2 `CacheBackend::seed_counter`、#13 `SnapshotControl::credential_for_load`、#17/#18 `gproxy_core::host::CredentialHealthLease`、#20 `lease_refresh` 参数个数、#23 `health::record_success`。声明在 `gproxy-core`，实现在 `gproxy-app`/`gproxy-store`/`gproxy-channels`，属于不同功能点。
+- **模块文件与 `mod` 声明分居**：#3、#5、#9 的 `file not found for module branch_history` / `failure`。一个 hunk 往往一次声明多个模块，声明无法单独搬走。
+- **结构体字段与其初始化点分居**：#6、#7、#8 的 `missing field activity in initializer of FunnelCtx`。
+- **跨功能点的 import**：#4 的 `unresolved import crate::funnel::inline`。
+
+具体有两个不可约的依赖环横跨其中 6 个功能点：
+
+1. `gproxy-store`（quota/usage/settlement）↔ `gproxy-app` 的 snapshot/host 插件 ↔ `gproxy-core` 的 host trait；
+2. `gproxy-channel-api` 的流解码契约 ↔ `gproxy-channels` 11 个 channel 的实现 ↔ `gproxy-transform` 的 envelope ↔ `gproxy-core` 的 funnel。
+
+不存在一种文件归属或提交顺序能让它们各自独立编译。可以靠把相关 crate 整个合进同一个提交换取逐提交可编译，但那样会把 quota、admission、stream 三个功能点糊回一起 —— 本轮明确选择**保功能点边界，放宽逐提交编译**。因此 bisect 应以 tip 与上表中可编译的提交为落点，不要假设任意中间提交可构建。
+
+## 验证
+
+本轮使用 Rust 1.98.1 与 Node.js 24.21.0，全部在重建后的 tip（`f87c32c9`）上实际执行。
+
+| 检查 | 结果 |
+| --- | --- |
+| `git diff self-rebased self` | 空 —— 拆分与 rebase 内容逐字节一致 |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 通过 |
+| `cargo test --workspace --no-fail-fast` | 941 passed，0 failed，28 ignored |
+| `cargo check --workspace --target wasm32-unknown-unknown` | 通过 |
+| console `pnpm lint` | TypeScript、ESLint、i18n parity/unused 全部通过 |
+| console `pnpm test` | 42 个 Vitest 文件、130 个测试通过；4 个模型目录脚本测试通过 |
+| console `pnpm build` | 通过 |
+| docs `pnpm check` 与 `pnpm build` | 通过，57 个页面构建成功 |
+| `python3 scripts/test-postgres-redis.py` | 23/23 通过（临时 loopback 容器） |
+| `python3 scripts/perf/test_compare.py` | 12 个测试通过 |
+| `bash -n deploy/self/build.sh deploy/self/upload.sh` | 通过 |
+
+测试总数由上一轮的 746 升到 941，其中既有上游 v3.0.14–v3.0.17 新增的测试，也有本轮拆分过程中一并带入的 self 自有测试；重点是 0 failed。
+
+未连接生产数据库、MySQL、Upstash 或真实 Edge runtime；没有执行部署，也没有把上一轮的跑分当作本轮性能结论。
