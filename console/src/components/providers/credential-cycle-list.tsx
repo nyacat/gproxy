@@ -1,8 +1,8 @@
 import type { CredentialQuotaCycleDto } from "@/generated/CredentialQuotaCycleDto"
 import type { QuotaProbeWindowDto } from "@/generated/QuotaProbeWindowDto"
 import { useMemo, useState } from "react"
-import { useQuery } from "@tanstack/react-query"
-import { queryCredentialCycles } from "@/api/observability"
+import { useCyclePage } from "@/components/usage/use-cycle-page"
+import { CyclePageNavigation } from "@/components/usage/cycle-page-navigation"
 import { CycleEstimateDetails } from "@/components/usage/cycle-estimate-details"
 import { QueryState } from "@/components/query-state"
 import { OptionPages } from "@/components/option-pages"
@@ -107,10 +107,12 @@ function PreviousCycles({ credentialId, currentIds }: { credentialId: number; cu
 function PreviousCycleData({ credentialId, currentIds }: { credentialId: number; currentIds: number[] }) {
   const { t } = useTranslation()
   const [to] = useState(() => Math.floor(Date.now() / 1000) + 1)
-  const request = { from: to - 366 * 86400, to, credential_id: credentialId, include_history: false, include_estimate: false }
-  const query = useQuery({ queryKey: ["credential-cycles", "previous", request], queryFn: ({ signal }) => queryCredentialCycles(request, signal, "quota-details"), refetchInterval: 60_000 })
-  const previous = (query.data ?? []).filter((cycle) => !currentIds.includes(cycle.id))
-  return <QueryState loading={query.isLoading} error={query.error ? t("common.loadError") : ""}>
+  const page = useCyclePage({ from: to - 366 * 86400, to, credential_id: credentialId })
+  const previous = (page.query.data?.items ?? []).filter((cycle) => !currentIds.includes(cycle.id))
+  return <div className="grid gap-3">
+    <CyclePageNavigation page={page.page} hasMore={page.query.data?.next_cursor != null} pending={page.query.isFetching} previous={page.previous} next={page.next} />
+    <QueryState loading={page.query.isLoading} error={page.query.error ? t("common.loadError") : ""}>
     {previous.length ? <HistoryTiles cycles={previous} /> : <p className="text-sm text-muted-foreground">{t("providers.credentials.noQuotaCycle")}</p>}
-  </QueryState>
+    </QueryState>
+  </div>
 }

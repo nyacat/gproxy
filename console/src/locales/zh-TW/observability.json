@@ -158,6 +158,9 @@
         "cost": "折算剩餘 USD"
       },
       "pageHint": "目前顯示 {{count}} / {{total}} 個週期，圖表與明細隨頁面切換。",
+      "pageSelectionHint": "下方管道、序列和週期選擇僅作用於目前頁面。上方供應商、憑證和視窗篩選會查詢全部歷史；下一頁可查看更早的週期。",
+      "windowKey": "視窗識別碼",
+      "windowFilterHint": "可選，精確比對視窗識別碼，例如 primary 或 weekly；篩選範圍包含全部歷史頁面。",
       "sampleHint": "密集曲線依桶顯示首尾與極值；範圍統計包含全部觀測。"
     },
     "cycleUsage": {
@@ -176,6 +179,7 @@
         "unknown_scope": "無法確定對應模型範圍",
         "unordered_observations": "觀測順序不確定，等待複查",
         "incomplete_usage": "樣本用量未完整結算或缺失",
+        "estimate_overflow": "數值超出可計算範圍",
         "usage_disabled": "用量記錄已關閉"
       },
       "estimateDetails": "查看估算詳情",

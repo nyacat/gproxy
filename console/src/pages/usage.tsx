@@ -1,15 +1,15 @@
 import { useCallback, useMemo, useRef, useState } from "react"
 import { readPageSize } from "@/components/data-table-state"
-import { hashKey, keepPreviousData, useQueries, useQuery } from "@tanstack/react-query"
+import { hashKey, useQueries, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useTranslation } from "react-i18next"
 import type { UsageRecordQueryDto } from "@/generated/UsageRecordQueryDto"
-import { queryCredentialCycles, usageRecords, usageSummary } from "@/api/observability"
+import { usageRecords, usageSummary } from "@/api/observability"
 import { credentials as fetchCredentials, providers as fetchProviders } from "@/api/control"
 import { userKeys as fetchUserKeys, users as fetchUsers } from "@/api/identity"
 import { PageLayout } from "@/components/page-layout"
 import type { PageSize } from "@/components/data-table-pagination"
 import { UsageExplorer } from "@/components/usage/usage-explorer"
-import { QuotaHistory } from "@/components/usage/quota-history"
+import { QuotaHistoryPage } from "@/components/usage/quota-history-page"
 import { ObservabilityTabs } from "@/components/observability-tabs"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 
@@ -17,6 +17,8 @@ type UsageView = "records" | "quotas"
 const EMPTY: never[] = []
 
 const now = () => Math.floor(Date.now() / 1000)
+const usageFilter = (query: UsageRecordQueryDto) => ({ ...query, page: null, page_size: null })
+const recordsKey = (query: UsageRecordQueryDto) => ["usage-records", usageFilter(query), query.page, query.page_size] as const
 
 function initialQuery(): UsageRecordQueryDto {
   const to = now()
@@ -25,6 +27,7 @@ function initialQuery(): UsageRecordQueryDto {
 
 export function UsagePage() {
   const { t } = useTranslation()
+  const client = useQueryClient()
   const [view, setView] = useState<UsageView>("records")
   const [draft, setDraft] = useState<UsageRecordQueryDto>(initialQuery)
   const [query, setQuery] = useState<UsageRecordQueryDto>(draft)
@@ -42,32 +45,37 @@ export function UsagePage() {
     const next = { ...draft, to, page: 1, page_size: query.page_size }
     setDraft((value) => ({ ...value, to }))
     setQuery(next)
-    if (view === "records" && hashKey([next]) === hashKey([query])) {
-      void records.refetch()
-      void summary.refetch()
-    } else if (view === "quotas" && next.from === query.from && next.to === query.to
-      && next.provider_id === query.provider_id && next.credential_id === query.credential_id) {
-      void cycleQuery.refetch()
+    if (view === "records") {
+      // Explicit Apply refreshes both reads, including when page 1 is already
+      // cached or only pagination changed. Inactive matches become stale and
+      // are fetched when the new observers mount.
+      void client.invalidateQueries({ queryKey: recordsKey(next), exact: true })
+      void client.invalidateQueries({ queryKey: ["usage-summary", usageFilter(next)], exact: true })
+    } else {
+      void client.invalidateQueries({ queryKey: ["credential-cycles", "page"] })
     }
   }
-  const filter = { ...query, page: null, page_size: null }
+  const filter = usageFilter(query)
   // Detach the inactive view's observers so in-flight requests can be aborted.
-  const history = view === "quotas" ? { from: query.from, to: query.to, credential_id: query.credential_id, provider_id: query.provider_id } : null
-  const records = useQuery({ queryKey: ["usage-records", view === "records" ? query : null], queryFn: ({ signal }) => usageRecords(query, signal), placeholderData: keepPreviousData, enabled: view === "records" })
-  const [summary, credentialQuery, providerQuery, userQuery, keyQuery, cycleQuery] = useQueries({ queries: [
+  const records = useQuery({
+    queryKey: view === "records" ? recordsKey(query) : ["usage-records", null],
+    queryFn: ({ signal }) => usageRecords(query, signal),
+    // Retain a page while navigating within its filter only. Another filter's
+    // rows must never be paired with the new summary or exposed as its result.
+    placeholderData: (previous, previousQuery) => hashKey([previousQuery?.queryKey[1]]) === hashKey([filter]) ? previous : undefined,
+    enabled: view === "records",
+  })
+  const [summary, credentialQuery, providerQuery, userQuery, keyQuery] = useQueries({ queries: [
     { queryKey: ["usage-summary", view === "records" ? filter : null], queryFn: ({ signal }) => usageSummary(query, signal), enabled: view === "records" },
     { queryKey: ["credentials"], queryFn: ({ signal }) => fetchCredentials(signal) },
     { queryKey: ["providers"], queryFn: ({ signal }) => fetchProviders(signal) },
     { queryKey: ["users"], queryFn: ({ signal }) => fetchUsers(signal), enabled: view === "records" },
     { queryKey: ["user-keys"], queryFn: ({ signal }) => fetchUserKeys(signal), enabled: view === "records" },
-    { queryKey: ["credential-cycles", "history", history], queryFn: ({ signal }) => queryCredentialCycles({ from: query.from, to: query.to, credential_id: query.credential_id, provider_id: query.provider_id, include_history: false, include_estimate: false }, signal), refetchInterval: view === "quotas" ? 60_000 : false, enabled: view === "quotas" },
   ] })
   const totalRequests = summary.data?.requests
   const recordPage = useMemo(() => records.data
     ? { ...records.data, total: records.data.total ?? totalRequests ?? null }
     : { items: EMPTY, total: null, page: 1, page_size: 10, has_more: false }, [records.data, totalRequests])
-  const loading = view === "records" ? records.isLoading : cycleQuery.isLoading
-  const error = view === "records" ? records.error : cycleQuery.error
   return (
     <PageLayout title={t("nav.usage")} description={t("usage.description")}>
       <ObservabilityTabs value="usage" />
@@ -82,17 +90,16 @@ export function UsagePage() {
           onReset={() => { const next = initialQuery(); pinnedTo.current = false; setDraft(next); setQuery(next) }}
           page={recordPage}
           summary={summary.data ?? null} summaryError={Boolean(summary.error)} pending={records.isFetching}
-          loading={loading} error={Boolean(error)}
+          loading={records.isLoading} error={Boolean(records.error)}
           onPage={onPage} onPageSize={onPageSize}
           credentials={credentialQuery.data ?? EMPTY} providers={providerQuery.data ?? EMPTY}
           users={userQuery.data ?? EMPTY} keys={keyQuery.data ?? EMPTY}
         >
-          <QuotaHistory
+          <QuotaHistoryPage
             range={{ from: query.from, to: query.to, credential_id: query.credential_id, provider_id: query.provider_id }}
-            cycles={cycleQuery.data ?? []}
             providers={providerQuery.data ?? []} credentials={credentialQuery.data ?? []}
-            loading={cycleQuery.isLoading || providerQuery.isLoading || credentialQuery.isLoading}
-            error={cycleQuery.isError || providerQuery.isError || credentialQuery.isError}
+            loading={providerQuery.isLoading || credentialQuery.isLoading}
+            error={providerQuery.isError || credentialQuery.isError}
           />
         </UsageExplorer>
     </PageLayout>

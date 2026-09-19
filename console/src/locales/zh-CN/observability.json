@@ -158,6 +158,9 @@
         "cost": "折算剩余 USD"
       },
       "pageHint": "当前显示 {{count}} / {{total}} 个周期，图表和明细随页面切换。",
+      "pageSelectionHint": "下方渠道、序列和周期选择仅作用于当前页。上方服务商、凭据和窗口筛选会查询全部历史；下一页可查看更早的周期。",
+      "windowKey": "窗口标识",
+      "windowFilterHint": "可选，精确匹配窗口标识，例如 primary 或 weekly；筛选范围包含全部历史页面。",
       "sampleHint": "密集曲线按桶显示首尾和极值；范围统计包含全部观测。"
     },
     "cycleUsage": {
@@ -176,6 +179,7 @@
         "unknown_scope": "无法确定对应模型范围",
         "unordered_observations": "观测顺序不确定，等待复查",
         "incomplete_usage": "样本用量未完整结算或缺失",
+        "estimate_overflow": "数值超出可计算范围",
         "usage_disabled": "用量记录已关闭"
       },
       "estimateDetails": "查看估算详情",

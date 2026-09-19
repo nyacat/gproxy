@@ -1,7 +1,7 @@
 import type { CredentialDto } from "@/generated/CredentialDto"
 import type { QuotaSnapshot } from "@/generated/QuotaSnapshot"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
-import { render, screen, waitFor, within } from "@testing-library/react"
+import { act, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import "@/i18n"
@@ -84,6 +84,63 @@ describe("CredentialCard", () => {
     expect(client.getQueryState(ownHistory)?.isInvalidated).toBe(true)
     expect(client.getQueryState(otherProvider)?.isInvalidated).toBe(false)
     expect(client.getQueryState(otherHistory)?.isInvalidated).toBe(false)
+  })
+
+  it("keeps a late manual probe bound to the credential version that started it", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    let resolveProbe!: (response: Response) => void
+    const current = snapshot()
+    current.entries[0].value = { kind: "balance", remaining: "220.00", unit: "CNY", availability: "available", components: [] }
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response(snapshot()))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveProbe = resolve }))
+      .mockResolvedValueOnce(response(current)))
+    const mounted = render(view(credential, client))
+    await screen.findByText("110.00 CNY")
+    await userEvent.setup().click(screen.getByRole("button", { name: "Refresh" }))
+    mounted.rerender(view({ ...credential, version: 2 }, client))
+    await screen.findByText("220.00 CNY")
+    resolveProbe(response(probed(snapshot())))
+    await waitFor(() => expect(client.getQueryData(["credential-quota-probe", 7, 1])).toBeDefined())
+    expect(client.getQueryData(["credential-quota", 7, 2])).toEqual(current)
+    expect(client.getQueryData(["credential-quota-probe", 7, 2])).toBeUndefined()
+    expect(screen.getByText("220.00 CNY")).toBeInTheDocument()
+  })
+
+  it("does not let an older snapshot read overwrite a completed probe", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    let resolveSnapshot!: (response: Response) => void
+    let oldReadSignal: AbortSignal | null | undefined
+    const current = snapshot()
+    current.entries[0].value = { kind: "balance", remaining: "220.00", unit: "CNY", availability: "available", components: [] }
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response(snapshot()))
+      .mockImplementationOnce((_path, init) => {
+        oldReadSignal = init?.signal
+        return new Promise((resolve) => { resolveSnapshot = resolve })
+      })
+      .mockResolvedValueOnce(response(probed(current))))
+    const mounted = render(view(credential, client))
+    await screen.findByText("110.00 CNY")
+    const otherSignals: AbortSignal[] = []
+    for (const key of [["credential-quota", 8, 1], ["credential-quota", 7, 2]]) {
+      void client.fetchQuery({ queryKey: key, queryFn: ({ signal }) => new Promise((_resolve, reject) => {
+        otherSignals.push(signal)
+        signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true })
+      }) }).catch(() => {})
+    }
+    void client.invalidateQueries({ queryKey: ["credential-quota", 7, 1], exact: true })
+    await waitFor(() => expect(oldReadSignal).toBeDefined())
+    await userEvent.setup().click(screen.getByRole("button", { name: "Refresh" }))
+    await screen.findByText("220.00 CNY")
+    await act(async () => resolveSnapshot(response(snapshot())))
+    expect(client.getQueryData(["credential-quota", 7, 1])).toEqual(current)
+    expect(oldReadSignal?.aborted).toBe(true)
+    expect(otherSignals).toHaveLength(2)
+    expect(otherSignals.every((signal) => !signal.aborted)).toBe(true)
+    expect(screen.getByText("220.00 CNY")).toBeInTheDocument()
+    mounted.unmount()
+    client.clear()
   })
 
   it("keeps historical cycles available when a window source has no current entries", async () => {

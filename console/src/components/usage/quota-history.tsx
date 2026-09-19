@@ -13,11 +13,14 @@ import { QuotaHistoryChart } from "./quota-history-chart"
 import { quotaSeries, type QuotaMetric } from "./quota-history-data"
 import { QuotaHistoryFilter } from "./quota-history-filter"
 import { OptionPages } from "@/components/option-pages"
+import { CyclePageNavigation, type CyclePagination } from "./cycle-page-navigation"
 
 const CYCLES_PER_PAGE = 10
 
-export function QuotaHistory({ cycles, providers, credentials, loading, error, range }: {
+export function QuotaHistory({ cycles, providers, credentials, loading, error, range, pagination, selectionKey }: {
   range?: CycleRead;
+  pagination?: CyclePagination;
+  selectionKey?: string;
   cycles: Array<CredentialQuotaCycleDto>; providers: Array<ProviderDto>; credentials: Array<CredentialDto>; loading: boolean; error: boolean
 }) {
   const { t, i18n } = useTranslation()
@@ -26,6 +29,14 @@ export function QuotaHistory({ cycles, providers, credentials, loading, error, r
   const [excludedSeries, setExcludedSeries] = useState(new Set<string>())
   const [excludedRounds, setExcludedRounds] = useState(new Set<string>())
   const [page, setPage] = useState(0)
+  const [selectionScope, setSelectionScope] = useState(selectionKey)
+  if (selectionScope !== selectionKey) {
+    setSelectionScope(selectionKey)
+    setExcludedProviders(new Set())
+    setExcludedSeries(new Set())
+    setExcludedRounds(new Set())
+    setPage(0)
+  }
   const series = useMemo(() => quotaSeries(cycles, credentials, providers, t), [cycles, credentials, providers, t])
   const providerOptions = Array.from(new Map(series.map((series) => [series.providerId, { value: series.providerId, label: series.provider }])).values())
   const available = series.filter((series) => !excludedProviders.has(series.providerId))
@@ -41,7 +52,9 @@ export function QuotaHistory({ cycles, providers, credentials, loading, error, r
   const labels = new Map(pageSeries.flatMap((series) => series.cycles.map((cycle) => [cycle.id, series.label] as const)))
   return <section className="flex min-w-0 flex-col gap-5" aria-label={t("usage.quotaHistory.title")}>
     <h2 className="text-base font-semibold">{t("usage.quotaHistory.title")}</h2>
+    {pagination ? <CyclePageNavigation {...pagination} /> : null}
     <QueryState loading={loading} error={error ? t("common.loadError") : ""}>
+      {pagination ? <p className="text-xs text-muted-foreground">{t("usage.quotaHistory.pageSelectionHint")}</p> : null}
       <div className="grid min-w-0 gap-3 sm:grid-cols-3">
         <QuotaHistoryFilter label={t("usage.quotaHistory.providers")} options={providerOptions} excluded={excludedProviders} onChange={(value) => { setExcludedProviders(value); setPage(0) }} />
         <QuotaHistoryFilter label={t("usage.quotaHistory.series")} options={available.map((series) => ({ value: series.id, label: series.label }))} excluded={excludedSeries} onChange={(value) => { setExcludedSeries(value); setPage(0) }} />
@@ -51,7 +64,7 @@ export function QuotaHistory({ cycles, providers, credentials, loading, error, r
         {(["percent", "tokens", "cost"] as const).map((metric) => <ToggleGroupItem key={metric} value={metric}>{t(`usage.quotaHistory.metrics.${metric}`)}</ToggleGroupItem>)}
       </ToggleGroup>
       <p className="text-xs text-muted-foreground">{t("usage.quotaHistory.pageHint", { count: shown.length, total: ordered.length })}</p>
-      <OptionPages page={currentPage} pages={pages} onPage={setPage} />
+      {pagination ? null : <OptionPages page={currentPage} pages={pages} onPage={setPage} />}
       {range ? <QuotaHistoryCharts series={pageSeries} metric={metric} range={range} /> : <>
         <QuotaHistoryChart series={pageSeries} metric={metric} mode="within" />
         <QuotaHistoryChart series={pageSeries} metric={metric} mode="across" />

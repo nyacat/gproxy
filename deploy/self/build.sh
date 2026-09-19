@@ -20,6 +20,10 @@ if [[ "$(git branch --show-current)" != self ]]; then
 fi
 
 image="${IMAGE:-gproxy:self}"
+build_hash="$(git rev-parse --short=12 HEAD)"
+if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+  build_hash+="-dirty"
+fi
 archive="$script_dir/gproxy-self.tar.zst"
 builder=""
 archive_tmp="$(mktemp "$archive.tmp.XXXXXX")"
@@ -37,7 +41,7 @@ trap 'exit 143' TERM
 
 # 独立 builder 的缓存随 builder 一起删除，不清理其他项目的缓存。
 builder="$(docker buildx create --name "gproxy-self-$$-$RANDOM" --driver docker-container)"
-echo "构建 $image（linux/amd64，通用 x86-64，release：O3 / fat LTO / 单 codegen unit）"
+echo "构建 $image（build $build_hash，linux/amd64，通用 x86-64，release：O3 / fat LTO / 单 codegen unit）"
 # 在这里覆盖 Cargo release 配置，优化参数通过 build args 传入 Docker 内的 Cargo。
 # 固定通用 x86-64 指令集，兼容本地 7302、远端 7C13 和其他 x86_64 CPU。
 # 直接导出 Docker tar 流，不向本地 Docker 导入应用镜像。
@@ -47,6 +51,7 @@ docker buildx build \
   --provenance=false \
   --progress plain \
   --file deploy/self/docker/Dockerfile \
+  --build-arg "GPROXY_BUILD_HASH=$build_hash" \
   --build-arg CARGO_PROFILE_RELEASE_OPT_LEVEL=3 \
   --build-arg CARGO_PROFILE_RELEASE_LTO=fat \
   --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
