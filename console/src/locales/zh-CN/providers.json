@@ -243,14 +243,20 @@
       "healthObserved": "观测于 {{time}}",
       "healthDetail": "健康详情",
       "healthReset": {
-        "action": "清除健康状态",
-        "hint": "点击徽章清除已记录的健康状态。",
+        "action": "重置",
+        "scope": "重置 {{scope}} 的健康状态",
+        "all": "重置此账号全部健康记录",
+        "hint": "重置单项不会影响其他模型；重置全部会同时清除账号级和模型级记录。",
         "success": "已清除健康状态。",
         "error": "无法清除健康状态。"
       },
       "modelHealth": {
-        "issues": "异常模型 {{count}} 个",
-        "more": "还有 {{count}} 个…"
+        "issues": "部分模型异常 ({{count}})",
+        "account": "账号级（全部模型）",
+        "accountStatus": "账号：{{status}}",
+        "unspecified": "未指定模型",
+        "none": "暂无健康异常记录。",
+        "view": "查看账号与模型健康状态"
       },
       "quota": {
         "empty": "上游 usage 接口未返回额度窗口。",

@@ -142,7 +142,32 @@ pub(super) async fn update(
 pub(super) async fn credential_health_reset(
     state: &impl State,
     id: i64,
+    body: &Bytes,
 ) -> Result<Response<Bytes>, AdminError> {
-    state.store().clear_credential_health(id).await?;
+    match health_reset_model(body)? {
+        Some(model) => {
+            state
+                .store()
+                .clear_credential_model_health(id, &model)
+                .await?;
+        }
+        None => state.store().clear_credential_health(id).await?,
+    }
     util::updated(state, true).await
+}
+
+fn health_reset_model(body: &Bytes) -> Result<Option<String>, AdminError> {
+    if body.is_empty() {
+        return Ok(None);
+    }
+    let mut request: serde_json::Map<String, serde_json::Value> = util::parse(body)?;
+    let model = match request.remove("model") {
+        None => None,
+        Some(serde_json::Value::String(model)) => Some(model),
+        Some(_) => return Err(AdminError::BadRequest("model must be a string".into())),
+    };
+    if let Some(field) = request.keys().next() {
+        return Err(AdminError::BadRequest(format!("unknown field `{field}`")));
+    }
+    Ok(model)
 }

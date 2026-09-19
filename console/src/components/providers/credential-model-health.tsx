@@ -6,15 +6,10 @@ import { toast } from "sonner"
 import { ApiError } from "@/api/client"
 import { resetCredentialHealth } from "@/api/control"
 import { StatusBadge } from "@/components/status-badge"
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { Button } from "@/components/ui/button"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { formatInstant } from "@/lib/format"
 
-const SHOWN = 8
-
-/* One badge carries credential health. v2 idiom: healthy models never
-   surface; abnormal ones ride the status badge's tooltip. Clicking the badge
-   clears the recorded rows — the manual escape hatch for a stale state,
-   since health otherwise only refreshes when the same model is hit again. */
 export function CredentialHealthBadge({ credentialId, health, models, observedAt }: {
   credentialId: number
   health: CredentialHealthDto
@@ -24,7 +19,7 @@ export function CredentialHealthBadge({ credentialId, health, models, observedAt
   const { t, i18n } = useTranslation()
   const client = useQueryClient()
   const reset = useMutation({
-    mutationFn: () => resetCredentialHealth(credentialId),
+    mutationFn: (model: string | undefined) => resetCredentialHealth(credentialId, model),
     onSuccess: async () => {
       await client.invalidateQueries({ queryKey: ["credentials"] })
       toast.success(t("providers.credentials.healthReset.success"))
@@ -33,44 +28,82 @@ export function CredentialHealthBadge({ credentialId, health, models, observedAt
   })
   const issues = models
     .filter((value) => value.health === "degraded" || value.health === "dead")
-    .sort((left, right) => left.model.localeCompare(right.model))
+    .sort((left, right) => {
+      if (left.model === "*") return -1
+      if (right.model === "*") return 1
+      return left.model.localeCompare(right.model)
+    })
+  const accountIssue = issues.find((issue) => issue.model === "*")
+  const modelIssueCount = issues.filter((issue) => issue.model !== "*").length
+  const accountLabel = accountIssue ? t("providers.credentials.modelHealth.accountStatus", { status: t(`common.status.${accountIssue.health}`) }) : null
+  const modelLabel = modelIssueCount ? t("providers.credentials.modelHealth.issues", { count: modelIssueCount }) : null
+  const summary = health === "disabled" || !issues.length
+    ? t(`common.status.${health}`)
+    : [accountLabel, modelLabel].filter(Boolean).join(" · ")
   const observed = formatInstant(observedAt ?? null, i18n.language)
+  const scopeLabel = (model: string) => model === "*"
+    ? t("providers.credentials.modelHealth.account")
+    : model || t("providers.credentials.modelHealth.unspecified")
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
+    <Popover>
+      <PopoverTrigger asChild>
         <button
           type="button"
-          className="inline-flex disabled:opacity-50"
-          disabled={reset.isPending}
-          aria-label={t("providers.credentials.healthReset.action")}
-          onClick={(event) => {
-            event.stopPropagation()
-            reset.mutate()
-          }}
+          className="inline-flex flex-wrap gap-1 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          aria-label={`${t("providers.credentials.modelHealth.view")}: ${summary}`}
+          onClick={(event) => event.stopPropagation()}
         >
-          <StatusBadge status={health} />
+          {health === "disabled" || !issues.length ? <StatusBadge status={health} /> : (
+            <>
+              {accountIssue ? <StatusBadge status={accountIssue.health} label={accountLabel ?? undefined} /> : null}
+              {modelLabel ? <StatusBadge status="degraded" label={modelLabel} /> : null}
+            </>
+          )}
         </button>
-      </TooltipTrigger>
-      <TooltipContent className="max-w-sm flex-col items-start gap-1">
-        {observed ? <span className="opacity-70">{t("providers.credentials.healthObserved", { time: observed })}</span> : null}
+      </PopoverTrigger>
+      <PopoverContent
+        align="start"
+        className="w-96 max-w-[calc(100vw-2rem)]"
+        aria-label={t("providers.credentials.healthDetail")}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="flex flex-col gap-1">
+          <p className="font-medium">{t("providers.credentials.healthDetail")}</p>
+          {observed ? <p className="text-xs text-muted-foreground">{t("providers.credentials.healthObserved", { time: observed })}</p> : null}
+        </div>
         {issues.length ? (
-          <span className="font-medium">{t("providers.credentials.modelHealth.issues", { count: issues.length })}</span>
-        ) : null}
-        {issues.slice(0, SHOWN).map((issue) => (
-          <span key={issue.model} className="flex flex-col">
-            <span>
-              <span className="font-mono">{issue.model || "*"}</span>
-              {" · "}
-              {t(`common.status.${issue.health}`)}
-              {" · "}
-              {formatInstant(issue.observed_at, i18n.language)}
-            </span>
-            {issue.detail ? <span className="font-mono opacity-70">{issue.response_status != null ? `${issue.response_status} · ` : ""}{issue.detail}</span> : null}
-          </span>
-        ))}
-        {issues.length > SHOWN ? <span>{t("providers.credentials.modelHealth.more", { count: issues.length - SHOWN })}</span> : null}
-        <span className="opacity-70">{t("providers.credentials.healthReset.hint")}</span>
-      </TooltipContent>
-    </Tooltip>
+          <ul className="max-h-80 space-y-3 overflow-y-auto">
+            {issues.map((issue) => (
+              <li key={issue.model} className="flex flex-col gap-1">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                    <span className="break-all font-mono text-xs">{scopeLabel(issue.model)}</span>
+                    <StatusBadge status={issue.health} />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="xs"
+                    disabled={reset.isPending}
+                    aria-label={t("providers.credentials.healthReset.scope", { scope: scopeLabel(issue.model) })}
+                    onClick={() => reset.mutate(issue.model)}
+                  >
+                    {t("providers.credentials.healthReset.action")}
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">{t("providers.credentials.healthObserved", { time: formatInstant(issue.observed_at, i18n.language) })}</p>
+                {issue.response_status != null || issue.detail ? <p className="break-words font-mono text-xs text-muted-foreground">{[issue.response_status, issue.detail].filter((value) => value != null && value !== "").join(" · ")}</p> : null}
+              </li>
+            ))}
+          </ul>
+        ) : <p className="text-xs text-muted-foreground">{t("providers.credentials.modelHealth.none")}</p>}
+        <div className="flex flex-col items-start gap-2 border-t pt-2.5">
+          <p className="text-xs text-muted-foreground">{t("providers.credentials.healthReset.hint")}</p>
+          <Button type="button" variant="outline" size="xs" disabled={reset.isPending || !models.length} onClick={() => reset.mutate(undefined)}>
+            {t("providers.credentials.healthReset.all")}
+          </Button>
+        </div>
+      </PopoverContent>
+    </Popover>
   )
 }

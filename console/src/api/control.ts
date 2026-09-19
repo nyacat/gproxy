@@ -70,8 +70,8 @@ export const probeCredentialQuota = (id: number, force = false, lightweight = fa
 }
 export const resetCredentialQuota = (id: number) =>
   api<QuotaResetResponse>(`/admin/api/credentials/${id}/quota-reset`, json("POST", {}))
-export const resetCredentialHealth = (id: number) =>
-  api<void>(`/admin/api/credentials/${id}/health-reset`, json("POST", {}))
+export const resetCredentialHealth = (id: number, model?: string) =>
+  api<void>(`/admin/api/credentials/${id}/health-reset`, json("POST", { model }))
 export const revealCredentialSecret = (id: number) =>
   api<CredentialSecretResponse>(`/admin/api/credentials/${id}/reveal`, json("POST", {}))
 

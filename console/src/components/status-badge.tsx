@@ -11,12 +11,12 @@ const styles: Record<CredentialHealthDto, string> = {
   unknown: "border-state-info/35 text-state-info",
 }
 
-export function StatusBadge({ status, title }: { status: CredentialHealthDto; title?: string }) {
+export function StatusBadge({ status, title, label }: { status: CredentialHealthDto; title?: string; label?: string }) {
   const { t } = useTranslation()
   return (
     <Badge variant="outline" title={title} className={cn("gap-1.5", styles[status])}>
       <span className="size-1.5 rounded-full bg-current" aria-hidden="true" />
-      {t(`common.status.${status}`)}
+      {label ?? t(`common.status.${status}`)}
     </Badge>
   )
 }
