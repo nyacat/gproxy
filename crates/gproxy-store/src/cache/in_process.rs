@@ -138,23 +138,30 @@ impl CacheBackend for InProcessCache {
             if entries.get(state_key).map(|entry| &entry.value) != Some(&expected) {
                 return Ok(None);
             }
+            // Neither write changes an existing expiry; a counter with nothing
+            // reserved against it is retired instead of being made permanent.
+            let state_expires_at = entries.get(state_key).and_then(|entry| entry.expires_at);
             expire(entries, counter_key);
-            let current = entries
-                .get(counter_key)
-                .map_or(Ok(0), |entry| decode_counter(&entry.value))?;
+            let counter = entries.get(counter_key);
+            let current = counter.map_or(Ok(0), |entry| decode_counter(&entry.value))?;
+            let counter_expires_at = counter.and_then(|entry| entry.expires_at);
             let next = current.checked_add(by).ok_or_else(overflow)?;
             entries.insert(
                 counter_key.into(),
                 Entry {
                     value: next.to_be_bytes().to_vec(),
-                    expires_at: expiry((next == 0).then_some(Duration::from_secs(3600)))?,
+                    expires_at: if next <= 0 {
+                        expiry(Some(Duration::from_secs(3600)))?
+                    } else {
+                        counter_expires_at
+                    },
                 },
             );
             entries.insert(
                 state_key.into(),
                 Entry {
                     value: state,
-                    expires_at: None,
+                    expires_at: state_expires_at,
                 },
             );
             Ok(Some(next))
@@ -261,6 +268,7 @@ impl CacheBackend for InProcessCache {
         pending_key: &'a str,
         estimate: i64,
         limit: i64,
+        pending_ttl: Option<Duration>,
         state_key: &'a str,
         expected_state: Vec<u8>,
         state: Vec<u8>,
@@ -274,6 +282,7 @@ impl CacheBackend for InProcessCache {
             if current != Some(&expected_state) {
                 return Ok(None);
             }
+            let state_expires_at = entries.get(state_key).and_then(|entry| entry.expires_at);
             expire(entries, used_key);
             expire(entries, pending_key);
             let Some(used) = entries
@@ -291,18 +300,20 @@ impl CacheBackend for InProcessCache {
             if !gproxy_core::spend_fits(used, pending, estimate, limit) {
                 return Ok(Some(gproxy_core::SpendReserve::Denied));
             }
+            // Every accepted reservation refreshes the pending expiry; the
+            // admission state keeps the expiry its owner installed.
             entries.insert(
                 pending_key.into(),
                 Entry {
                     value: pending.to_be_bytes().to_vec(),
-                    expires_at: None,
+                    expires_at: expiry(pending_ttl)?,
                 },
             );
             entries.insert(
                 state_key.into(),
                 Entry {
                     value: state,
-                    expires_at: None,
+                    expires_at: state_expires_at,
                 },
             );
             Ok(Some(gproxy_core::SpendReserve::Allowed))
@@ -476,7 +487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atomic_reservation_retains_pending_and_state_until_release() {
+    async fn atomic_reservation_refreshes_pending_and_keeps_the_state_expiry() {
         let cache = InProcessCache::default();
         cache.seed_counter("used", 0, None).await.unwrap();
         cache
@@ -487,7 +498,14 @@ mod tests {
             .set("state", b"ready".to_vec(), Some(Duration::from_secs(60)))
             .await
             .unwrap();
-        assert_eq!(cache.entries.lock().unwrap().expirations.len(), 2);
+        let state_expiry = cache
+            .entries
+            .lock()
+            .unwrap()
+            .get("state")
+            .unwrap()
+            .expires_at;
+        let short = Instant::now() + Duration::from_secs(120);
         assert_eq!(
             cache
                 .reserve_spend_and_set(
@@ -495,6 +513,7 @@ mod tests {
                     "pending",
                     1,
                     10,
+                    Some(Duration::from_secs(600)),
                     "state",
                     b"ready".to_vec(),
                     b"reserved".to_vec(),
@@ -504,8 +523,9 @@ mod tests {
             Some(gproxy_core::SpendReserve::Allowed),
         );
         let entries = cache.entries.lock().unwrap();
-        assert!(entries.expirations.is_empty());
-        assert_eq!(entries.get("pending").unwrap().expires_at, None);
-        assert_eq!(entries.get("state").unwrap().expires_at, None);
+        // A reservation pushes its own backstop further out, but it may neither
+        // extend nor drop the expiry of the token that releases it.
+        assert!(entries.get("pending").unwrap().expires_at.unwrap() > short);
+        assert_eq!(entries.get("state").unwrap().expires_at, state_expiry);
     }
 }

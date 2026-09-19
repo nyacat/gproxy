@@ -217,6 +217,7 @@ impl CacheBackend for RedisCache {
         pending_key: &'a str,
         estimate: i64,
         limit: i64,
+        pending_ttl: Option<Duration>,
         state_key: &'a str,
         expected_state: Vec<u8>,
         state: Vec<u8>,
@@ -230,6 +231,7 @@ impl CacheBackend for RedisCache {
                 .arg(limit)
                 .arg(expected_state)
                 .arg(state)
+                .arg(ttl_millis(pending_ttl))
                 .invoke_async(&mut self.connection.clone())
                 .await
                 .map_err(|_| error("Redis", "reserve spend and set"))?;

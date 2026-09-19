@@ -91,12 +91,10 @@ impl CacheBackend for AppCache {
         state: Vec<u8>,
     ) -> BoxFuture<'a, Result<Option<i64>, Error>> {
         #[cfg(test)]
-        return self
-            .testing
-            .run("compare_incr", state_key, Some(None), move || {
-                self.inner
-                    .compare_incr_and_set(counter_key, by, state_key, expected_state, state)
-            });
+        return self.testing.run("compare_incr", state_key, None, move || {
+            self.inner
+                .compare_incr_and_set(counter_key, by, state_key, expected_state, state)
+        });
         #[cfg(not(test))]
         self.inner
             .compare_incr_and_set(counter_key, by, state_key, expected_state, state)
@@ -144,30 +142,31 @@ impl CacheBackend for AppCache {
         pending_key: &'a str,
         estimate: i64,
         limit: i64,
+        pending_ttl: Option<Duration>,
         state_key: &'a str,
         expected_state: Vec<u8>,
         state: Vec<u8>,
     ) -> BoxFuture<'a, Result<Option<gproxy_core::SpendReserve>, Error>> {
         #[cfg(test)]
-        return self
-            .testing
-            .run("reserve_state", state_key, Some(None), move || {
-                self.inner.reserve_spend_and_set(
-                    used_key,
-                    pending_key,
-                    estimate,
-                    limit,
-                    state_key,
-                    expected_state,
-                    state,
-                )
-            });
+        return self.testing.run("reserve_state", state_key, None, move || {
+            self.inner.reserve_spend_and_set(
+                used_key,
+                pending_key,
+                estimate,
+                limit,
+                pending_ttl,
+                state_key,
+                expected_state,
+                state,
+            )
+        });
         #[cfg(not(test))]
         self.inner.reserve_spend_and_set(
             used_key,
             pending_key,
             estimate,
             limit,
+            pending_ttl,
             state_key,
             expected_state,
             state,

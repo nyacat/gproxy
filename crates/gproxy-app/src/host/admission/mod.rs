@@ -17,4 +17,6 @@ pub(in crate::host) use auth::unix_now;
 pub(crate) use auth::{catalogue_permitted, provider_permitted};
 pub(super) use credential::admit as admit_credential;
 pub(super) use finish::{finish_checked, load};
+#[cfg(test)]
+pub(crate) use reserve::ADMISSION_TTL;
 pub(super) use reserve::admit;

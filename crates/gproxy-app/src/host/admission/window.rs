@@ -8,6 +8,15 @@ use serde::{Deserialize, Serialize};
 use super::super::AppHost;
 
 const VIEW_TTL: Duration = Duration::from_secs(3600);
+/// A reservation outlives the used view: it is released by its own request, not
+/// by a clock. This expiry is only the backstop for a host that was killed
+/// before it could settle, whose share of pending would otherwise shrink the
+/// effective limit of a window that never resets until someone edits Redis by
+/// hand. Every accepted reservation refreshes it, so it can only elapse once a
+/// window has stopped admitting entirely — which is exactly the state a stranded
+/// reservation causes. Keep it far longer than any request may plausibly run:
+/// expiring pending under a live request would release its reservation early.
+pub(super) const RESERVATION_TTL: Duration = Duration::from_secs(6 * 3600);
 const BIND_RETRIES: usize = 8;
 
 #[derive(Serialize, Deserialize)]
@@ -61,6 +70,7 @@ pub(super) async fn reserve(
                     &pending,
                     estimate,
                     limit,
+                    Some(RESERVATION_TTL),
                     state_key,
                     expected.clone(),
                     updated.clone(),

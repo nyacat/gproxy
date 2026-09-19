@@ -240,8 +240,11 @@ impl CacheBackend for MemoryHost {
                 .cache
                 .insert(counter_key.into(), next.to_be_bytes().to_vec());
             state.cache.insert(state_key.into(), state_value);
-            state.cache_ttls.remove(counter_key);
-            state.cache_ttls.remove(state_key);
+            // Neither write changes an existing expiry; a counter with nothing
+            // reserved against it is retired instead of being made permanent.
+            if next <= 0 {
+                state.cache_ttls.insert(counter_key.into(), 3600);
+            }
             Ok(Some(next))
         })();
         Box::pin(async move { result })
@@ -323,6 +326,7 @@ impl CacheBackend for MemoryHost {
         pending_key: &'a str,
         estimate: i64,
         limit: i64,
+        pending_ttl: Option<Duration>,
         state_key: &'a str,
         expected_state: Vec<u8>,
         state_value: Vec<u8>,
@@ -349,8 +353,16 @@ impl CacheBackend for MemoryHost {
                 .cache
                 .insert(pending_key.into(), pending.to_be_bytes().to_vec());
             state.cache.insert(state_key.into(), state_value);
-            state.cache_ttls.remove(pending_key);
-            state.cache_ttls.remove(state_key);
+            // Every accepted reservation refreshes the pending expiry; the
+            // admission state keeps the expiry its owner installed.
+            match pending_ttl {
+                Some(ttl) => {
+                    state.cache_ttls.insert(pending_key.into(), ttl.as_secs());
+                }
+                None => {
+                    state.cache_ttls.remove(pending_key);
+                }
+            }
             Ok(Some(crate::SpendReserve::Allowed))
         })();
         Box::pin(async move { result })

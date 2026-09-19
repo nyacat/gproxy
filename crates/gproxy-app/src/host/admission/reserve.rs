@@ -155,6 +155,14 @@ fn admit_inner<'a>(
     })
 }
 
+/// An active request keeps its identity and reservations for its whole lifetime,
+/// so this is not a one-hour view expiry: it is the absolute ceiling on a state
+/// that outlived the host holding it. Longer than `window::RESERVATION_TTL`, so
+/// the token that releases a reservation always outlives the reservation itself.
+/// Settlements preserve it rather than reinstalling it, so a long stream cannot
+/// turn a request-scoped key into a permanent one.
+pub(crate) const ADMISSION_TTL: Duration = Duration::from_secs(24 * 3600);
+
 // Only an empty state is installed here; all monetary writes subsequently
 // compare and replace it in the same atomic operation as their counter charge.
 pub(super) async fn initialize_state(
@@ -166,7 +174,7 @@ pub(super) async fn initialize_state(
         if host
             .services
             .cache
-            .compare_and_swap(key, None, Some(bytes.clone()), None)
+            .compare_and_swap(key, None, Some(bytes.clone()), Some(ADMISSION_TTL))
             .await?
         {
             return Ok(());

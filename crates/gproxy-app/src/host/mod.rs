@@ -33,6 +33,8 @@ use crate::control::SnapshotControl;
 
 use crate::secrets::EnvelopeCipher;
 #[cfg(test)]
+pub(crate) use admission::ADMISSION_TTL;
+#[cfg(test)]
 pub(crate) use admission::authenticate_headers;
 #[cfg(test)]
 pub(crate) use admission::authorize;

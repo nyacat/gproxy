@@ -214,7 +214,68 @@ async fn exercise_atomicity(cache: SharedCache) {
     cache.delete(&pending).await.unwrap();
     exercise_counter_bounds(cache.clone(), &prefix).await;
     exercise_reservation_state(cache.clone(), &prefix).await;
+    exercise_reservation_expiry(cache.clone(), &prefix).await;
     exercise_reservation_bounds(cache, &prefix).await;
+}
+
+// An expiry belongs to whoever installed it. A reservation refreshes its own
+// backstop on pending and nothing else, so a host killed mid-request cannot
+// strand a reservation forever, while a release may neither extend nor drop the
+// expiry of the token that authorizes it.
+async fn exercise_reservation_expiry(cache: SharedCache, prefix: &str) {
+    use gproxy_core::SpendReserve;
+    use std::time::Duration;
+
+    let used = format!("{prefix}:expiring-used");
+    let pending = format!("{prefix}:expiring-pending");
+    let state = format!("{prefix}:expiring-state");
+    for key in [&used, &pending, &state] {
+        cache.delete(key).await.unwrap();
+    }
+    cache.seed_counter(&used, 0, None).await.unwrap();
+    cache
+        .seed_counter(&pending, 0, Some(Duration::from_millis(300)))
+        .await
+        .unwrap();
+    cache
+        .set(&state, b"ready".to_vec(), Some(Duration::from_secs(1)))
+        .await
+        .unwrap();
+    assert_eq!(
+        cache
+            .reserve_spend_and_set(
+                &used,
+                &pending,
+                2,
+                10,
+                Some(Duration::from_secs(30)),
+                &state,
+                b"ready".to_vec(),
+                b"reserved".to_vec(),
+            )
+            .await
+            .unwrap(),
+        Some(SpendReserve::Allowed),
+    );
+    assert_eq!(
+        cache
+            .compare_incr_and_set(
+                &pending,
+                -1,
+                &state,
+                b"reserved".to_vec(),
+                b"released".to_vec()
+            )
+            .await
+            .unwrap(),
+        Some(1),
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(cache.incr(&pending, 0, None).await.unwrap(), 1);
+    assert_eq!(cache.get(&state).await.unwrap(), None);
+    for key in [&used, &pending, &state] {
+        cache.delete(key).await.unwrap();
+    }
 }
 
 async fn exercise_counter_bounds(cache: SharedCache, prefix: &str) {
@@ -310,6 +371,7 @@ async fn exercise_reservation_state(cache: SharedCache, prefix: &str) {
                 &pending,
                 7,
                 10,
+                None,
                 &state,
                 b"ready".to_vec(),
                 b"reserved".to_vec()
@@ -326,6 +388,7 @@ async fn exercise_reservation_state(cache: SharedCache, prefix: &str) {
                 &pending,
                 7,
                 10,
+                None,
                 &state,
                 b"ready".to_vec(),
                 b"reserved".to_vec()
@@ -344,6 +407,7 @@ async fn exercise_reservation_state(cache: SharedCache, prefix: &str) {
                 &pending,
                 8,
                 10,
+                None,
                 &state,
                 b"ready".to_vec(),
                 b"reserved".to_vec()
@@ -368,6 +432,7 @@ async fn exercise_reservation_state(cache: SharedCache, prefix: &str) {
                     &pending,
                     7,
                     10,
+                    None,
                     &state,
                     b"ready".to_vec(),
                     b"reserved".to_vec(),
@@ -389,6 +454,7 @@ async fn exercise_reservation_state(cache: SharedCache, prefix: &str) {
                 &pending,
                 7,
                 10,
+                None,
                 &state,
                 b"ready".to_vec(),
                 b"reserved".to_vec()
@@ -406,6 +472,7 @@ async fn exercise_reservation_state(cache: SharedCache, prefix: &str) {
                 &pending,
                 7,
                 10,
+                None,
                 &state,
                 b"ready".to_vec(),
                 b"reserved".to_vec()
@@ -431,6 +498,7 @@ async fn exercise_reservation_state(cache: SharedCache, prefix: &str) {
                 &pending,
                 1,
                 9_007_199_254_740_993,
+                None,
                 &state,
                 b"ready".to_vec(),
                 b"reserved".to_vec()
@@ -446,6 +514,7 @@ async fn exercise_reservation_state(cache: SharedCache, prefix: &str) {
                 &pending,
                 0,
                 9_007_199_254_740_993,
+                None,
                 &state,
                 b"reserved".to_vec(),
                 b"advanced".to_vec()
@@ -547,6 +616,7 @@ async fn exercise_reservation_bounds(cache: SharedCache, prefix: &str) {
                         &pending,
                         estimate,
                         limit,
+                        None,
                         &state,
                         b"ready".to_vec(),
                         b"reserved".to_vec(),
@@ -584,6 +654,7 @@ async fn exercise_reservation_bounds(cache: SharedCache, prefix: &str) {
                                 &pending,
                                 estimate,
                                 limit,
+                                None,
                                 &state,
                                 b"ready".to_vec(),
                                 b"reserved".to_vec(),

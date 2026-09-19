@@ -102,8 +102,12 @@ return 1
 "#
 );
 
-/// KEYS: used, pending, state. ARGV: estimate, limit, expected state, new state.
-/// Returns -2 state changed, -1 missing used, 0 denied, 1 allowed.
+/// KEYS: used, pending, state. ARGV: estimate, limit, expected state, new state,
+/// pending ttl_ms. Returns -2 state changed, -1 missing used, 0 denied, 1 allowed.
+/// A reservation outlives the used view, so pending carries a far longer expiry
+/// that every accepted reservation refreshes: a host killed mid-request cannot
+/// strand its share of pending forever. KEEPTTL preserves the request-scoped
+/// expiry the admission state was created with.
 pub(crate) const RESERVE_AND_SET_SCRIPT: &str = spend_script!(
     r#"
 local current = redis.call('GET', KEYS[3])
@@ -114,7 +118,10 @@ if not used then return -1 end
 local next_pending = reserve(used, redis.call('GET', KEYS[2]) or '0', ARGV[1], ARGV[2])
 if not next_pending then return 0 end
 redis.call('SET', KEYS[2], next_pending)
-redis.call('SET', KEYS[3], ARGV[4])
+if tonumber(ARGV[5]) > 0 then
+  redis.call('PEXPIRE', KEYS[2], ARGV[5])
+end
+redis.call('SET', KEYS[3], ARGV[4], 'KEEPTTL')
 return 1
 "#
 );
@@ -131,16 +138,17 @@ end
 return redis.call('GET', KEYS[1])
 "#;
 
+// Releasing part of a reservation must not extend either key's lifetime: the
+// reservation path owns the pending expiry and admission owns the state expiry.
+// A fully released counter is retired sooner, and never made permanent.
 pub(crate) const COMPARE_INCR_SCRIPT: &str = r#"
 if redis.call('GET', KEYS[2]) ~= ARGV[2] then return false end
 redis.call('INCRBY', KEYS[1], ARGV[1])
 local value = redis.call('GET', KEYS[1])
-if value == '0' then
+if tonumber(value) <= 0 then
   redis.call('PEXPIRE', KEYS[1], 3600000)
-else
-  redis.call('PERSIST', KEYS[1])
 end
-redis.call('SET', KEYS[2], ARGV[3])
+redis.call('SET', KEYS[2], ARGV[3], 'KEEPTTL')
 return value
 "#;
 

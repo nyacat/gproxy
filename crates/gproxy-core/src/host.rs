@@ -117,6 +117,8 @@ pub trait CacheBackend {
     ) -> BoxFuture<'a, Result<i64, StoreError>>;
     /// Atomically adjust one counter and replace one state value. Either both
     /// writes commit or neither does; quota reconciliation relies on this.
+    /// Neither write changes an existing expiry: releasing part of a reservation
+    /// must not extend the lifetime of the counter or of the state value.
     fn compare_incr_and_set<'a>(
         &'a self,
         counter_key: &'a str,
@@ -156,7 +158,10 @@ pub trait CacheBackend {
     /// Atomically reserve spend and advance the caller's reservation state.
     /// Repeating an already committed transition returns `Some(Allowed)` without
     /// charging again. A different current state returns `None`.
-    /// Successful writes retain both pending and state without an expiry.
+    /// Every accepted reservation refreshes `pending_ttl`, which bounds how long
+    /// an unreleased reservation survives a host that died before settling. The
+    /// state value keeps the expiry its owner installed, so a settlement cannot
+    /// turn a request-scoped key into a permanent one.
     /// Backends without this capability fail explicitly; sequential writes are
     /// not a safe substitute for this atomic operation.
     #[allow(clippy::too_many_arguments)]
@@ -166,6 +171,7 @@ pub trait CacheBackend {
         pending_key: &'a str,
         estimate: i64,
         limit: i64,
+        pending_ttl: Option<Duration>,
         state_key: &'a str,
         expected_state: Vec<u8>,
         state: Vec<u8>,
@@ -175,6 +181,7 @@ pub trait CacheBackend {
             pending_key,
             estimate,
             limit,
+            pending_ttl,
             state_key,
             expected_state,
             state,

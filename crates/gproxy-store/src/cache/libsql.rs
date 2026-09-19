@@ -168,9 +168,11 @@ impl CacheBackend for LibsqlCache {
         state: Vec<u8>,
     ) -> BoxFuture<'a, Result<Option<i64>, Error>> {
         Box::pin(async move {
+            // Neither write changes an existing expiry; only a counter that
+            // reached zero is retired early, by the statement below.
             let statements = vec![
                 Statement::with_args(
-                    "UPDATE gproxy_kv SET v=?, expires_ms=NULL WHERE k=? AND v=? AND (expires_ms IS NULL OR expires_ms>?)",
+                    "UPDATE gproxy_kv SET v=? WHERE k=? AND v=? AND (expires_ms IS NULL OR expires_ms>?)",
                     vec![
                         DbValue::Blob(state),
                         text(state_key),
@@ -181,12 +183,17 @@ impl CacheBackend for LibsqlCache {
                 Statement::with_args(
                     checked_increment_sql!(
                         "INSERT INTO gproxy_kv(k,v,expires_ms) SELECT ?,?,NULL WHERE changes()=1 ON CONFLICT(k) DO UPDATE SET v=CASE WHEN gproxy_kv.expires_ms IS NOT NULL AND gproxy_kv.expires_ms<=? THEN excluded.v ELSE ",
-                        " END,expires_ms=NULL RETURNING CAST(v AS INTEGER) AS value"
+                        " END, expires_ms=CASE WHEN gproxy_kv.expires_ms IS NOT NULL AND gproxy_kv.expires_ms<=? THEN excluded.expires_ms ELSE gproxy_kv.expires_ms END RETURNING CAST(v AS INTEGER) AS value"
                     ),
-                    vec![text(counter_key), integer(by), integer(now_ms())],
+                    vec![
+                        text(counter_key),
+                        integer(by),
+                        integer(now_ms()),
+                        integer(now_ms()),
+                    ],
                 ),
                 Statement::with_args(
-                    "UPDATE gproxy_kv SET expires_ms=? WHERE k=? AND CAST(v AS INTEGER)=0 AND changes()=1",
+                    "UPDATE gproxy_kv SET expires_ms=? WHERE k=? AND CAST(v AS INTEGER)<=0 AND changes()=1",
                     vec![expiry(Some(Duration::from_secs(3600))), text(counter_key)],
                 ),
             ];
@@ -301,6 +308,7 @@ impl CacheBackend for LibsqlCache {
         pending_key: &'a str,
         estimate: i64,
         limit: i64,
+        pending_ttl: Option<Duration>,
         state_key: &'a str,
         expected_state: Vec<u8>,
         state: Vec<u8>,
@@ -314,10 +322,11 @@ impl CacheBackend for LibsqlCache {
                 ),
                 Statement::with_args(
                     RESERVE_AND_SET_SQL,
-                    vec![text(pending_key), integer(now), integer(estimate), integer(limit), text(used_key), integer(now), text(state_key), DbValue::Blob(expected_state), DbValue::Blob(state.clone()), integer(now), text(pending_key), DbValue::Null],
+                    vec![text(pending_key), integer(now), integer(estimate), integer(limit), text(used_key), integer(now), text(state_key), DbValue::Blob(expected_state), DbValue::Blob(state.clone()), integer(now), text(pending_key), expiry(pending_ttl)],
                 ),
+                // The admission state keeps the expiry its owner installed.
                 Statement::with_args(
-                    "UPDATE gproxy_kv SET v=?,expires_ms=NULL WHERE k=? AND changes()=1",
+                    "UPDATE gproxy_kv SET v=? WHERE k=? AND changes()=1",
                     vec![DbValue::Blob(state), text(state_key)],
                 ),
             ]).await.map_err(|_| error("libSQL", "reserve spend and set"))?;

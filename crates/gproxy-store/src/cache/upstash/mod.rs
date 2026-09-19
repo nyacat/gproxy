@@ -245,6 +245,7 @@ impl CacheBackend for UpstashCache {
         pending_key: &'a str,
         estimate: i64,
         limit: i64,
+        pending_ttl: Option<Duration>,
         state_key: &'a str,
         expected_state: Vec<u8>,
         state: Vec<u8>,
@@ -260,6 +261,7 @@ impl CacheBackend for UpstashCache {
                         json!(limit.to_string()),
                         json!(encode(expected_state)),
                         json!(encode(state)),
+                        json!(ttl_millis(pending_ttl)),
                     ],
                     "reserve spend and set",
                 )

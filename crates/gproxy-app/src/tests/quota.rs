@@ -501,12 +501,15 @@ async fn cache_failures_and_lost_replies_retry_without_losing_or_duplicating_spe
         .unwrap();
         // An active request keeps its identity and reservations for its whole
         // lifetime; a long stream/session must not receive a one-hour expiry.
+        // Only the ceiling for a state that outlived its host applies, and the
+        // reservation written after it preserves that expiry instead of
+        // replacing it.
         assert_eq!(
             host.services
                 .cache
                 .testing
                 .ttl(&format!("gproxy:admission:{}", request.request_id)),
-            Some(None)
+            Some(Some(crate::host::ADMISSION_TTL))
         );
         host.services
             .cache
