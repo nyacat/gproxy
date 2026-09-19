@@ -26,12 +26,11 @@ type Props = {
 
 function Section({ title, value }: { title: string; value: string | null }) {
   const { t } = useTranslation()
-  const display = value == null ? null : formattedLogContent(value)
 
   async function copy() {
-    if (display == null) return
+    if (value == null) return
     try {
-      await copyText(display)
+      await copyText(formattedLogContent(value))
       toast.success(t("logs.detail.copied", { label: title }))
     } catch {
       toast.error(t("logs.detail.copyError", { label: title }))
@@ -42,7 +41,7 @@ function Section({ title, value }: { title: string; value: string | null }) {
     <section className="flex min-w-0 flex-col gap-2">
       <div className="flex items-center justify-between gap-2">
         <h4 className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">{title}</h4>
-        <Button type="button" size="icon-xs" variant="ghost" disabled={display == null} aria-label={t("logs.detail.copy", { label: title })} onClick={() => void copy()}>
+        <Button type="button" size="icon-xs" variant="ghost" disabled={value == null} aria-label={t("logs.detail.copy", { label: title })} onClick={() => void copy()}>
           <CopyIcon />
         </Button>
       </div>

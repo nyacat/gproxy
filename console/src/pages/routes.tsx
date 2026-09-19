@@ -16,7 +16,7 @@ export function RoutesPage() {
     queries: [
       { queryKey: ["routes"], queryFn: routes },
       { queryKey: ["route-members"], queryFn: routeMembers },
-      { queryKey: ["providers"], queryFn: providers },
+      { queryKey: ["providers"], queryFn: ({ signal }) => providers(signal) },
       { queryKey: ["model-aliases"], queryFn: modelAliases },
     ],
   })

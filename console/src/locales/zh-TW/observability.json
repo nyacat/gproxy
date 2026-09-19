@@ -101,7 +101,11 @@
       "status": "回應狀態碼",
       "copy": "複製{{label}}",
       "copied": "已複製{{label}}。",
-      "copyError": "無法複製{{label}}。"
+      "copyError": "無法複製{{label}}。",
+      "segmentHint": "大型內容以分段顯示。複製或下載可取得完整內容；大型本文保留原始格式。",
+      "segments": "內容分段",
+      "segment": "第 {{page}} / {{pages}} 段",
+      "download": "下載原文"
     }
   },
   "usage": {
@@ -152,7 +156,9 @@
         "percent": "剩餘比例",
         "tokens": "折算剩餘權杖",
         "cost": "折算剩餘 USD"
-      }
+      },
+      "pageHint": "目前顯示 {{count}} / {{total}} 個週期，圖表與明細隨頁面切換。",
+      "sampleHint": "密集曲線依桶顯示首尾與極值；範圍統計包含全部觀測。"
     },
     "cycleUsage": {
       "used": "本週期已用（本機）",
@@ -171,7 +177,9 @@
         "unordered_observations": "觀測順序不確定，等待複查",
         "incomplete_usage": "樣本用量未完整結算或缺失",
         "usage_disabled": "用量記錄已關閉"
-      }
+      },
+      "estimateDetails": "查看估算詳情",
+      "loadHistory": "查看最近一年的歷史週期"
     },
     "cycleStates": {
       "empty": "此期間未觀測到上游憑證配額視窗。"

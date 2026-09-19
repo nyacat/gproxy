@@ -8,6 +8,7 @@ import { toast } from "sonner"
 import { ApiError } from "@/api/client"
 import { resetCredentialQuota } from "@/api/control"
 import { ConfirmDangerous } from "@/components/confirm-dangerous"
+import { BodyView } from "@/components/logs/body-view"
 import { CredentialCycleList } from "@/components/providers/credential-cycle-list"
 import { CredentialQuotaSources } from "@/components/providers/credential-quota-sources"
 import { useCredentialQuota } from "@/components/providers/use-credential-quota"
@@ -56,14 +57,7 @@ export function CredentialCard(props: Props) {
     onError: (error) => toast.error(error instanceof ApiError ? error.message : t("providers.credentials.quotaReset.error")),
   })
   const resetCredits = snapshot?.sources.find((source) => source.reset_credits)?.reset_credits ?? quota?.reset_credits
-  const raw = useMemo(() => {
-    if (!quota?.raw) return null
-    try {
-      return JSON.stringify(JSON.parse(quota.raw), null, 2)
-    } catch {
-      return quota.raw
-    }
-  }, [quota])
+  const raw = quota?.raw
 
   return (
     <>
@@ -107,7 +101,8 @@ export function CredentialCard(props: Props) {
               </Button> : null}
             </section>
           ) : null}
-          {mergedCycles.length > 0 || snapshot?.entries.some((entry) => entry.value.kind === "window") ? <CredentialCycleList
+          {mergedCycles.length > 0 || snapshot?.sources.some((source) => source.capability.kinds.includes("window")) ? <CredentialCycleList
+            credentialId={credential.id}
             cycles={mergedCycles}
             localError={quota?.local_error}
             windows={snapshot?.entries.flatMap((entry) => entry.value.kind === "window" ? [{
@@ -128,7 +123,7 @@ export function CredentialCard(props: Props) {
                   </Button>
                 </CollapsibleTrigger>
                 <CollapsibleContent>
-                  <pre className="max-h-64 overflow-auto rounded-md bg-muted p-3 text-xs">{raw}</pre>
+                  <BodyView value={raw} />
                 </CollapsibleContent>
               </Collapsible>
             ) : null}

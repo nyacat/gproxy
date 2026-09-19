@@ -60,10 +60,14 @@ import { api, json } from "@/api/client"
 const save = <T, R = unknown>(path: string, value: T, id?: number) =>
   api<R>(id == null ? path : `${path}/${id}`, json(id == null ? "POST" : "PATCH", value))
 
-export const credentialQuota = (id: number) =>
-  api<QuotaSnapshot>(`/admin/api/credentials/${id}/quota`)
-export const probeCredentialQuota = (id: number, force = false) =>
-  api<QuotaProbeResponse>(`/admin/api/credentials/${id}/quota-probe${force ? "?force=true" : ""}`, json("POST", {}))
+export const credentialQuota = (id: number, signal?: AbortSignal) =>
+  api<QuotaSnapshot>(`/admin/api/credentials/${id}/quota`, { signal })
+export const probeCredentialQuota = (id: number, force = false, lightweight = false, signal?: AbortSignal) => {
+  const query = new URLSearchParams()
+  if (force) query.set("force", "true")
+  if (lightweight) query.set("lightweight", "true")
+  return api<QuotaProbeResponse>(`/admin/api/credentials/${id}/quota-probe${query.size ? `?${query}` : ""}`, { ...json("POST", {}), signal })
+}
 export const resetCredentialQuota = (id: number) =>
   api<QuotaResetResponse>(`/admin/api/credentials/${id}/quota-reset`, json("POST", {}))
 export const resetCredentialHealth = (id: number) =>
@@ -82,10 +86,10 @@ export const importConfiguration = (value: ConfigurationImportRequest) =>
 export const testConnectivity = (value: ConnectivityTestRequest) =>
   api<ConnectivityTestResponse>("/admin/api/connectivity/test", json("POST", value))
 
-export const providers = () => api<Array<ProviderDto>>("/admin/api/providers")
+export const providers = (signal?: AbortSignal) => api<Array<ProviderDto>>("/admin/api/providers", { signal })
 export const saveProvider = (value: ProviderWriteRequest, id?: number) =>
   save("/admin/api/providers", value, id)
-export const credentials = () => api<Array<CredentialDto>>("/admin/api/credentials")
+export const credentials = (signal?: AbortSignal) => api<Array<CredentialDto>>("/admin/api/credentials", { signal })
 export const saveCredential = (value: CredentialWriteRequest, id?: number) =>
   save("/admin/api/credentials", value, id)
 export const routes = () => api<Array<RouteDto>>("/admin/api/routes")

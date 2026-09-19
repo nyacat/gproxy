@@ -1,6 +1,6 @@
 import { useRef, useState } from "react"
 import { readPageSize } from "@/components/data-table-state"
-import { useQueries, useQuery } from "@tanstack/react-query"
+import { hashKey, useQueries, useQuery } from "@tanstack/react-query"
 import { useTranslation } from "react-i18next"
 import type { LogQueryDto } from "@/generated/LogQueryDto"
 import { logDetail, logs } from "@/api/observability"
@@ -8,7 +8,6 @@ import { providers } from "@/api/control"
 import { userKeys, users } from "@/api/identity"
 import { LogExplorer } from "@/components/logs/log-explorer"
 import { PageLayout } from "@/components/page-layout"
-import { QueryState } from "@/components/query-state"
 import { ObservabilityTabs } from "@/components/observability-tabs"
 import { adminPath, navigateAdminPath, useAdminLocation } from "@/lib/admin-route"
 
@@ -34,30 +33,32 @@ export function LogsPage() {
   })
   const search = () => {
     const end = pinnedEnd.current ? draft.end : now()
+    const next = { ...draft, end, cursor: null }
     setDraft((value) => ({ ...value, end }))
-    setQuery({ ...draft, end, cursor: null })
+    setQuery(next)
+    if (hashKey([next]) === hashKey([query])) void logQuery.refetch()
   }
   const location = useAdminLocation()
   const selected = location.segments[0] ?? null
   const [logQuery, providerQuery, userQuery, keyQuery] = useQueries({ queries: [
-    { queryKey: ["logs", query], queryFn: () => logs(query) },
-    { queryKey: ["providers"], queryFn: providers },
-    { queryKey: ["users"], queryFn: users },
-    { queryKey: ["user-keys"], queryFn: userKeys },
+    { queryKey: ["logs", query], queryFn: ({ signal }) => logs(query, signal) },
+    { queryKey: ["providers"], queryFn: ({ signal }) => providers(signal) },
+    { queryKey: ["users"], queryFn: ({ signal }) => users(signal) },
+    { queryKey: ["user-keys"], queryFn: ({ signal }) => userKeys(signal) },
   ] })
-  const detailQuery = useQuery({ queryKey: ["log-detail", selected], queryFn: () => logDetail(selected!), enabled: selected != null })
-  const loading = [logQuery, providerQuery, userQuery, keyQuery].some((item) => item.isLoading)
-  const error = [logQuery, providerQuery, userQuery, keyQuery].some((item) => item.error)
+  const detailQuery = useQuery({ queryKey: ["log-detail", selected], queryFn: ({ signal }) => logDetail(selected!, signal), enabled: selected != null, gcTime: 0 })
+  const loading = logQuery.isLoading
+  const error = logQuery.isError
   return (
     <PageLayout title={t("logs.title")} description={t("logs.description")}>
       <ObservabilityTabs value="logs" />
-      <QueryState loading={loading} error={error ? t("common.loadError") : ""}>
         <LogExplorer
           draft={draft}
           onDraft={editDraft}
           onSearch={() => { navigateAdminPath(adminPath("logs"), true); search() }}
           onReset={() => { const next = initialQuery(); pinnedEnd.current = false; setDraft(next); setQuery(next); navigateAdminPath(adminPath("logs"), true) }}
-          page={logQuery.data!}
+          page={logQuery.data ?? { items: [], next_cursor: null }}
+          loading={loading} error={error}
           providers={providerQuery.data ?? []}
           users={userQuery.data ?? []}
           keys={keyQuery.data ?? []}
@@ -69,7 +70,6 @@ export function LogsPage() {
           onNext={(cursor) => setQuery((value) => ({ ...value, cursor }))}
           onPageSize={(limit) => { setDraft((value) => ({ ...value, limit })); setQuery((value) => ({ ...value, limit, cursor: null })) }}
         />
-      </QueryState>
     </PageLayout>
   )
 }

@@ -8,6 +8,7 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { Empty, EmptyHeader, EmptyTitle } from "@/components/ui/empty"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { cn } from "@/lib/utils"
+import { useMediaQuery } from "@/lib/use-media-query"
 
 export type DataTableColumn<T> = {
   key: string
@@ -36,7 +37,9 @@ export type DataTableProps<T> = {
   pagination?: {
     page: number
     pageSize: PageSize
-    total: number
+    total: number | null
+    hasMore?: boolean
+    pending?: boolean
     onPage: (page: number) => void
     onPageSize: (size: PageSize) => void
   }
@@ -67,6 +70,7 @@ export function DataTable<T>({
   pagination,
 }: DataTableProps<T>) {
   const { t } = useTranslation()
+  const mobile = useMediaQuery("(max-width: 767px)")
   const [query, setQuery] = useState("")
   const deferredQuery = useDeferredValue(query.trim().toLocaleLowerCase())
   const [page, setPage] = useState(1)
@@ -79,8 +83,9 @@ export function DataTable<T>({
     ? rows.filter((row) => searchText(row).toLocaleLowerCase().includes(deferredQuery))
     : rows, [deferredQuery, rows, searchText, pagination])
   const effectiveSize = pagination?.pageSize ?? pageSize
-  const pages = Math.max(1, Math.ceil((pagination?.total ?? filtered.length) / effectiveSize))
-  const currentPage = pagination?.page ?? Math.min(page, pages)
+  const total = pagination ? pagination.total : filtered.length
+  const pages = total == null ? null : Math.max(1, Math.ceil(total / effectiveSize))
+  const currentPage = pagination?.page ?? Math.min(page, pages ?? 1)
   const visibleRows = pagination ? rows : filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize)
   const selectedRows = rows.filter((row) => selected.has(rowKey(row)))
   const selecting = selectable && batchMode
@@ -138,7 +143,7 @@ export function DataTable<T>({
         <Empty><EmptyHeader><EmptyTitle>{empty}</EmptyTitle></EmptyHeader></Empty>
       ) : (
         <>
-          <div className="hidden overflow-hidden rounded-md border bg-card md:block">
+          {!mobile ? <div className="overflow-hidden rounded-md border bg-card">
             <Table>
               <TableHeader><TableRow>
                 {selecting ? <TableHead className="w-10"><Checkbox checked={allSelected ? true : someSelected ? "indeterminate" : false} onCheckedChange={toggleAll} aria-label={t("common.dataTable.selectAll")} /></TableHead> : null}
@@ -156,8 +161,7 @@ export function DataTable<T>({
                 </Fragment>
               })}</TableBody>
             </Table>
-          </div>
-          <div className="grid gap-2 md:hidden">{visibleRows.map((row) => {
+          </div> : <div className="grid gap-2">{visibleRows.map((row) => {
             const id = rowKey(row)
             const clickable = selecting || onRowClick != null
             const expanded = !selecting && id === activeRowKey && renderExpandedRow != null
@@ -169,10 +173,10 @@ export function DataTable<T>({
             </Card>
               {expanded ? renderExpandedRow(row) : null}
             </Fragment>
-          })}</div>
+          })}</div>}
         </>
       )}
-      {filtered.length > 0 || pagination ? <DataTablePagination page={currentPage} pages={pages} pageSize={effectiveSize} onPage={pagination?.onPage ?? setPage} onPageSize={pagination ? (size) => { storePageSize(storageKey, size); pagination.onPageSize(size) } : (size) => { setPageSize(size); setPage(1); onPageSizeChange?.(size) }} /> : null}
+      {filtered.length > 0 || pagination ? <DataTablePagination page={currentPage} pages={pages} hasMore={pagination?.hasMore} pageSize={effectiveSize} pending={pagination?.pending} onPage={pagination?.onPage ?? setPage} onPageSize={pagination ? (size) => { storePageSize(storageKey, size); pagination.onPageSize(size) } : (size) => { setPageSize(size); setPage(1); onPageSizeChange?.(size) }} /> : null}
       {selecting ? (
         <div className="sticky bottom-3 flex flex-wrap items-center gap-2 rounded-md border bg-background/95 p-2 shadow-sm backdrop-blur">
           <span className="px-2 text-sm text-muted-foreground">{t("common.dataTable.selected", { count: selectedRows.length })}</span>

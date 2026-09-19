@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { memo, useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
 import type { UsageRecordDto } from "@/generated/UsageRecordDto"
 import type { UsageRecordPageDto } from "@/generated/UsageRecordPageDto"
@@ -23,9 +23,16 @@ type Props = {
   onPageSize: (size: PageSize) => void
 }
 
-export function UsageTable({ page, providers, credentials, users, keys, pending, onPage, onPageSize }: Props) {
-  const { t, i18n } = useTranslation()
+export const UsageTable = memo(function UsageTable(props: Props) {
   const [selected, setSelected] = useState<UsageRecordDto | null>(null)
+  return <>
+    <RecordRows {...props} onSelect={setSelected} />
+    <UsageRecordDetail record={selected} onClose={() => setSelected(null)} providers={props.providers} />
+  </>
+})
+
+const RecordRows = memo(function RecordRows({ page, providers, credentials, users, keys, pending, onPage, onPageSize, onSelect }: Props & { onSelect: (record: UsageRecordDto | null) => void }) {
+  const { t, i18n } = useTranslation()
   const names = useMemo(() => ({
     providers: new Map(providers.map((value) => [value.id, value.name])),
     credentials: new Map(credentials.map((value) => [value.id, value.label ?? `#${value.id}`])),
@@ -53,9 +60,8 @@ export function UsageTable({ page, providers, credentials, users, keys, pending,
     <DataTable columns={columns} rows={page.items} rowKey={(row) => row.id} searchText={(row) => row.request_id}
       renderCard={(row) => <div className="grid gap-2 text-xs"><div className="flex justify-between gap-3"><span className="break-all font-mono">{row.model}</span><strong className="tabular-nums">{formatCost(row.cost, i18n.language)}</strong></div><p>{t("usage.record.time")}: {formatInstant(row.at, i18n.language)} · {name("providers", row.provider_id)}</p><p className="break-all font-mono">{row.request_id}</p><p>{t("usage.inputTokens")}: {row.input_tokens} · {t("usage.outputTokens")}: {row.output_tokens}</p><p>{t("usage.record.latency")}: {row.latency_ms} ms · <span title={t("usage.record.tpsHint")}>{t("usage.record.tps")}: {formatTokensPerSecond(row.output_tokens, row.latency_ms, i18n.language)}</span></p><p>{t(`usage.record.${row.usage_source}`)} · {t(`usage.record.${row.ended}`)}</p></div>}
       selectable
-      batchActions={(rows, onApplied) => <UsageDeleteActions rows={rows} disabled={pending} onApplied={() => { onApplied(); setSelected(null); onPage(1) }} />}
-      onRowClick={setSelected} empty={t("usage.empty")} storageKey="usage-records"
-      pagination={{ page: page.page, pageSize: page.page_size as PageSize, total: page.total, onPage: (next) => { if (!pending) onPage(next) }, onPageSize }} />
-    <UsageRecordDetail record={selected} onClose={() => setSelected(null)} providers={providers} />
+      batchActions={(rows, onApplied) => <UsageDeleteActions rows={rows} disabled={pending} onApplied={() => { onApplied(); onSelect(null); onPage(1) }} />}
+      onRowClick={onSelect} empty={t("usage.empty")} storageKey="usage-records"
+      pagination={{ page: page.page, pageSize: page.page_size as PageSize, total: page.total, hasMore: page.has_more, pending, onPage, onPageSize }} />
   </div>
-}
+})

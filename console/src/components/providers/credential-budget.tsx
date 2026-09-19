@@ -22,7 +22,7 @@ export function CredentialBudget({ credentialId }: { credentialId: number }) {
   const query = useQuery({ queryKey: ["quotas"], queryFn: quotas })
   const windows = useQuery({
     queryKey: ["quota-windows", "credential", credentialId],
-    queryFn: () => quotaWindows("credential", credentialId),
+    queryFn: ({ signal }) => quotaWindows("credential", credentialId, signal),
     refetchInterval: 15_000,
   })
   const quota = query.data?.find((item) => item.subject_kind === "credential" && item.subject_id === credentialId)

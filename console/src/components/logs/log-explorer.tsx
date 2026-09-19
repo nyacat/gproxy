@@ -11,6 +11,7 @@ import type { UserKeyDto } from "@/generated/UserKeyDto"
 import { LogDetail } from "@/components/logs/log-detail"
 import { LogFilters } from "@/components/logs/log-filters"
 import { LogList } from "@/components/logs/log-list"
+import { QueryState } from "@/components/query-state"
 import type { PageSize } from "@/components/data-table-state"
 
 type Props = {
@@ -19,6 +20,8 @@ type Props = {
   onSearch: () => void
   onReset: () => void
   page: LogPageDto
+  loading?: boolean
+  error?: boolean
   providers: Array<ProviderDto>
   users: Array<UserDto>
   keys: Array<UserKeyDto>
@@ -39,7 +42,9 @@ export function LogExplorer(props: Props) {
       <LogFilters {...props} />
       <div className="flex min-w-0 flex-col gap-5 xl:flex-row xl:gap-3">
         <div style={{ "--workspace-pane-width": `${pane.width}px` } as CSSProperties} className="min-w-0 xl:w-[var(--workspace-pane-width)] xl:shrink-0">
-          <LogList page={props.page} pageSize={(props.draft.limit ?? 50) as PageSize} selected={props.selected} onSelect={props.onSelect} onNext={props.onNext} onPageSize={props.onPageSize} />
+          <QueryState loading={Boolean(props.loading)} error={props.error ? t("common.loadError") : ""}>
+            <LogList page={props.page} pageSize={(props.draft.limit ?? 50) as PageSize} selected={props.selected} onSelect={props.onSelect} onNext={props.onNext} onPageSize={props.onPageSize} />
+          </QueryState>
         </div>
         <WorkspaceResizeHandle className="md:hidden xl:block" label={t("logs.resize")} width={pane.width} minWidth={pane.minWidth} maxWidth={pane.maxWidth} onWidthChange={pane.setWidth} onReset={pane.resetWidth} />
         <div className="min-w-0 flex-1">

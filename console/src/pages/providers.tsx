@@ -16,13 +16,13 @@ import {
 } from "@/api/control"
 import {
   channels as fetchChannels,
-  credentialCycles as fetchCredentialCycles,
+  queryCredentialCycles,
   tlsPresets as fetchTlsPresets,
 } from "@/api/observability"
 import { ProvidersView } from "@/components/providers/providers-view"
+import { useAdminLocation } from "@/lib/admin-route"
 import { useRuleMutations } from "@/components/rules/use-rule-mutations"
 
-const MAX_CYCLE_RANGE_SECONDS = 366 * 24 * 60 * 60
 const PROVIDER_QUERY_KEYS = [["providers"], ["rule-sets"], ["provider-rule-sets"], ["routing-rules"]]
 
 type ProviderMutation = { value: ProviderWriteRequest; id?: number }
@@ -30,16 +30,23 @@ type CredentialMutation = { value: CredentialWriteRequest; id?: number }
 
 export function ProvidersPage() {
   const queryClient = useQueryClient()
+  const location = useAdminLocation()
+  const providerId = Number(location.segments[0])
+  const credentialTab = !["models", "aliases", "pricing", "rules", "routing", "settings"].includes(location.segments[1])
   const ruleMutations = useRuleMutations()
-  const providers = useQuery({ queryKey: ["providers"], queryFn: fetchProviders })
-  const credentials = useQuery({ queryKey: ["credentials"], queryFn: fetchCredentials })
+  const providers = useQuery({ queryKey: ["providers"], queryFn: ({ signal }) => fetchProviders(signal) })
+  const credentials = useQuery({ queryKey: ["credentials"], queryFn: ({ signal }) => fetchCredentials(signal) })
   const channels = useQuery({ queryKey: ["channels"], queryFn: fetchChannels })
   const presets = useQuery({ queryKey: ["tls-presets"], queryFn: fetchTlsPresets })
   const cycles = useQuery({
-    queryKey: ["credential-cycles", "providers"],
-    queryFn: () => {
+    queryKey: ["credential-cycles", "providers", providerId],
+    enabled: Number.isSafeInteger(providerId) && providerId > 0 && credentialTab,
+    queryFn: ({ signal }) => {
       const to = Math.floor(Date.now() / 1000) + 1
-      return fetchCredentialCycles(to - MAX_CYCLE_RANGE_SECONDS, to)
+      return queryCredentialCycles({
+        from: to - 604_800, to, provider_id: providerId, current_only: true,
+        include_history: false, include_estimate: false,
+      }, signal, "providers")
     },
     refetchInterval: 30_000,
   })

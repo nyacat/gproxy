@@ -77,7 +77,8 @@
       "itemsPerPage": "Items per page",
       "selected": "{{count}} selected",
       "selectAll": "Select all rows",
-      "selectRow": "Select row"
+      "selectRow": "Select row",
+      "pageUnknown": "Page {{page}}"
     },
     "filters": {
       "start": "Start",

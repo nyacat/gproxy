@@ -101,7 +101,11 @@
       "status": "Response status",
       "copy": "Copy {{label}}",
       "copied": "{{label}} copied.",
-      "copyError": "Could not copy {{label}}."
+      "copyError": "Could not copy {{label}}.",
+      "segmentHint": "Large content is displayed in segments. Copy or download to access the complete content; large bodies keep their original formatting.",
+      "segments": "Content segments",
+      "segment": "Segment {{page}} of {{pages}}",
+      "download": "Download original"
     }
   },
   "usage": {
@@ -152,7 +156,9 @@
         "percent": "Remaining %",
         "tokens": "Calculated remaining tokens",
         "cost": "Calculated remaining USD"
-      }
+      },
+      "pageHint": "Showing {{count}} of {{total}} cycles. Charts and details follow the displayed page.",
+      "sampleHint": "Dense curves show bucket endpoints and extrema; range statistics include every observation."
     },
     "cycleUsage": {
       "used": "Used this cycle (local)",
@@ -171,7 +177,9 @@
         "unordered_observations": "Observations are unordered; awaiting another reading",
         "incomplete_usage": "Usage is incomplete or not fully settled",
         "usage_disabled": "Usage recording is disabled"
-      }
+      },
+      "estimateDetails": "View estimate details",
+      "loadHistory": "Previous rounds in the last year"
     },
     "cycleStates": {
       "empty": "No upstream credential quota windows were observed in this period."

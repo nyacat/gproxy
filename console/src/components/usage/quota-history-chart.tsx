@@ -1,27 +1,29 @@
+import { useMemo } from "react"
 import { useTranslation } from "react-i18next"
 import { CartesianGrid, ErrorBar, Line, LineChart, Scatter, ScatterChart, XAxis, YAxis } from "recharts"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart"
-import { formatCost, formatCount, formatInstant, formatPercent } from "@/lib/format"
-import { cyclePoints, roundRange, type QuotaMetric, type QuotaSeries } from "./quota-history-data"
+import { dateFormat, formatCost, formatCount, formatInstant, formatPercent } from "@/lib/format"
+import { cyclePoints, roundRange, sampleQuotaPoints, type QuotaMetric, type QuotaSeries } from "./quota-history-data"
 
 export function QuotaHistoryChart({ series, metric, mode }: { series: Array<QuotaSeries>; metric: QuotaMetric; mode: "within" | "across" }) {
   const { t, i18n } = useTranslation()
   const format = (value: number) => metric === "cost" ? formatCost(value, i18n.language) : metric === "percent" ? formatPercent(value / 100, i18n.language) : formatCount(Math.round(value), i18n.language)
-  const plots = series.flatMap((series) => series.cycles.map((cycle) => ({
+  const plots = useMemo(() => series.flatMap((series) => series.cycles.map((cycle) => ({
     id: `cycle_${cycle.id}`, color: series.color,
     label: `${series.label} · ${formatInstant(cycle.accounting_start_ms / 1000, i18n.language)} · #${cycle.id}`,
-    points: cyclePoints(cycle, metric), range: roundRange(cycle, metric),
-  })))
+    points: mode === "within" ? sampleQuotaPoints(cyclePoints(cycle, metric)) : [],
+    range: mode === "across" ? roundRange(cycle, metric) : null,
+  }))), [series, metric, mode, i18n.language])
   const data = plots.flatMap((plot) => mode === "within" ? plot.points : plot.range ? [plot.range] : [])
   const config = Object.fromEntries(plots.map((plot) => [plot.id, { label: plot.label, color: plot.color }]))
   const hasValues = data.some((point) => point.value != null)
-  const date = (value: number) => new Intl.DateTimeFormat(i18n.language, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(value)
+  const date = (value: number) => dateFormat(i18n.language, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(value)
   const Plot = mode === "within" ? LineChart : ScatterChart
   return <Card>
     <CardHeader>
       <CardTitle>{t(`usage.quotaHistory.${mode}Title`)}</CardTitle>
-      <CardDescription>{t(`usage.quotaHistory.${mode}Description`)}</CardDescription>
+      <CardDescription>{t(`usage.quotaHistory.${mode}Description`)} {mode === "within" ? t("usage.quotaHistory.sampleHint") : null}</CardDescription>
     </CardHeader>
     <CardContent className="flex min-w-0 flex-col gap-4">
       {hasValues ? <ChartContainer config={config} className="h-80 w-full aspect-auto" aria-label={t(`usage.quotaHistory.${mode}Title`)}>
@@ -47,7 +49,7 @@ export function QuotaHistoryChart({ series, metric, mode }: { series: Array<Quot
               </div>
             }} />
           }} />
-          {plots.map((plot) => mode === "within" ? <Line key={plot.id} name={plot.id} data={plot.points} dataKey="value" type="linear" stroke={plot.color} strokeWidth={2} dot={{ r: 2 }} connectNulls={false} isAnimationActive={false} /> : plot.range ? <Scatter key={plot.id} name={plot.id} data={[plot.range]} dataKey="value" fill={plot.color} isAnimationActive={false}>
+          {plots.map((plot) => mode === "within" ? <Line key={plot.id} name={plot.id} data={plot.points} dataKey="value" type="linear" stroke={plot.color} strokeWidth={2} dot={data.length <= 128 ? { r: 2 } : false} connectNulls={false} isAnimationActive={false} /> : plot.range ? <Scatter key={plot.id} name={plot.id} data={[plot.range]} dataKey="value" fill={plot.color} isAnimationActive={false}>
             <ErrorBar dataKey="range" direction="y" width={12} stroke={plot.color} strokeWidth={3} />
           </Scatter> : null)}
         </Plot>
