@@ -158,3 +158,88 @@ async fn authoritative_credential_load_observes_peer_rotation_and_revocation_wit
     assert!(host.load_current(id).await.is_err());
     assert!(host.load(id).await.is_err());
 }
+
+#[tokio::test]
+async fn rotation_retry_preserves_a_concurrent_quota_authorization_deletion() {
+    let fixture = crate::tests::setup::fixture().await;
+    fixture.app.shutdown();
+    fixture.app.drain_background().await;
+    let host = &fixture.app.inner.host;
+    let id = CredentialId(fixture.credential);
+    let original = host.load_current(id).await.unwrap();
+    let mut secret = original.secret.clone();
+    secret["quota_api_key"] = serde_json::json!("removed-quota-authorization");
+    secret["quota_organization_id"] = serde_json::json!("old-organization");
+    host.services
+        .store
+        .persist_credential_rotation(
+            id.0,
+            &host.services.cipher.seal(&secret).unwrap(),
+            original.version,
+        )
+        .await
+        .unwrap();
+    let refreshing = host.load_current(id).await.unwrap();
+    let mut replacement = refreshing.secret.clone();
+    replacement["api_key"] = serde_json::json!("new-inference-authorization");
+
+    secret.as_object_mut().unwrap().remove("quota_api_key");
+    secret["quota_organization_id"] = serde_json::json!("new-organization");
+    let metadata = host
+        .services
+        .control
+        .current()
+        .credentials
+        .iter()
+        .find(|credential| credential.id == id.0)
+        .unwrap()
+        .clone();
+    assert!(
+        host.services
+            .store
+            .update_credential_version(
+                id.0,
+                &gproxy_store::records::CredentialUpdateInput {
+                    provider_id: fixture.provider,
+                    label: Some("edited during refresh".into()),
+                    kind: refreshing.kind.clone(),
+                    envelope: Some(host.services.cipher.seal(&secret).unwrap()),
+                    enabled: true,
+                    weight: metadata.weight,
+                    rpm_limit: metadata.rpm_limit,
+                    tpm_limit: metadata.tpm_limit,
+                    proxy_url: metadata.proxy_url,
+                    tls_fingerprint: metadata.tls_fingerprint,
+                },
+                refreshing.version,
+                true,
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        host.persist_rotation(id, replacement.clone(), refreshing.version)
+            .await
+            .is_err()
+    );
+    let edited = host.load_current(id).await.unwrap();
+    host.persist_rotation(id, replacement, edited.version)
+        .await
+        .unwrap();
+    let rotated = host.load_current(id).await.unwrap();
+    assert_eq!(rotated.version, refreshing.version + 2);
+    assert_eq!(rotated.secret["api_key"], "new-inference-authorization");
+    assert!(rotated.secret.get("quota_api_key").is_none());
+    assert_eq!(rotated.secret["quota_organization_id"], "new-organization");
+    assert_eq!(
+        host.services
+            .store
+            .credential(id.0)
+            .await
+            .unwrap()
+            .unwrap()
+            .label
+            .as_deref(),
+        Some("edited during refresh")
+    );
+}

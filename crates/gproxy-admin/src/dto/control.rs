@@ -61,6 +61,8 @@ pub struct CredentialModelHealthDto {
 pub struct CredentialDto {
     #[serde(default)]
     pub quota_capabilities: Option<super::QuotaCapabilitiesDto>,
+    #[serde(default)]
+    pub refresh_supported: bool,
     pub id: i64,
     pub provider_id: i64,
     pub label: Option<String>,
@@ -279,4 +281,28 @@ pub struct ProviderModelWriteRequest {
 pub struct CredentialSecretResponse {
     #[ts(type = "unknown")]
     pub secret: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialRefreshRequest {
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum CredentialRefreshTokenStatusDto {
+    Updated,
+    Unchanged,
+    NotReturned,
+    NotApplicable,
+    UpdatedElsewhere,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct CredentialRefreshResponse {
+    pub credential_id: i64,
+    pub credential_version: u64,
+    pub refresh_token_status: CredentialRefreshTokenStatusDto,
 }

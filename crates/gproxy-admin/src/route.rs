@@ -48,6 +48,7 @@ pub(crate) enum Route {
     CredentialQuotaRead(i64),
     CredentialQuotaReset(i64),
     CredentialHealthReset(i64),
+    CredentialRefresh(i64),
     RevealCredentialSecret(i64),
     RevealUserKey(i64),
     UserPassword(i64),
@@ -149,6 +150,9 @@ pub(crate) fn parse(method: &Method, path: &str) -> Option<Route> {
         }
         if let ["credentials", credential, "health-reset"] = segments.as_slice() {
             return Some(Route::CredentialHealthReset(credential.parse().ok()?));
+        }
+        if let ["credentials", credential, "refresh"] = segments.as_slice() {
+            return Some(Route::CredentialRefresh(credential.parse().ok()?));
         }
         if let ["credentials", credential, "reveal"] = segments.as_slice() {
             return Some(Route::RevealCredentialSecret(credential.parse().ok()?));
@@ -329,6 +333,7 @@ pub(crate) fn audit(route: &Route, body: &[u8]) -> Option<AuditDescriptor> {
         Route::CredentialHealthReset(id) => {
             action("credential.health_reset", "credentials", Some(*id))
         }
+        Route::CredentialRefresh(id) => action("credential.refresh", "credentials", Some(*id)),
         Route::RevealUserKey(id) => action("user_key.reveal", "user_key", Some(*id)),
         Route::RevealCredentialSecret(id) => {
             action("credential.secret_reveal", "credentials", Some(*id))
@@ -417,6 +422,16 @@ mod tests {
         assert!(matches!(route, Route::CredentialQuotaReset(17)));
         let descriptor = audit(&route, b"{}").unwrap();
         assert_eq!(descriptor.action, "credential.quota_reset");
+        assert_eq!(descriptor.target_kind, "credentials");
+        assert_eq!(descriptor.target_id, Some(17));
+    }
+
+    #[test]
+    fn parses_and_audits_credential_refresh() {
+        let route = parse(&http::Method::POST, "/admin/api/credentials/17/refresh").unwrap();
+        assert!(matches!(route, Route::CredentialRefresh(17)));
+        let descriptor = audit(&route, br#"{"version":0}"#).unwrap();
+        assert_eq!(descriptor.action, "credential.refresh");
         assert_eq!(descriptor.target_kind, "credentials");
         assert_eq!(descriptor.target_id, Some(17));
     }

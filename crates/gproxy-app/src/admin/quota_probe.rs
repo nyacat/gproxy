@@ -47,8 +47,7 @@ async fn refresh(
     id: i64,
     force: bool,
     automatic: bool,
-) -> Result<String, AdminError> {
-    let (provider, version, sources) = super::quota_snapshot::sources(app, id).await?;
+) -> Result<Option<(u64, String)>, AdminError> {
     let lease_key = format!("quota:probe:{id}:lease");
     let mut owner = vec![0; 16];
     getrandom::fill(&mut owner).map_err(internal)?;
@@ -66,6 +65,7 @@ async fn refresh(
     let guard =
         acquired.ok_or_else(|| AdminError::Conflict("quota refresh is still running".into()))?;
     let result = async {
+        let (_, _, sources) = super::quota_snapshot::sources(app, id).await?;
         let saved = app
             .inner
             .host
@@ -73,7 +73,7 @@ async fn refresh(
             .store
             .credential_quota_snapshot(id)
             .await?;
-        let mut raw = String::new();
+        let mut raw = None;
         for capability in sources.into_iter().filter(|source| {
             source.mode == QuotaQueryMode::Probe
                 && source.support == QuotaSupport::Ready
@@ -90,10 +90,23 @@ async fn refresh(
             {
                 continue;
             }
+            let (provider, version, current_sources) =
+                super::quota_snapshot::sources(app, id).await?;
+            let Some(capability) = current_sources
+                .into_iter()
+                .find(|source| source.id == capability.id)
+                .filter(|source| {
+                    source.mode == QuotaQueryMode::Probe
+                        && source.support == QuotaSupport::Ready
+                        && (!automatic || source.automatic)
+                })
+            else {
+                continue;
+            };
             if let Some(body) =
                 source::refresh(app, &provider, id, version, capability, force, &owner).await?
             {
-                raw = body;
+                raw = Some(body);
             }
         }
         Ok(raw)
@@ -106,11 +119,15 @@ async fn refresh(
 async fn response(
     app: &AppHandle,
     id: i64,
-    raw: String,
+    raw: Option<(u64, String)>,
     lightweight: bool,
 ) -> Result<QuotaProbeResponse, AdminError> {
-    let snapshot = super::quota_snapshot::read(app, id).await?;
+    let (credential_version, snapshot) = super::quota_snapshot::read_versioned(app, id).await?;
+    let raw = raw
+        .filter(|(version, _)| *version == credential_version)
+        .map_or_else(String::new, |(_, raw)| raw);
     let mut response = QuotaProbeResponse {
+        credential_version,
         windows: windows(&snapshot),
         reset_credits: snapshot
             .sources

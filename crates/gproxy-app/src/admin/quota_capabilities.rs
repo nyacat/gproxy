@@ -5,9 +5,16 @@ pub(super) async fn read(
     app: &AppHandle,
     id: i64,
 ) -> Result<Option<QuotaCapabilitiesDto>, AdminError> {
+    read_all(app, id).await.map(|(quota, _)| quota)
+}
+
+pub(super) async fn read_all(
+    app: &AppHandle,
+    id: i64,
+) -> Result<(Option<QuotaCapabilitiesDto>, bool), AdminError> {
     let services = &app.inner.host.services;
     let Some(credential) = services.store.credential(id).await? else {
-        return Ok(None);
+        return Ok((None, false));
     };
     let (_, _, sources) = super::quota_snapshot::sources(app, id).await?;
     let secret = services
@@ -19,14 +26,22 @@ pub(super) async fn read(
         .core
         .quota_capabilities(&credential.channel, &secret)
         .map_err(|error| AdminError::BadRequest(error.to_string()))?;
-    Ok(Some(QuotaCapabilitiesDto {
-        probe: sources.iter().any(|source| {
-            source.mode == gproxy_channel_api::QuotaQueryMode::Probe
-                && source.support == gproxy_channel_api::QuotaSupport::Ready
+    let refresh_supported = credential.enabled
+        && app.inner.core.credential_refresh_supported(
+            gproxy_channels::canonical_channel_id(&credential.channel),
+            &secret,
+        );
+    Ok((
+        Some(QuotaCapabilitiesDto {
+            probe: sources.iter().any(|source| {
+                source.mode == gproxy_channel_api::QuotaQueryMode::Probe
+                    && source.support == gproxy_channel_api::QuotaSupport::Ready
+            }),
+            reset: capability.is_some_and(|capability| capability.reset),
+            top_up_url: capability
+                .and_then(|capability| capability.top_up_url)
+                .map(str::to_owned),
         }),
-        reset: capability.is_some_and(|capability| capability.reset),
-        top_up_url: capability
-            .and_then(|capability| capability.top_up_url)
-            .map(str::to_owned),
-    }))
+        refresh_supported,
+    ))
 }

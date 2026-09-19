@@ -14,6 +14,8 @@ pub enum AdminError {
     NotFound,
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    BadGateway(&'static str),
     #[error("internal admin error: {0}")]
     Internal(String),
 }
@@ -27,6 +29,7 @@ impl AdminError {
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
