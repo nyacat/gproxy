@@ -148,3 +148,90 @@ fn upstream_failures_are_deduplicated_without_poisoning_later_responses() {
     assert_eq!(sample.usage.input_tokens, 3);
     assert!(meter.take_failure().is_none());
 }
+
+#[test]
+fn success_requires_completed_status_and_is_scoped_to_the_server_model() {
+    let mut meter = meter();
+    meter.observe(&text(
+        r#"{"type":"session.created","session":{"type":"realtime","model":"session-model","audio":{"input":{"transcription":{"model":"transcription-model"}}}}}"#,
+    ));
+    assert!(meter.take_successful_model().is_none());
+    for (index, status) in [
+        "failed",
+        "incomplete",
+        "cancelled",
+        "in_progress",
+        "future-status",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let frame = text(&serde_json::json!({
+            "type":"response.done",
+            "response":{"id":format!("response-{index}"),"status":status,"model":"response-model",
+                "usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}
+        }).to_string());
+        assert!(matches!(
+            meter.observe(&frame),
+            SessionObservation::Usage(_)
+        ));
+        assert!(meter.take_successful_model().is_none(), "{status}");
+        assert_eq!(meter.observation_model(), "response-model");
+    }
+    let completed = text(
+        r#"{"type":"response.done","response":{"id":"success","status":"completed","model":"response-model","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#,
+    );
+    assert!(matches!(
+        meter.observe(&completed),
+        SessionObservation::Usage(_)
+    ));
+    assert_eq!(
+        meter.take_successful_model().as_deref(),
+        Some("response-model")
+    );
+    assert!(meter.take_successful_model().is_none());
+    meter.observe(&text(
+        r#"{"type":"error","error":{"code":"server_is_overloaded"}}"#,
+    ));
+    assert_eq!(meter.take_failure().unwrap().category, "upstream");
+    assert!(matches!(
+        meter.observe(&completed),
+        SessionObservation::None
+    ));
+    assert!(
+        meter.take_successful_model().is_none(),
+        "replayed completion must not recover a later failure"
+    );
+    meter.observe(&text(r#"{"type":"response.done","response":{"id":"next-success","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#));
+    assert_eq!(
+        meter.take_successful_model().as_deref(),
+        Some("session-model")
+    );
+    meter.observe(&text(r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"transcription-1","transcript":"ok","usage":{"type":"tokens","input_tokens":1,"output_tokens":0,"total_tokens":1}}"#));
+    assert_eq!(
+        meter.take_successful_model().as_deref(),
+        Some("transcription-model")
+    );
+}
+
+#[test]
+fn invalid_or_untrusted_terminal_events_never_report_success() {
+    for ready in [false, true] {
+        let mut meter = meter();
+        if ready {
+            meter.observe(&text(r#"{"type":"session.created","session":{"type":"realtime","model":"session-model"}}"#));
+        }
+        for frame in [
+            r#"{"type":"response.done","response":{"id":"missing-usage","status":"completed"}}"#,
+            r#"{"type":"response.done","response":{"id":"bad-usage","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":1}}}"#,
+            r#"{"type":"response.done","response":{"id":"missing-status","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#,
+            r#"{"type":"response.done","response":{"id":"contradictory-status","status":"completed","status_details":{"error":{"code":"server_is_overloaded"}},"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#,
+        ] {
+            meter.observe(&text(frame));
+            assert!(
+                meter.take_successful_model().is_none(),
+                "ready={ready}, {frame}"
+            );
+        }
+    }
+}

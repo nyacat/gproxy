@@ -163,3 +163,132 @@ fn handshake_failure_skips_dead_credentials_and_uses_the_same_failover_budget() 
     assert_eq!(state.settlements[0].credential_id, CredentialId(8));
     assert_eq!(state.settlements[0].cost, Decimal::from(6));
 }
+
+#[test]
+fn response_done_recovers_only_the_successful_model_after_overload() {
+    use crate::CredentialHealth;
+
+    let (host, core) = setup();
+    {
+        let mut state = host.state.lock().unwrap();
+        state.health = vec![
+            (
+                CredentialId(7),
+                "other-model".into(),
+                CredentialHealth::Degraded,
+            ),
+            (
+                CredentialId(8),
+                "response-model".into(),
+                CredentialHealth::Degraded,
+            ),
+        ];
+        state.socket_frames = [
+            WsFrame::Text(r#"{"type":"session.created","session":{"type":"realtime","model":"session-model"}}"#.into()),
+            WsFrame::Text(r#"{"type":"response.done","response":{"id":"failed","status":"failed","model":"response-model","status_details":{"error":{"code":"server_is_overloaded"}},"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#.into()),
+            WsFrame::Text(r#"{"type":"response.done","response":{"id":"incomplete","status":"incomplete","model":"response-model","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#.into()),
+            WsFrame::Text(r#"{"type":"response.done","response":{"id":"success","status":"completed","model":"response-model","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#.into()),
+            WsFrame::Close(Some(1000)),
+        ].into();
+    }
+    let mut expected = host.state.lock().unwrap().health.clone();
+    let outcome = block_on(core.execute(&host, request("model=alias"))).unwrap();
+    let ResponseBody::WebSocket(mut socket) = outcome.body else {
+        panic!("websocket response")
+    };
+    assert_eq!(host.state.lock().unwrap().health, expected);
+    assert!(block_on(socket.recv()).unwrap().is_some());
+    assert_eq!(
+        host.state.lock().unwrap().health,
+        expected,
+        "session.created is not successful inference"
+    );
+    assert!(block_on(socket.recv()).unwrap().is_some());
+    expected.push((
+        CredentialId(7),
+        "response-model".into(),
+        CredentialHealth::Degraded,
+    ));
+    assert_eq!(host.state.lock().unwrap().health, expected);
+    assert!(block_on(socket.recv()).unwrap().is_some());
+    assert_eq!(
+        host.state.lock().unwrap().health,
+        expected,
+        "incomplete usage is not success"
+    );
+    assert!(block_on(socket.recv()).unwrap().is_some());
+    expected.push((
+        CredentialId(7),
+        "response-model".into(),
+        CredentialHealth::Healthy,
+    ));
+    assert_eq!(host.state.lock().unwrap().health, expected);
+    while block_on(socket.recv()).unwrap().is_some() {}
+    let state = host.state.lock().unwrap();
+    assert_eq!(
+        state.health, expected,
+        "normal session close is not another success"
+    );
+    assert_eq!(state.settlements.len(), 1);
+    assert_eq!(state.settlements[0].usage.input_tokens, 9);
+}
+
+#[test]
+fn cancelled_receives_preserve_health_updates_in_upstream_order() {
+    use crate::CredentialHealth;
+    use futures_util::FutureExt;
+
+    let (host, core) = setup();
+    {
+        let mut state = host.state.lock().unwrap();
+        state.defer_spawned = true;
+        state.health_writes_pending = true;
+        state.socket_frames = [
+            WsFrame::Text(r#"{"type":"session.created","session":{"type":"realtime","model":"actual-model"}}"#.into()),
+            WsFrame::Text(r#"{"type":"response.done","response":{"id":"failed","status":"failed","status_details":{"error":{"code":"server_is_overloaded"}},"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#.into()),
+            WsFrame::Text(r#"{"type":"response.done","response":{"id":"success","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#.into()),
+            WsFrame::Close(Some(1000)),
+        ].into();
+    }
+    let outcome = block_on(core.execute(&host, request("model=alias"))).unwrap();
+    let ResponseBody::WebSocket(mut socket) = outcome.body else {
+        panic!("websocket response")
+    };
+    assert!(block_on(socket.recv()).unwrap().is_some());
+    assert!(socket.recv().now_or_never().is_none());
+    assert!(socket.recv().now_or_never().is_none());
+    let pending = {
+        let mut state = host.state.lock().unwrap();
+        assert!(state.health.is_empty());
+        assert_eq!(state.spawned_tasks.len(), 2);
+        state.health_writes_pending = false;
+        std::mem::take(&mut state.spawned_tasks)
+    };
+    // Even if the later task is scheduled first, it must await the prior failure.
+    for task in pending.into_iter().rev() {
+        block_on(task);
+    }
+    assert_eq!(
+        host.state.lock().unwrap().health,
+        [
+            (
+                CredentialId(7),
+                "actual-model".into(),
+                CredentialHealth::Degraded
+            ),
+            (
+                CredentialId(7),
+                "actual-model".into(),
+                CredentialHealth::Healthy
+            ),
+        ]
+    );
+    while block_on(socket.recv()).unwrap().is_some() {}
+    let pending = std::mem::take(&mut host.state.lock().unwrap().spawned_tasks);
+    for task in pending {
+        block_on(task);
+    }
+    let state = host.state.lock().unwrap();
+    assert_eq!(state.settlements.len(), 1);
+    assert_eq!(state.settlements[0].usage.input_tokens, 6);
+}

@@ -9,6 +9,9 @@ use crate::control::{FailoverBudget, Plan, ProviderRef, Target};
 use crate::host::CredentialId;
 use crate::{Core, InitError, ResponseBody};
 
+mod health;
+mod recovery;
+
 #[test]
 fn codex_remote_server_requires_websocket_upgrade_before_forwarding() -> Result<(), InitError> {
     let host = MemoryHost::new(false);
@@ -112,8 +115,14 @@ fn responses_socket_reuses_upstream_and_settles_injected_responses() -> Result<(
 fn responses_socket_forwards_steering_and_settles_automatic_continuation() -> Result<(), InitError>
 {
     let host = MemoryHost::new(false);
+    let prior = (
+        CredentialId(7),
+        "upstream-model".into(),
+        crate::CredentialHealth::Degraded,
+    );
     {
         let mut state = host.state.lock().expect("state lock");
+        state.health.push(prior.clone());
         state.credential.channel = "openai".into();
         state.credential.kind = "api_key".into();
         state.credential.secret = json!({"api_key":"upstream-secret"});
@@ -178,9 +187,14 @@ fn responses_socket_forwards_steering_and_settles_automatic_continuation() -> Re
         )),
     )
     .unwrap();
-    for _ in 0..4 {
+    for _ in 0..3 {
         let _ = block_on(socket.recv()).unwrap();
+        assert_eq!(
+            host.state.lock().unwrap().health.as_slice(),
+            std::slice::from_ref(&prior)
+        );
     }
+    let _ = block_on(socket.recv()).unwrap();
 
     let state = host.state.lock().expect("state lock");
     assert_eq!(state.socket_sent.len(), 2);
@@ -191,6 +205,17 @@ fn responses_socket_forwards_steering_and_settles_automatic_continuation() -> Re
     assert_eq!(state.settlements.len(), 1);
     assert_eq!(state.settlements[0].usage.input_tokens, 6);
     assert_eq!(state.settlements[0].usage.output_tokens, 4);
+    assert_eq!(
+        state.health,
+        [
+            prior,
+            (
+                CredentialId(7),
+                "upstream-model".into(),
+                crate::CredentialHealth::Healthy
+            ),
+        ]
+    );
     Ok(())
 }
 

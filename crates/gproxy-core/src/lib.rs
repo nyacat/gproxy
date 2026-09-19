@@ -64,8 +64,9 @@ pub use control::{
 pub use error::CoreError;
 pub use fingerprint::apply_request as apply_provider_transport;
 pub use host::{
-    CacheBackend, CaptureSink, CredentialHealth, CredentialId, CredentialRecord, CredentialStore,
-    Host, SettlementPermit, Spawner, SpendReserve, UpstreamTransport, UsageSink, spend_fits,
+    CacheBackend, CaptureSink, CredentialHealth, CredentialHealthActivity, CredentialHealthLease,
+    CredentialId, CredentialRecord, CredentialStore, Host, SettlementPermit, Spawner, SpendReserve,
+    UpstreamTransport, UsageSink, spend_fits,
 };
 pub use quota::QuotaProbeResult;
 pub use quota_source::QuotaSourceProbeResult;

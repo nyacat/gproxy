@@ -58,20 +58,18 @@ impl<H: Host> Session<H> {
         TransportError::Interrupted(reason.into())
     }
 
-    fn observe(&mut self, frame: &WsFrame) -> Result<(), TransportError> {
+    async fn observe(&mut self, frame: &WsFrame) -> Result<(), TransportError> {
         let ready = self.meter.ready();
         let observation = self.meter.observe(frame);
-        if let Some(failure) = self.meter.take_failure() {
-            self.guard.failure(
-                failure,
-                matches!(
-                    &observation,
-                    gproxy_channel_api::SessionObservation::Usage(_)
-                ),
-            );
-        }
-        match observation {
-            SessionObservation::None => {}
+        let failure = self
+            .meter
+            .take_failure()
+            .map(|failure| (failure, self.meter.observation_model().to_owned()));
+        let usage_received = matches!(&observation, SessionObservation::Usage(_));
+        // Consume usage before awaiting health persistence so cancelling recv
+        // cannot lose the usage from an already consumed response.done frame.
+        let observed = match observation {
+            SessionObservation::None => Ok(()),
             SessionObservation::Usage(sample) if ready => {
                 let provider = self.guard.ctx().target.provider.clone();
                 let tier = self
@@ -86,16 +84,25 @@ impl<H: Host> Session<H> {
                     &provider,
                     tier.as_deref(),
                 ) {
-                    return Err(self.compromised(&error.to_string()));
+                    Err(self.compromised(&error.to_string()))
+                } else {
+                    Ok(())
                 }
             }
             SessionObservation::Usage(_) => {
-                return Err(self.compromised("Realtime usage arrived before server session state"));
+                Err(self.compromised("Realtime usage arrived before server session state"))
             }
-            SessionObservation::Compromised { reason, .. } => return Err(self.compromised(&reason)),
-        }
+            SessionObservation::Compromised { reason, .. } => Err(self.compromised(&reason)),
+        };
         if self.meter.ready() {
             self.guard.set_primary_model(self.meter.primary_model());
+        }
+        if let Some((failure, model)) = failure {
+            self.guard.failure(failure, &model, usage_received).await;
+        }
+        observed?;
+        if let Some(model) = self.meter.take_successful_model() {
+            self.guard.success(&model).await;
         }
         Ok(())
     }
@@ -148,7 +155,7 @@ impl<H: Host> WsDuplex for MeteredSocket<H> {
                     Ok(Some(frame))
                 }
                 Ok(Some(frame)) => {
-                    if let Err(error) = session.observe(&frame) {
+                    if let Err(error) = session.observe(&frame).await {
                         let _ = session.socket.send(WsFrame::Close(Some(1011))).await;
                         self.session
                             .take()

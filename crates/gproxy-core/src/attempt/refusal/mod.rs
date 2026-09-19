@@ -1,5 +1,6 @@
 mod buffered;
 mod credit;
+mod health;
 mod meter;
 pub(crate) mod pin;
 mod policy;
@@ -21,12 +22,22 @@ pub(crate) struct Wrapped {
 
 pub(crate) async fn wrap<H: crate::host::Host>(
     core: &crate::api::Core<H>,
-    facts: &crate::funnel::FunnelCtx,
+    facts: &mut crate::funnel::FunnelCtx,
     response: http::Response<crate::boundary::ByteStream>,
     replay: Replay,
     streaming: bool,
 ) -> Wrapped {
     let mut runner = retry::Runner::new(core, facts, replay);
+    if let Some(channel) = core.channels.get(&facts.target.provider.channel) {
+        crate::funnel::health::observe_quota(
+            core.host.as_ref(),
+            channel,
+            facts,
+            response.headers(),
+        )
+        .await;
+    }
+    facts.health_delegated = true;
     if streaming {
         let decoder = runner.meter.decoder();
         Wrapped {

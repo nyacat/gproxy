@@ -57,6 +57,53 @@ fn cancelled_meter_releases_owner_and_settles_interrupted() -> Result<(), InitEr
 }
 
 #[test]
+fn cancelled_health_write_preserves_sideband_failure_and_received_usage() {
+    use crate::{CredentialHealth, CredentialId};
+    use futures_util::FutureExt;
+
+    let host = MemoryHost::with_session_spawner();
+    configure(&host);
+    {
+        let mut state = host.state.lock().unwrap();
+        state.defer_spawned = true;
+        state.health_writes_pending = true;
+        state.socket_frames = [
+            WsFrame::Text(r#"{"type":"session.created","session":{"type":"realtime","model":"actual-model"}}"#.into()),
+            WsFrame::Text(r#"{"type":"response.done","response":{"id":"failed","status":"failed","status_details":{"error":{"code":"server_is_overloaded"}},"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#.into()),
+        ].into();
+    }
+    let core = core(&host).unwrap();
+    assert!(
+        block_on(core.execute(&host, request("sideband-cancelled-health")))
+            .unwrap()
+            .status
+            .is_success()
+    );
+    let runner = host.state.lock().unwrap().spawned_tasks.pop().unwrap();
+    assert!(runner.now_or_never().is_none());
+    let pending = {
+        let mut state = host.state.lock().unwrap();
+        state.health_writes_pending = false;
+        std::mem::take(&mut state.spawned_tasks)
+    };
+    for task in pending {
+        block_on(task);
+    }
+    let state = host.state.lock().unwrap();
+    assert_eq!(
+        state.health,
+        [(
+            CredentialId(7),
+            "actual-model".into(),
+            CredentialHealth::Degraded
+        )]
+    );
+    assert_eq!(state.settlements.len(), 1);
+    assert_eq!(state.settlements[0].usage.input_tokens, 3);
+    assert_eq!(state.settlements[0].ended, crate::Ended::Interrupted);
+}
+
+#[test]
 fn observer_disconnect_hangs_up_and_settles_interrupted() -> Result<(), InitError> {
     let host = MemoryHost::with_session_spawner();
     configure(&host);

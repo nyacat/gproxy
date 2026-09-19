@@ -45,6 +45,9 @@ pub(crate) async fn cancel_outcome(outcome: ExecOutcome) {
 #[derive(Clone)]
 pub(crate) struct FunnelCtx {
     pub activity: Option<crate::host::CredentialUsageLease>,
+    pub health_activity: Option<crate::host::CredentialHealthLease>,
+    /// A composite response delegates observations to its physical attempts.
+    pub health_delegated: bool,
     pub upstream_started_at_ms: Option<i64>,
     pub request_id: String,
     pub target: Target,

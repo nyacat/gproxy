@@ -28,7 +28,7 @@ pub(super) async fn finish<H: Host>(host: Shared<H>, mut session: Session<H>, mu
                 break;
             }
             Some(Ok(Some(frame))) => {
-                if session.observe(&frame).is_err() {
+                if session.observe(&frame).await.is_err() {
                     ended = Ended::Interrupted;
                     break;
                 }

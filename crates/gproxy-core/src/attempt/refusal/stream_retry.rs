@@ -35,7 +35,12 @@ impl<H: Host> Runner<H> {
             }
             let response = match self.send(&plan.model, &plan.body).await {
                 Ok(response) => response,
-                Err(CoreError::QuotaExceeded | CoreError::RateLimited { .. }) => return Ok(None),
+                Err(
+                    CoreError::QuotaExceeded
+                    | CoreError::RateLimited { .. }
+                    | CoreError::CredentialCoolingDown { .. }
+                    | CoreError::NoCredentials,
+                ) => return Ok(None),
                 Err(error) => return Err(error),
             };
             if response.status() != http::StatusCode::BAD_REQUEST {
@@ -45,9 +50,7 @@ impl<H: Host> Runner<H> {
                 }
                 return Ok(Some(response));
             }
-            let response = crate::attempt::body::collect(response)
-                .await
-                .map_err(|error| CoreError::Transport(error.error))?;
+            let response = self.collect_response(response).await?;
             self.capture(
                 response.status(),
                 response.headers(),

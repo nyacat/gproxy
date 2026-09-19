@@ -81,6 +81,10 @@ fn claudeweb_new_and_resume_turns_transfer_one_scoped_stream() {
         }),
     );
     let outcome = block_on(core.execute(&host, first)).expect("new turn");
+    assert!(
+        host.state.lock().unwrap().health.is_empty(),
+        "successful conversation setup is not evidence that the model recovered"
+    );
     let ResponseBody::Stream(mut body) = outcome.body else {
         panic!("new turn was not streaming")
     };

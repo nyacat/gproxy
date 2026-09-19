@@ -212,7 +212,7 @@ impl<H: Host> ResponsesBridge<H> {
                 Some(classified.routing_affinity(self.identity.user_key_id)),
             )
             .unwrap_or_else(|_| self.fallback_plan.clone());
-        let plan = if let Some((target, _)) = &self.pinned {
+        let mut plan = if let Some((target, _)) = &self.pinned {
             if !resolved.targets.iter().any(|candidate| {
                 candidate.provider.id == target.provider.id
                     && candidate.credential == target.credential
@@ -229,7 +229,10 @@ impl<H: Host> ResponsesBridge<H> {
             resolved
         };
         if self.pinned.is_none() {
-            if self.connect_native(&request, &plan, &classified).await? {
+            if self
+                .connect_native(&request, &mut plan, &classified)
+                .await?
+            {
                 return Ok(());
             }
             return self.start_http(request, plan).await;
@@ -293,12 +296,20 @@ impl<H: Host> ResponsesBridge<H> {
     }
 
     async fn recv_native(&mut self) -> Result<Option<WsFrame>, TransportError> {
-        let frame = self
+        let frame = match self
             .native
             .as_mut()
             .expect("checked native socket")
             .recv()
-            .await?;
+            .await
+        {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.finish_active(Ended::Interrupted).await;
+                self.closed = true;
+                return Err(error);
+            }
+        };
         let Some(frame) = frame else {
             self.finish_active(Ended::Interrupted).await;
             self.closed = true;
@@ -319,7 +330,7 @@ impl<H: Host> ResponsesBridge<H> {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
             && let Some(active) = self.active.as_mut()
         {
-            active.failure.observe(None, &value);
+            active.observe_failure(&value);
         }
         let Ok(ResponseStreamEvent::Known(event)) = serde_json::from_str(text) else {
             if self
@@ -339,9 +350,20 @@ impl<H: Host> ResponsesBridge<H> {
             .saturating_add(crate::usage::utf8_chars(text.as_bytes()));
         match *event {
             KnownResponseStreamEvent::ResponseCreated(event) => {
-                if active.response_id.is_some() && active.pending_steers > 0 {
+                if active
+                    .response_id
+                    .as_ref()
+                    .is_some_and(|id| id != &event.response.id)
+                    && active.pending_steers > 0
+                {
+                    if active.steered_response_id == active.response_id
+                        && active.steered_incomplete()
+                    {
+                        active.reset_failure();
+                    }
                     active.pending_steers = 0;
                     active.terminal = None;
+                    active.steered_response_id = None;
                 }
                 active.response_id = Some(event.response.id.clone());
             }
@@ -354,20 +376,38 @@ impl<H: Host> ResponsesBridge<H> {
             | KnownResponseStreamEvent::ResponseSteerFailed(_) => {
                 active.pending_steers = active.pending_steers.saturating_sub(1);
             }
-            KnownResponseStreamEvent::ResponseCompleted(event)
-            | KnownResponseStreamEvent::ResponseIncomplete(event) => {
+            KnownResponseStreamEvent::ResponseCompleted(event) => {
+                if active
+                    .response_id
+                    .as_ref()
+                    .is_some_and(|id| id != &event.response.id)
+                {
+                    return;
+                }
+                active.steered_response_id = None;
+                active.terminal = Some(Ended::Complete);
+                active.responses.push(Bytes::from(
+                    serde_json::to_vec(&event.response).expect("response serializes"),
+                ));
+            }
+            KnownResponseStreamEvent::ResponseIncomplete(event) => {
+                active.steered_response_id = active
+                    .steered_incomplete()
+                    .then(|| event.response.id.clone());
                 active.terminal = Some(Ended::Complete);
                 active.responses.push(Bytes::from(
                     serde_json::to_vec(&event.response).expect("response serializes"),
                 ));
             }
             KnownResponseStreamEvent::ResponseFailed(event) => {
+                active.steered_response_id = None;
                 active.terminal = Some(Ended::Complete);
                 active.responses.push(Bytes::from(
                     serde_json::to_vec(&event.response).expect("response serializes"),
                 ));
             }
             KnownResponseStreamEvent::Error(_) => {
+                active.steered_response_id = None;
                 active.terminal = Some(Ended::Complete);
             }
             _ => {}
@@ -406,6 +446,16 @@ impl<H: Host> ResponsesBridge<H> {
                 &active.facts,
                 http::StatusCode::SWITCHING_PROTOCOLS,
                 failure,
+            )
+            .await;
+        } else if ended == Ended::Complete
+            && terminal_disposition == Some(gproxy_channel_api::Disposition::Success)
+        {
+            crate::funnel::health::record_response(
+                self.core.host.as_ref(),
+                &active.facts,
+                gproxy_channel_api::Disposition::Success,
+                http::StatusCode::SWITCHING_PROTOCOLS,
             )
             .await;
         }

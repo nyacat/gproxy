@@ -89,6 +89,54 @@ fn call_defers_one_settlement_to_the_owned_sideband() -> Result<(), InitError> {
     Ok(())
 }
 
+#[test]
+fn sideband_completed_response_restores_only_its_model_after_overload() {
+    use crate::{CredentialHealth, CredentialId};
+
+    let host = MemoryHost::with_session_spawner();
+    configure(&host);
+    host.state.lock().unwrap().socket_frames = [
+        WsFrame::Text(r#"{"type":"session.created","session":{"type":"realtime","model":"session-model"}}"#.into()),
+        WsFrame::Text(r#"{"type":"response.done","response":{"id":"failed","status":"failed","model":"response-model","status_details":{"error":{"code":"server_is_overloaded"}}}}"#.into()),
+        WsFrame::Text(r#"{"type":"response.done","response":{"id":"incomplete","status":"incomplete","model":"response-model","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#.into()),
+        WsFrame::Text(r#"{"type":"response.done","response":{"id":"success","status":"completed","model":"response-model","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}"#.into()),
+        WsFrame::Close(Some(1000)),
+    ].into();
+    let core = core(&host).unwrap();
+    let outcome = block_on(core.execute(&host, request("sideband-health"))).unwrap();
+    assert!(outcome.status.is_success());
+    let state = host.state.lock().unwrap();
+    let model_updates = state
+        .health
+        .iter()
+        .filter(|(_, model, _)| model == "response-model")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        model_updates,
+        [
+            (
+                CredentialId(7),
+                "response-model".into(),
+                CredentialHealth::Degraded
+            ),
+            (
+                CredentialId(7),
+                "response-model".into(),
+                CredentialHealth::Healthy
+            ),
+        ]
+    );
+    assert!(
+        !state
+            .health
+            .iter()
+            .any(|(_, model, _)| model == "session-model")
+    );
+    assert_eq!(state.settlements.len(), 1);
+    assert_eq!(state.settlements[0].usage.input_tokens, 6);
+}
+
 fn configure(host: &MemoryHost) {
     let mut state = host.state.lock().expect("state lock");
     state.credential.secret = json!({

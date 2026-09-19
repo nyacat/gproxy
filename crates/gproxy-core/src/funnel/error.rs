@@ -181,6 +181,7 @@ fn core_error_kind(error: &CoreError) -> &'static str {
         CoreError::UnknownProvider(_) => "unknown_provider",
         CoreError::Unsupported => "unsupported",
         CoreError::RateLimited { .. } => "rate_limited",
+        CoreError::CredentialCoolingDown { .. } => "credential_cooling_down",
         CoreError::QuotaExceeded => "quota_exceeded",
         CoreError::NoCredentials => "no_credentials",
         CoreError::Transform(_) => "transform",

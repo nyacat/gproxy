@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use gproxy_channel_api::{Disposition, PrepareCtx, ResponseView};
+use gproxy_channel_api::PrepareCtx;
 use serde_json::{Value, json};
 
 use crate::api::Core;
@@ -19,6 +19,7 @@ pub(super) struct Runner<H: Host> {
     pub prefix: Vec<Value>,
     pub boundaries: Vec<Value>,
     pub wire_iterations: Vec<Value>,
+    pub last_health: Option<gproxy_channel_api::Disposition>,
 }
 
 pub(super) struct RetryPlan {
@@ -43,6 +44,7 @@ impl<H: Host> Runner<H> {
             prefix: Vec::new(),
             boundaries: Vec::new(),
             wire_iterations: Vec::new(),
+            last_health: None,
         }
     }
 
@@ -154,7 +156,12 @@ impl<H: Host> Runner<H> {
             }
             let response = match self.send(&model, &body).await {
                 Ok(response) => response,
-                Err(CoreError::QuotaExceeded | CoreError::RateLimited { .. }) => return Ok(None),
+                Err(
+                    CoreError::QuotaExceeded
+                    | CoreError::RateLimited { .. }
+                    | CoreError::CredentialCoolingDown { .. }
+                    | CoreError::NoCredentials,
+                ) => return Ok(None),
                 Err(error) => return Err(error),
             };
             if response.status() != http::StatusCode::BAD_REQUEST {
@@ -182,9 +189,7 @@ impl<H: Host> Runner<H> {
                 }
                 return Ok(Some(response));
             }
-            let response = crate::attempt::body::collect(response)
-                .await
-                .map_err(|error| CoreError::Transport(error.error))?;
+            let response = self.collect_response(response).await?;
             self.capture(
                 response.status(),
                 response.headers(),
@@ -240,6 +245,21 @@ impl<H: Host> Runner<H> {
             &target.provider,
         )
         .await?;
+        let health_activity = if self.facts.target.upstream_model == model
+            && self.facts.credential_version == Some(credential.version)
+            && self.facts.health_activity.is_some()
+        {
+            self.facts.health_activity.clone()
+        } else {
+            self.core
+                .host
+                .begin_credential_health_attempt(
+                    &self.facts.request_id,
+                    &target,
+                    credential.version,
+                )
+                .await?
+        };
         let mut headers = self.replay.headers.clone();
         if let Some(betas) = headers
             .get("anthropic-beta")
@@ -270,6 +290,9 @@ impl<H: Host> Runner<H> {
         self.replay.capture(&prepared.request);
         self.facts.target = target;
         self.facts.credential_version = Some(credential.version);
+        self.facts.health_activity = health_activity;
+        self.last_health = None;
+        self.meter.reset_health();
         self.facts.upstream_started_at_ms = Some(crate::quota::now_ms());
         self.facts.upstream_url = Some(prepared.request.uri().to_string());
         self.facts.request_body = prepared.request.body().clone();
@@ -295,6 +318,7 @@ impl<H: Host> Runner<H> {
                     self.facts.upstream_started_at_ms.expect("send time"),
                     0,
                 );
+                self.record_transport_health().await;
                 crate::funnel::error::attempt_transport(
                     self.core.host.as_ref(),
                     &self.facts,
@@ -311,23 +335,13 @@ impl<H: Host> Runner<H> {
                 response.status().as_u16(),
             );
         }
-        let disposition = channel.classify(ResponseView {
-            status: response.status(),
-            headers: response.headers(),
-            body: &[],
-        });
-        crate::funnel::health::response(
+        crate::funnel::health::observe_quota(
             self.core.host.as_ref(),
             channel,
             &self.facts,
-            disposition,
-            response.status(),
             response.headers(),
         )
         .await;
-        if disposition == Disposition::CredentialDead {
-            tracing::warn!(request_id = %self.facts.request_id, "fallback credential was rejected");
-        }
         Ok(response)
     }
 

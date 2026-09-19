@@ -150,6 +150,8 @@ async fn serve<H: Host>(
     };
     let funnel = FunnelCtx {
         activity: None,
+        health_activity: None,
+        health_delegated: false,
         upstream_started_at_ms: None,
         request_id: request.request_id.clone(),
         target,

@@ -37,6 +37,9 @@ pub(crate) async fn observe_quota(
     facts: &super::FunnelCtx,
     headers: &http::HeaderMap,
 ) {
+    if facts.health_delegated {
+        return;
+    }
     let target = &facts.target;
     let mut observations = channel.observe_quota(headers);
     let received_at_ms = crate::quota::now_ms();
@@ -77,6 +80,9 @@ pub(crate) async fn record_response(
     disposition: Disposition,
     status: http::StatusCode,
 ) {
+    if facts.health_delegated {
+        return;
+    }
     let target = &facts.target;
     let Some(credential_version) = facts.credential_version else {
         return;
@@ -113,6 +119,9 @@ pub(crate) async fn record_failure(
     status: http::StatusCode,
     failure: &gproxy_channel_api::UpstreamFailure,
 ) {
+    if facts.health_delegated {
+        return;
+    }
     let Some(version) = facts.credential_version else {
         return;
     };

@@ -283,6 +283,7 @@ pub fn classify(
             | "internalserverexception"
             | "internal"
             | "overloaded_error"
+            | "server_is_overloaded"
             | "service_unavailable"
             | "serviceunavailableexception"
             | "unavailable"

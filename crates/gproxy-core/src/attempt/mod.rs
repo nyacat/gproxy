@@ -180,7 +180,7 @@ pub(crate) async fn send<H: Host>(
                     return Err(Box::new(Failure::Transport { facts, error }));
                 }
             };
-            funnel::health::response(
+            funnel::health::stream_response(
                 core.host.as_ref(),
                 channel_impl,
                 &facts,
@@ -208,7 +208,7 @@ pub(crate) async fn send<H: Host>(
     let (response, decoder_override, usage_override) = if response.status().is_success() {
         if let Some(replay) = refusal {
             committed = true;
-            let wrapped = refusal::wrap(core, &facts, response, replay, stream).await;
+            let wrapped = refusal::wrap(core, &mut facts, response, replay, stream).await;
             if wrapped.decoder.is_some() {
                 facts.target_framing = gproxy_protocol::StreamFraming::Sse;
             }
@@ -385,7 +385,7 @@ pub(crate) async fn send<H: Host>(
                                 error: CoreError::Transport(failure.error),
                             }));
                         }
-                    } else {
+                    } else if !facts.health_delegated {
                         crate::funnel::health::degraded(
                             core.host.as_ref(),
                             &facts.target,
@@ -425,14 +425,16 @@ pub(crate) async fn send<H: Host>(
     let response = match body::collect(response).await {
         Ok(response) => response,
         Err(failure) => {
-            crate::funnel::health::degraded(
-                core.host.as_ref(),
-                &facts.target,
-                facts.credential_version,
-                Some(failure.status),
-                "upstream response interrupted",
-            )
-            .await;
+            if !facts.health_delegated {
+                crate::funnel::health::degraded(
+                    core.host.as_ref(),
+                    &facts.target,
+                    facts.credential_version,
+                    Some(failure.status),
+                    "upstream response interrupted",
+                )
+                .await;
+            }
             return Err(Box::new(Failure::Interrupted {
                 channel: channel.descriptor().id,
                 facts,
@@ -463,7 +465,11 @@ pub(crate) async fn send<H: Host>(
         );
         funnel::health::record_failure(core.host.as_ref(), &facts, response.status(), failure)
             .await;
-    } else {
+    } else if semantic != Disposition::Success
+        || !facts
+            .key
+            .is_some_and(|key| key.operation() == gproxy_protocol::Operation::CreateRealtimeCall)
+    {
         funnel::health::record_response(core.host.as_ref(), &facts, semantic, response.status())
             .await;
     }
