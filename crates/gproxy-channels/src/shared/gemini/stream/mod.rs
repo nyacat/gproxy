@@ -24,6 +24,11 @@ enum Parser {
     JsonArray(json_array::Decoder),
 }
 
+struct ParsedChunk {
+    raw: Bytes,
+    value: Option<serde_json::Value>,
+}
+
 impl GeminiStreamDecoder {
     pub(crate) fn for_operation(ctx: StreamCtx<'_>) -> Option<Self> {
         if ctx.key.operation() != Operation::StreamGenerateContent
@@ -46,52 +51,56 @@ impl GeminiStreamDecoder {
         })
     }
 
-    fn parse(&mut self, chunk: &[u8]) -> Result<Vec<serde_json::Value>, ChannelError> {
-        match &mut self.parser {
-            Parser::Sse(parser) => parser.push(chunk),
-            Parser::JsonArray(parser) => parser.push(chunk),
-        }
-    }
-
-    fn parse_finish(&mut self) -> Result<Vec<serde_json::Value>, ChannelError> {
-        match &mut self.parser {
-            Parser::Sse(parser) => parser.finish(),
-            Parser::JsonArray(parser) => parser.finish(),
-        }
-    }
-
-    fn observe(&mut self, chunks: Vec<serde_json::Value>) -> Result<(), ChannelError> {
-        for value in chunks {
-            self.failure.observe(None, &value);
-            if value.get("error").is_some_and(|error| !error.is_null()) {
-                continue;
+    fn drain(&mut self, eof: bool) -> Result<Vec<Frame>, StreamDecodeError> {
+        let mut output = Vec::new();
+        loop {
+            let parsed = match &mut self.parser {
+                Parser::Sse(parser) => parser.next(eof),
+                Parser::JsonArray(parser) => parser.next(eof),
+            };
+            let chunk = match parsed {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => return Ok(output),
+                Err(error) => return Err(StreamDecodeError::from(error).prepend(output)),
+            };
+            if let Some(value) = chunk.value
+                && let Err(error) = self.observe(value)
+            {
+                return Err(StreamDecodeError::from(error).prepend(output));
             }
-            let chunk: GenerateContentResponse = serde_json::from_value(value)
-                .map_err(|_| ChannelError::Decode("invalid Gemini content response".into()))?;
-            if let Some(metadata) = chunk.usage_metadata.as_ref() {
-                if self.response_tier.is_none() {
-                    self.response_tier = metadata
-                        .service_tier
-                        .as_ref()
-                        .and_then(super::usage::tier_name);
-                }
-                // Code Assist can attach prompt-only usage to early thinking
-                // and tool-call frames. Later frames carry cumulative output
-                // counts, which remain subject to the strict usage checks.
-                if metadata.prompt_token_count.is_none()
-                    || metadata.candidates_token_count.is_none()
-                {
-                    self.terminal.observe(&chunk)?;
-                    continue;
-                }
-                let mut usage = super::usage::normalize(metadata)
-                    .map_err(|error| ChannelError::Decode(format!("Gemini usage: {error}")))?;
+            output.push(Frame(chunk.raw));
+        }
+    }
+
+    fn observe(&mut self, value: serde_json::Value) -> Result<(), ChannelError> {
+        self.failure.observe(None, &value);
+        if value.get("error").is_some_and(|error| !error.is_null()) {
+            return Ok(());
+        }
+        let chunk: GenerateContentResponse = serde_json::from_value(value)
+            .map_err(|_| ChannelError::Decode("invalid Gemini content response".into()))?;
+        self.terminal.observe(&chunk)?;
+        if let Some(metadata) = chunk.usage_metadata.as_ref() {
+            // Code Assist can attach prompt-only usage to early thinking
+            // and tool-call frames. Only complete usage replaces the previous
+            // cumulative sample, after the event itself has been validated.
+            let usage = (metadata.prompt_token_count.is_some()
+                && metadata.candidates_token_count.is_some())
+            .then(|| super::usage::normalize(metadata))
+            .transpose()
+            .map_err(|error| ChannelError::Decode(format!("Gemini usage: {error}")))?;
+            if self.response_tier.is_none() {
+                self.response_tier = metadata
+                    .service_tier
+                    .as_ref()
+                    .and_then(super::usage::tier_name);
+            }
+            if let Some(mut usage) = usage {
                 if let Some(tier) = self.response_tier.as_ref() {
                     usage.dimensions.insert("service_tier".into(), tier.clone());
                 }
                 self.usage = Some(usage);
             }
-            self.terminal.observe(&chunk)?;
         }
         Ok(())
     }
@@ -103,13 +112,33 @@ impl StreamDecoder for GeminiStreamDecoder {
     }
 
     fn push(&mut self, chunk: Bytes) -> Result<Vec<Frame>, StreamDecodeError> {
-        let parsed = self.parse(&chunk)?;
-        self.observe(parsed)?;
-        if chunk.is_empty() {
-            Ok(Vec::new())
-        } else {
-            Ok(vec![Frame(chunk)])
+        let pending = match &mut self.parser {
+            Parser::Sse(parser) => {
+                let pending = parser.pending_len();
+                parser.push(&chunk);
+                pending
+            }
+            Parser::JsonArray(parser) => {
+                let pending = parser.pending_len();
+                parser.push(&chunk);
+                pending
+            }
+        };
+        let mut result = self.drain(false);
+        // A transport chunk containing complete events still travels without
+        // reframing or copying. Only an event spanning transport chunks needs
+        // the parser's assembled bytes; malformed suffixes are never forwarded.
+        if pending == 0 {
+            let frames = match &mut result {
+                Ok(frames) => frames,
+                Err(error) => &mut error.frames,
+            };
+            if !frames.is_empty() {
+                let length: usize = frames.iter().map(|frame| frame.0.len()).sum();
+                *frames = vec![Frame(chunk.slice(..length))];
+            }
         }
+        result
     }
 
     fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
@@ -121,17 +150,21 @@ impl StreamDecoder for GeminiStreamDecoder {
                 actual_service_tier: self.response_tier.take(),
             });
         }
-        let parsed = self.parse_finish()?;
-        self.observe(parsed)?;
+        let frames = self.drain(true)?;
+        if let Parser::JsonArray(parser) = &self.parser
+            && let Err(error) = parser.finish()
+        {
+            return Err(StreamDecodeError::from(error).prepend(frames));
+        }
         if self.failure.failure().is_none() && !self.terminal.is_complete() {
-            return Err(ChannelError::Decode(
+            return Err(StreamDecodeError::from(ChannelError::Decode(
                 "Gemini stream ended without terminal candidate or block reason".into(),
-            )
-            .into());
+            ))
+            .prepend(frames));
         }
         Ok(StreamTail {
             estimated_output_chars: None,
-            frames: Vec::new(),
+            frames,
             usage: self.usage.take(),
             actual_service_tier: self.response_tier.take(),
         })

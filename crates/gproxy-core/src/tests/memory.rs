@@ -24,6 +24,7 @@ pub(super) struct MemoryHost {
 
 pub(super) struct State {
     pub(super) credential: CredentialRecord,
+    pub(super) cached_credential: Option<CredentialRecord>,
     pub(super) conflict: bool,
     pub(super) peer_refresh_on_wait: bool,
     pub(super) lease_calls: usize,
@@ -94,6 +95,7 @@ impl MemoryHost {
                     secret: json!({"access_token": "old", "expires_at": 0}),
                     version: 4,
                 },
+                cached_credential: None,
                 conflict,
                 peer_refresh_on_wait: false,
                 lease_calls: 0,

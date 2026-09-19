@@ -19,8 +19,26 @@ impl CredentialStore for MemoryHost {
     fn load<'a>(&'a self, id: CredentialId) -> BoxFuture<'a, Result<CredentialRecord, StoreError>> {
         let mut state = self.state.lock().expect("state lock");
         state.loaded_credentials.push(id);
+        let mut record = state
+            .cached_credential
+            .as_ref()
+            .unwrap_or(&state.credential)
+            .clone();
+        record.id = id;
+        Box::pin(async move { Ok(record) })
+    }
+
+    fn load_current<'a>(
+        &'a self,
+        id: CredentialId,
+    ) -> BoxFuture<'a, Result<CredentialRecord, StoreError>> {
+        let mut state = self.state.lock().expect("state lock");
+        state.loaded_credentials.push(id);
         let mut record = state.credential.clone();
         record.id = id;
+        if state.cached_credential.is_some() {
+            state.cached_credential = Some(record.clone());
+        }
         Box::pin(async move { Ok(record) })
     }
 
@@ -364,7 +382,6 @@ impl UpstreamTransport for MemoryHost {
                 state
                     .upstream_requests
                     .push((request.headers().clone(), request.uri().to_string()));
-                state.upstream_bodies.push(request_body.clone());
                 state.upstream_bodies.push(request_body.clone());
                 state.authorizations.push(authorization);
                 if let Some(value) = request.headers().get("originator") {

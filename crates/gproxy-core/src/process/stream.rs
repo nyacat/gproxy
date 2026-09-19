@@ -99,6 +99,29 @@ impl ResponseRuleDecoder {
         );
         StreamDecodeError::from(error.error).prepend(frames)
     }
+
+    fn finish_frames(&mut self) -> Result<Vec<Frame>, StreamDecodeError> {
+        let frames = match &mut self.codec {
+            Codec::Sse(codec) => codec.finish(),
+            Codec::JsonArray(codec) => codec.finish(),
+        }
+        .map_err(|error| self.codec_error(error, Vec::new()))?;
+        Ok(frames
+            .into_iter()
+            .map(|frame| Frame(frame.map(|body| self.rewrite(body))))
+            .collect())
+    }
+
+    fn failed_frames(&mut self, mut error: StreamDecodeError) -> StreamDecodeError {
+        let mut frames = match self.decode(std::mem::take(&mut error.frames)) {
+            Ok(frames) => frames,
+            Err(error) => return error,
+        };
+        // Upstream EOF validation may fail after completing a final event
+        // without its delimiter. Rewriting must not leave that event buffered.
+        frames.extend(self.finish_frames().unwrap_or_else(|error| error.frames));
+        error.prepend(frames)
+    }
 }
 
 impl StreamDecoder for ResponseRuleDecoder {
@@ -118,10 +141,7 @@ impl StreamDecoder for ResponseRuleDecoder {
         let frames = match self.upstream.as_mut() {
             Some(upstream) => match upstream.push(chunk) {
                 Ok(frames) => frames,
-                Err(mut error) => {
-                    let frames = self.decode(std::mem::take(&mut error.frames))?;
-                    return Err(error.prepend(frames));
-                }
+                Err(error) => return Err(self.failed_frames(error)),
             },
             None => vec![Frame(chunk)],
         };
@@ -137,8 +157,7 @@ impl StreamDecoder for ResponseRuleDecoder {
                         error.frames.clear();
                         return Err(error);
                     }
-                    let frames = self.decode(std::mem::take(&mut error.frames))?;
-                    return Err(error.prepend(frames));
+                    return Err(self.failed_frames(error));
                 }
             },
             None => StreamTail::default(),
@@ -150,15 +169,9 @@ impl StreamDecoder for ResponseRuleDecoder {
         let tail_frames = std::mem::take(&mut tail.frames);
         self.pending_tail = Some(tail);
         let mut frames = self.decode(tail_frames)?;
-        let final_frames = match match &mut self.codec {
-            Codec::Sse(codec) => codec.finish(),
-            Codec::JsonArray(codec) => codec.finish(),
-        } {
-            Ok(frames) => frames,
-            Err(error) => return Err(self.codec_error(error, frames)),
-        };
-        for frame in final_frames {
-            frames.push(Frame(frame.map(|body| self.rewrite(body))));
+        match self.finish_frames() {
+            Ok(tail) => frames.extend(tail),
+            Err(error) => return Err(error.prepend(frames)),
         }
         let mut tail = self.pending_tail.take().expect("finished upstream tail");
         tail.frames = frames;

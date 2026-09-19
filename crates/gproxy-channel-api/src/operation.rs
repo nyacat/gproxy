@@ -79,4 +79,11 @@ pub trait OperationStream: Send {
     /// with the same ownership rules as [`crate::StreamDecoder`].
     fn push(&mut self, chunk: Bytes) -> Result<StreamOutput, StreamDecodeError>;
     fn finish(&mut self, end: StreamEnd) -> Result<Vec<Frame>, StreamDecodeError>;
+
+    /// Finish while retaining a terminal pause discovered in an unterminated
+    /// transport chunk. Implementations that do not support pauses keep the
+    /// original frame-only behavior.
+    fn finish_output(&mut self, end: StreamEnd) -> Result<StreamOutput, StreamDecodeError> {
+        self.finish(end).map(StreamOutput::frames)
+    }
 }

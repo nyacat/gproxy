@@ -127,10 +127,16 @@ impl<H: Host> ContinuationStream<H> {
 
     fn finish(&mut self, end: StreamEnd) {
         if let Some(mut codec) = self.codec.take() {
-            match codec.finish(end) {
-                Ok(frames) => self
-                    .output
-                    .extend(frames.into_iter().map(|frame: Frame| frame.0)),
+            match codec.finish_output(end) {
+                Ok(result) => {
+                    self.output
+                        .extend(result.frames.into_iter().map(|frame: Frame| frame.0));
+                    if let Some(pause) = result.pause {
+                        self.codec = Some(codec);
+                        self.park(pause);
+                        return;
+                    }
+                }
                 Err(error) => {
                     if end == StreamEnd::Complete {
                         self.output

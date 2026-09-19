@@ -403,3 +403,61 @@ fn invoke_exceptions_keep_request_id_and_partial_output() {
     assert_eq!(failure.disposition, Disposition::Retryable);
     assert_eq!(failure.request_id.as_deref(), Some("aws-request"));
 }
+
+#[test]
+fn invoke_recovers_observed_usage_once_when_binary_framing_fails_at_eof() {
+    use base64::Engine;
+    let request = Bytes::from_static(br#"{"anthropic_version":"bedrock-2023-05-31"}"#);
+    let mut decoder = AwsBedrockChannel
+        .stream_decoder(gproxy_channel_api::StreamCtx {
+            key: STREAM,
+            framing: gproxy_protocol::StreamFraming::Sse,
+            request_body: &request,
+            response_headers: &HeaderMap::new(),
+        })
+        .unwrap();
+    for event in [
+        json!({"type":"message_start","message":{"model":"claude","usage":{"input_tokens":12,"output_tokens":0}}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}),
+    ] {
+        let wire = smithy(
+            "chunk",
+            json!({"bytes":base64::engine::general_purpose::STANDARD.encode(event.to_string())}),
+        );
+        decoder.push(Bytes::from(wire)).unwrap();
+    }
+    let truncated = smithy("chunk", json!({"bytes":"e30="}));
+    decoder
+        .push(Bytes::copy_from_slice(&truncated[..7]))
+        .unwrap();
+    assert!(decoder.finish(StreamEnd::Complete).is_err());
+    let tail = decoder.recover_tail();
+    let usage = tail.usage.expect("usage received before framing failed");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (12, 7));
+    assert!(tail.frames.is_empty());
+    assert!(decoder.recover_tail().usage.is_none());
+}
+
+#[test]
+fn invoke_accepts_an_explicit_claude_error_as_terminal() {
+    use base64::Engine;
+    let request = Bytes::from_static(br#"{"anthropic_version":"bedrock-2023-05-31"}"#);
+    let mut decoder = AwsBedrockChannel
+        .stream_decoder(gproxy_channel_api::StreamCtx {
+            key: STREAM,
+            framing: gproxy_protocol::StreamFraming::Sse,
+            request_body: &request,
+            response_headers: &HeaderMap::new(),
+        })
+        .unwrap();
+    let error = json!({"type":"error","error":{"type":"overloaded_error","message":"busy"}});
+    let wire = smithy(
+        "chunk",
+        json!({"bytes":base64::engine::general_purpose::STANDARD.encode(error.to_string())}),
+    );
+    let frames = decoder.push(Bytes::from(wire)).unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(decoder.terminal_disposition(), Some(Disposition::Retryable));
+    let tail = decoder.finish(StreamEnd::Complete).unwrap();
+    assert!(tail.frames.is_empty());
+}

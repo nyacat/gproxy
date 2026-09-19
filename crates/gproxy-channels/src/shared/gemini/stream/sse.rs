@@ -3,6 +3,8 @@
 use gproxy_channel_api::ChannelError;
 use serde_json::Value;
 
+use super::ParsedChunk;
+
 const MAX_FRAME_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Default)]
@@ -11,29 +13,36 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
-    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Vec<Value>, ChannelError> {
+    pub(super) fn pending_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub(super) fn push(&mut self, chunk: &[u8]) {
         self.buffer.extend_from_slice(chunk);
-        if self.buffer.len() > MAX_FRAME_BYTES {
+    }
+
+    pub(super) fn next(&mut self, eof: bool) -> Result<Option<ParsedChunk>, ChannelError> {
+        let length = match delimiter(&self.buffer) {
+            Some((end, delimiter)) => end + delimiter,
+            None if eof => self.buffer.len(),
+            None if self.buffer.len() <= MAX_FRAME_BYTES => return Ok(None),
+            None => {
+                return Err(ChannelError::Decode(
+                    "Gemini SSE frame exceeds 100 MiB".into(),
+                ));
+            }
+        };
+        if length > MAX_FRAME_BYTES {
             return Err(ChannelError::Decode(
                 "Gemini SSE frame exceeds 100 MiB".into(),
             ));
         }
-        let mut output = Vec::new();
-        while let Some((end, delimiter)) = delimiter(&self.buffer) {
-            let raw = self.buffer.drain(..end + delimiter).collect::<Vec<_>>();
-            if let Some(frame) = parse(&raw[..end])? {
-                output.push(frame);
-            }
+        if length == 0 {
+            return Ok(None);
         }
-        Ok(output)
-    }
-
-    pub(super) fn finish(&mut self) -> Result<Vec<Value>, ChannelError> {
-        if self.buffer.is_empty() {
-            return Ok(Vec::new());
-        }
-        let raw = std::mem::take(&mut self.buffer);
-        Ok(parse(&raw)?.into_iter().collect())
+        let value = parse(&self.buffer[..length])?;
+        let raw = self.buffer.drain(..length).collect::<Vec<_>>().into();
+        Ok(Some(ParsedChunk { raw, value }))
     }
 }
 

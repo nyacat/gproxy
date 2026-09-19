@@ -5,6 +5,12 @@ use serde_json::{Value, json};
 
 use crate::error::CoreError;
 
+#[derive(Debug)]
+pub(super) struct EventError {
+    pub error: CoreError,
+    pub frames: Vec<Bytes>,
+}
+
 pub(super) struct Events {
     decoder: SseDecoder,
     collector: Option<ResponseCollector>,
@@ -45,10 +51,28 @@ impl Events {
         self.handoff = Some(boundary);
     }
 
-    pub(super) fn push(&mut self, chunk: Bytes) -> Result<Vec<Bytes>, CoreError> {
+    pub(super) fn push(&mut self, chunk: Bytes) -> Result<Vec<Bytes>, EventError> {
         let mut output = Vec::new();
-        for frame in self.decoder.push(&chunk)? {
-            output.extend(self.frame(frame)?);
+        let (frames, failure) = match self.decoder.push(&chunk) {
+            Ok(frames) => (frames, None),
+            Err(error) => (error.frames, Some(error.error)),
+        };
+        for frame in frames {
+            match self.frame(frame) {
+                Ok(frames) => output.extend(frames),
+                Err(error) => {
+                    return Err(EventError {
+                        error,
+                        frames: output,
+                    });
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(EventError {
+                error: error.into(),
+                frames: output,
+            });
         }
         Ok(output)
     }
@@ -126,16 +150,28 @@ impl Events {
         }
     }
 
-    pub(super) fn end(&mut self) -> Result<(Vec<Bytes>, Value, bool), CoreError> {
-        let frames = if let Some(frame) = self.decoder.finish()? {
-            self.frame(frame)?
+    pub(super) fn end(&mut self) -> Result<(Vec<Bytes>, Value, bool), EventError> {
+        let frames = if let Some(frame) = self.decoder.finish().map_err(|error| EventError {
+            error: error.into(),
+            frames: Vec::new(),
+        })? {
+            self.frame(frame).map_err(|error| EventError {
+                error,
+                frames: Vec::new(),
+            })?
         } else {
             Vec::new()
         };
         let collector = self.collector.take().expect("active collector");
         let open_tool = collector.claude_has_open_tool();
-        let response = serde_json::from_slice(&collector.finish()?.into_bytes()?)
-            .map_err(|error| CoreError::Transform(error.to_string()))?;
+        let response = (|| -> Result<Value, CoreError> {
+            serde_json::from_slice(&collector.finish()?.into_bytes()?)
+                .map_err(|error| CoreError::Transform(error.to_string()))
+        })()
+        .map_err(|error| EventError {
+            error,
+            frames: frames.clone(),
+        })?;
         Ok((frames, response, open_tool))
     }
 

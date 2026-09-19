@@ -1,13 +1,15 @@
 mod failure;
 mod framing;
+#[cfg(test)]
+mod tests;
 
 use bytes::Bytes;
 use gproxy_protocol::{OperationKey, StreamFraming};
 
 use self::framing::{FrameDecoder, FrameEncoder};
 use super::SseFrame;
-use crate::TransformError;
 use crate::registry::{self, TransformPair};
+use crate::{StreamTransformError, TransformError};
 
 pub struct ResponseStream {
     decoder: FrameDecoder,
@@ -54,40 +56,95 @@ impl ResponseStream {
         })
     }
 
-    pub fn push(&mut self, chunk: Bytes) -> Result<Vec<Bytes>, TransformError> {
-        let frames = self.decoder.push(&chunk)?;
+    pub fn push(&mut self, chunk: Bytes) -> Result<Vec<Bytes>, StreamTransformError> {
+        let frames = match self.decoder.push(&chunk) {
+            Ok(frames) => frames,
+            Err(error) => {
+                let frames = self.convert(error.frames)?;
+                return Err(StreamTransformError {
+                    error: error.error,
+                    frames,
+                });
+            }
+        };
         self.convert(frames)
     }
 
-    pub fn finish(&mut self) -> Result<Vec<Bytes>, TransformError> {
-        let frames = self.decoder.finish()?;
-        let mut output = self.convert(frames)?;
+    pub fn finish(&mut self) -> Result<Vec<Bytes>, StreamTransformError> {
+        let mut output = self.finish_prefix()?;
         let terminal = if self.failed {
             Vec::new()
         } else {
-            self.converter.finish()?
+            match self.converter.finish() {
+                Ok(frames) => frames,
+                Err(error) => {
+                    return Err(StreamTransformError {
+                        error,
+                        frames: output,
+                    });
+                }
+            }
         };
-        output.extend(self.encoder.push(terminal)?);
-        output.extend(self.encoder.finish()?);
+        match self.encoder.push(terminal) {
+            Ok(frames) => output.extend(frames),
+            Err(error) => return Err(error.prepend(output)),
+        }
+        match self.encoder.finish() {
+            Ok(frames) => output.extend(frames),
+            Err(error) => return Err(error.prepend(output)),
+        }
         Ok(output)
     }
 
-    fn convert(&mut self, frames: Vec<SseFrame>) -> Result<Vec<Bytes>, TransformError> {
+    /// Decode buffered complete input at EOF without asking the converter or
+    /// output framing to synthesize a successful ending. Wrappers use this
+    /// when the upstream decoder reports a terminal failure with valid frames.
+    pub fn finish_prefix(&mut self) -> Result<Vec<Bytes>, StreamTransformError> {
+        let frames = match self.decoder.finish() {
+            Ok(frames) => frames,
+            Err(error) => {
+                let frames = self.convert(error.frames)?;
+                return Err(StreamTransformError {
+                    error: error.error,
+                    frames,
+                });
+            }
+        };
+        self.convert(frames)
+    }
+
+    fn convert(&mut self, frames: Vec<SseFrame>) -> Result<Vec<Bytes>, StreamTransformError> {
         let mut output = Vec::new();
         for frame in frames {
             if self.failed {
                 continue;
             }
-            if self.translate_errors
-                && let Some(error) = failure::frame(self.source.kind(), &frame)?
-            {
-                self.failed = true;
-                output.extend(self.encoder.push(vec![error])?);
-            } else {
-                output.extend(self.encoder.push(self.converter.frame(frame)?)?);
+            let converted = match self.convert_frame(frame) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    return Err(StreamTransformError {
+                        error,
+                        frames: output,
+                    });
+                }
+            };
+            match self.encoder.push(converted) {
+                Ok(frames) => output.extend(frames),
+                Err(error) => return Err(error.prepend(output)),
             }
         }
         Ok(output)
+    }
+
+    fn convert_frame(&mut self, frame: SseFrame) -> Result<Vec<Bytes>, TransformError> {
+        if self.translate_errors
+            && let Some(error) = failure::frame(self.source.kind(), &frame)?
+        {
+            self.failed = true;
+            Ok(vec![error])
+        } else {
+            self.converter.frame(frame)
+        }
     }
 }
 

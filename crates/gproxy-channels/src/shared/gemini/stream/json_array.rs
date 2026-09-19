@@ -3,6 +3,8 @@
 use gproxy_channel_api::ChannelError;
 use serde_json::Value;
 
+use super::ParsedChunk;
+
 const MAX_BUFFER_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Default)]
@@ -11,44 +13,43 @@ pub(super) struct Decoder {
     state: State,
 }
 
-#[derive(Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum State {
     #[default]
     Start,
     FirstOrEnd,
     Value,
+    Separator,
     End,
 }
 
 impl Decoder {
-    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Vec<Value>, ChannelError> {
-        self.buffer.extend_from_slice(chunk);
-        let output = self.decode()?;
-        if self.buffer.len() > MAX_BUFFER_BYTES {
-            return Err(decode("buffer exceeds 100 MiB"));
-        }
-        Ok(output)
+    pub(super) fn pending_len(&self) -> usize {
+        self.buffer.len()
     }
 
-    pub(super) fn finish(&mut self) -> Result<Vec<Value>, ChannelError> {
-        let output = self.decode()?;
+    pub(super) fn push(&mut self, chunk: &[u8]) {
+        self.buffer.extend_from_slice(chunk);
+    }
+
+    pub(super) fn finish(&self) -> Result<(), ChannelError> {
         if self.state == State::End {
-            Ok(output)
+            Ok(())
         } else {
             Err(decode("stream ended before closing ']'"))
         }
     }
 
-    fn decode(&mut self) -> Result<Vec<Value>, ChannelError> {
-        let mut output = Vec::new();
+    pub(super) fn next(&mut self, eof: bool) -> Result<Option<ParsedChunk>, ChannelError> {
         let mut cursor = 0;
+        let mut state = self.state;
         loop {
             cursor += whitespace_len(&self.buffer[cursor..]);
-            match self.state {
+            match state {
                 State::Start => match self.buffer.get(cursor) {
                     Some(b'[') => {
                         cursor += 1;
-                        self.state = State::FirstOrEnd;
+                        state = State::FirstOrEnd;
                     }
                     Some(_) => return Err(decode("expected opening '['")),
                     None => break,
@@ -57,8 +58,9 @@ impl Decoder {
                     Some(b']') => {
                         cursor += 1;
                         self.state = State::End;
+                        return Ok(Some(self.take(cursor, None)));
                     }
-                    Some(_) => self.state = State::Value,
+                    Some(_) => state = State::Value,
                     None => break,
                 },
                 State::Value => {
@@ -67,27 +69,41 @@ impl Decoder {
                     };
                     let end = cursor + length;
                     let separator = end + whitespace_len(&self.buffer[end..]);
-                    let Some(byte) = self.buffer.get(separator).copied() else {
-                        break;
-                    };
-                    self.state = match byte {
-                        b',' => State::Value,
-                        b']' => State::End,
-                        _ => return Err(decode("expected ',' or ']' after an element")),
-                    };
-                    cursor = separator + 1;
-                    output.push(value);
+                    match self.buffer.get(separator).copied() {
+                        Some(b',') => self.state = State::Value,
+                        Some(b']') => self.state = State::End,
+                        Some(_) => return Err(decode("expected ',' or ']' after an element")),
+                        None if eof => {
+                            // A complete final response is still useful when its
+                            // closing array delimiter is truncated. Surface it
+                            // before finish reports the framing failure.
+                            self.state = State::Separator;
+                            return Ok(Some(self.take(separator, Some(value))));
+                        }
+                        None => break,
+                    }
+                    return Ok(Some(self.take(separator + 1, Some(value))));
                 }
+                State::Separator => break,
                 State::End => {
                     if cursor == self.buffer.len() {
-                        break;
+                        return Ok((cursor > 0).then(|| self.take(cursor, None)));
                     }
                     return Err(decode("data followed closing ']'"));
                 }
             }
         }
-        self.buffer.drain(..cursor);
-        Ok(output)
+        if self.buffer.len() > MAX_BUFFER_BYTES {
+            return Err(decode("buffer exceeds 100 MiB"));
+        }
+        Ok(None)
+    }
+
+    fn take(&mut self, length: usize, value: Option<Value>) -> ParsedChunk {
+        ParsedChunk {
+            raw: self.buffer.drain(..length).collect::<Vec<_>>().into(),
+            value,
+        }
     }
 }
 

@@ -78,6 +78,26 @@ impl Meter {
                 state.estimated_output_chars = tail.estimated_output_chars;
                 if let Some(usage) = tail.usage {
                     state.record(usage, refused, false);
+                } else {
+                    // A malformed terminal frame can leave the decoder with
+                    // no provider usage at all. Still close this attempt with
+                    // an estimate; otherwise the retry's admission remains
+                    // reserved and its usage is silently attributed to the
+                    // previous model/attempt.
+                    let input_tokens = crate::usage::estimate_input_tokens(&state.input);
+                    let output_tokens = state
+                        .estimated_output_chars
+                        .unwrap_or(state.received)
+                        .div_ceil(2);
+                    state.record(
+                        NormalizedUsage {
+                            input_tokens,
+                            output_tokens,
+                            ..Default::default()
+                        },
+                        refused,
+                        true,
+                    );
                 }
                 state.recovery_pending = true;
                 return Err(error);
@@ -248,5 +268,62 @@ mod tests {
         let tail = observer.recover_tail();
         assert!(tail.usage.is_none());
         assert!(tail.actual_service_tier.is_none());
+    }
+
+    #[test]
+    fn failed_tail_without_usage_still_records_the_current_attempt_estimate() {
+        let key = OperationKey::content(
+            Operation::StreamGenerateContent,
+            ContentGenerationKind::OpenAiChat,
+        );
+        let headers = http::HeaderMap::new();
+        let request = Bytes::from_static(b"test");
+        let upstream = gproxy_channels::OpenAiChannel.stream_decoder(StreamCtx {
+            key,
+            framing: StreamFraming::Sse,
+            request_body: &request,
+            response_headers: &headers,
+        });
+        let rules = crate::process::ResponseRuleDecoder::new(
+            upstream,
+            Arc::from([]),
+            key,
+            StreamFraming::Sse,
+            crate::process::RuleModels::new("second-model", None),
+            headers,
+        )
+        .unwrap();
+        let meter = Meter::new();
+        meter.record(
+            NormalizedUsage {
+                input_tokens: 20,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            "first-model".into(),
+            1,
+            true,
+            false,
+        );
+        meter.start(Some(Box::new(rules)), "second-model".into(), 2, request);
+        meter
+            .push(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hello!!!\"}}]}\n\n",
+            ))
+            .unwrap();
+        meter.push(Bytes::from_static(b"data: \xe4")).unwrap();
+        let mut observer = meter.decoder();
+        assert!(observer.finish(StreamEnd::Complete).is_err());
+        let usage = observer.recover_tail().usage.unwrap();
+        assert_eq!(usage.attempts.len(), 2);
+        let attempt = &usage.attempts[1];
+        assert_eq!(attempt.model, "second-model");
+        assert_eq!(attempt.started_at_ms, Some(2));
+        assert!(attempt.estimated);
+        assert_eq!(attempt.usage.input_tokens, 2);
+        // Chat currently uses the existing wire-character estimate; only the
+        // Responses decoder exposes a semantic content-character estimate.
+        assert_eq!(attempt.usage.output_tokens, 31);
+        assert!(observer.recover_tail().usage.is_none());
     }
 }

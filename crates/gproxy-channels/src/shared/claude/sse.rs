@@ -110,21 +110,27 @@ impl StreamDecoder for ClaudeSseDecoder {
         } else {
             self.buffer.clear();
         }
-        let mut usage = super::usage::merge_stream(self.start.as_ref(), self.delta.as_ref());
+        Ok(self.recover_tail())
+    }
+
+    fn recover_tail(&mut self) -> StreamTail {
+        let start = self.start.take();
+        let delta = self.delta.take();
+        let mut usage = super::usage::merge_stream(start.as_ref(), delta.as_ref());
         if let Some(usage) = usage.as_mut() {
             super::usage::attach(
                 usage,
-                self.delta.as_ref().unwrap_or(&Value::Null),
+                delta.as_ref().unwrap_or(&Value::Null),
                 &self.model,
                 self.refused,
             );
         }
-        Ok(StreamTail {
+        StreamTail {
             estimated_output_chars: None,
             frames: Vec::new(),
             usage,
             actual_service_tier: None,
-        })
+        }
     }
 }
 

@@ -53,11 +53,12 @@ impl StreamDecoder for CodeAssistJsonArray {
             serde_json::to_vec(&[super::unwrap_value(&value)])
                 .map_err(|error| ChannelError::Decode(error.to_string()))?,
         );
-        let frames = self.inner.push(frame)?;
+        let mut frames = self.inner.push(frame)?;
         let mut tail = match self.inner.finish(end) {
             Ok(tail) => tail,
             Err(error) => return Err(error.prepend(frames)),
         };
+        frames.append(&mut tail.frames);
         tail.frames = frames;
         Ok(tail)
     }
@@ -111,7 +112,7 @@ impl StreamDecoder for CodeAssistSse {
     }
 
     fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
-        let frames = if end == StreamEnd::Complete && !self.buffer.is_empty() {
+        let mut frames = if end == StreamEnd::Complete && !self.buffer.is_empty() {
             match canonical(&std::mem::take(&mut self.buffer))? {
                 Some(frame) => self.inner.push(frame)?,
                 None => Vec::new(),
@@ -124,6 +125,7 @@ impl StreamDecoder for CodeAssistSse {
             Ok(tail) => tail,
             Err(error) => return Err(error.prepend(frames)),
         };
+        frames.append(&mut tail.frames);
         tail.frames = frames;
         Ok(tail)
     }

@@ -125,9 +125,17 @@ impl<H: Host> State<H> {
                     if self.done {
                         continue;
                     }
-                    let (frames, body, open_tool) = self.events.end()?;
-                    self.pending.extend(frames);
-                    self.completion = Some((body, open_tool));
+                    match self.events.end() {
+                        Ok((frames, body, open_tool)) => {
+                            self.pending.extend(frames);
+                            self.completion = Some((body, open_tool));
+                        }
+                        Err(error) => {
+                            self.pending.extend(error.frames);
+                            self.terminal_error = Some(error.error);
+                            self.done = true;
+                        }
+                    }
                 }
             }
         }
@@ -146,7 +154,15 @@ impl<H: Host> State<H> {
             }
         };
         for frame in frames {
-            self.pending.extend(self.events.push(frame.0)?);
+            match self.events.push(frame.0) {
+                Ok(frames) => self.pending.extend(frames),
+                Err(error) => {
+                    self.pending.extend(error.frames);
+                    self.terminal_error = Some(error.error);
+                    self.done = true;
+                    break;
+                }
+            }
         }
         Ok(())
     }

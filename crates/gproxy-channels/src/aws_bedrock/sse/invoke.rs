@@ -91,7 +91,7 @@ impl StreamDecoder for InvokeDecoder {
     fn finish(&mut self, end: StreamEnd) -> Result<StreamTail, StreamDecodeError> {
         if end == StreamEnd::Complete {
             self.parser.finish()?;
-            if !self.stopped {
+            if !self.stopped && self.terminal_failure().is_none() {
                 return Err(ChannelError::Decode(
                     "Bedrock stream ended before message_stop".into(),
                 )
@@ -99,5 +99,9 @@ impl StreamDecoder for InvokeDecoder {
             }
         }
         self.usage.finish(end)
+    }
+
+    fn recover_tail(&mut self) -> StreamTail {
+        self.usage.recover_tail()
     }
 }
