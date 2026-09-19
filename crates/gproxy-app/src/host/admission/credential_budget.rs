@@ -293,17 +293,21 @@ fn reservation_key(request_id: &str) -> String {
     format!("gproxy:credential-admission:{request_id}")
 }
 
+/// Nothing here writes `gproxy:credential-budget-failed:`; a tripped budget is
+/// recorded per request in the shared quota failure set instead. The marker is
+/// still honoured because a node on the released build, or a rollback to it,
+/// writes exactly that key and never clears it on its own: dropping the read
+/// would resume admitting against a budget whose accounting is known broken.
+/// Both keys are read together so the ordinary case where neither exists costs
+/// one round trip rather than two.
 async fn failed(host: &AppHost, quota_id: i64) -> Result<bool, CoreError> {
-    Ok(host
-        .services
-        .cache
-        .get(&super::window::failure_key(quota_id))
-        .await?
-        .is_some()
-        || host
-            .services
+    let legacy = format!("gproxy:credential-budget-failed:{quota_id}");
+    let (current, legacy) = futures_util::future::join(
+        host.services
             .cache
-            .get(&format!("gproxy:credential-budget-failed:{quota_id}"))
-            .await?
-            .is_some())
+            .get(&super::window::failure_key(quota_id)),
+        host.services.cache.get(&legacy),
+    )
+    .await;
+    Ok(current?.is_some() || legacy?.is_some())
 }
