@@ -20,6 +20,8 @@ fn from_environment(environment: &HashMap<&str, OsString>) -> Cli {
         data_dir: get(DATA_DIR),
         persistence: get(PERSISTENCE),
         dsn: get(DSN),
+        pg_pool: get(PG_POOL),
+        pg_checkout_timeout_ms: get(PG_CHECKOUT_TIMEOUT_MS),
         libsql_url: get(LIBSQL_URL),
         libsql_auth_token: get(LIBSQL_AUTH_TOKEN),
         redis_url: get(REDIS_URL),

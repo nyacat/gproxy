@@ -55,7 +55,9 @@ pub(crate) fn summary(user_id: i64, now: i64) -> Result<Statement, StoreError> {
     query
         .expr_as(Expr::col(Asterisk).count(), Alias::new("total_logins"))
         .expr_as(
-            Func::sum(Expr::case(active(now), 1).finally(0)),
+            // Untyped CASE parameters resolve to text on PostgreSQL. These
+            // fixed integer literals keep SUM numeric during preparation.
+            Func::sum(Expr::case(active(now), Expr::cust("1")).finally(Expr::cust("0"))),
             Alias::new("active_sessions"),
         );
     Statement::query(&query)
@@ -82,7 +84,10 @@ pub(crate) fn list(
     }
     query
         .expr_as(field("oauth_clients", "name"), Alias::new("client_name"))
-        .expr_as(Expr::case(active(now), 1).finally(0), Alias::new("active"));
+        .expr_as(
+            Expr::case(active(now), Expr::cust("1")).finally(Expr::cust("0")),
+            Alias::new("active"),
+        );
     if active_only {
         query.cond_where(active(now));
     }

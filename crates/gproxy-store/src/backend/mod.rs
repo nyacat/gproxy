@@ -47,6 +47,8 @@ pub enum BackendConfig {
     #[cfg(not(target_arch = "wasm32"))]
     Postgres {
         dsn: String,
+        pool_size: usize,
+        checkout_timeout: std::time::Duration,
     },
     #[cfg(not(target_arch = "wasm32"))]
     Mysql {
@@ -91,8 +93,12 @@ pub(crate) async fn open(config: BackendConfig) -> Result<SharedExecutor, StoreE
             Ok(std::sync::Arc::new(native::NativeSql::open(path).await?))
         }
         #[cfg(not(target_arch = "wasm32"))]
-        BackendConfig::Postgres { dsn } => Ok(std::sync::Arc::new(
-            postgres::Postgres::connect(&dsn).await?,
+        BackendConfig::Postgres {
+            dsn,
+            pool_size,
+            checkout_timeout,
+        } => Ok(std::sync::Arc::new(
+            postgres::Postgres::connect(&dsn, pool_size, checkout_timeout).await?,
         )),
         #[cfg(not(target_arch = "wasm32"))]
         BackendConfig::Mysql { dsn } => Ok(std::sync::Arc::new(mysql::Mysql::connect(&dsn)?)),

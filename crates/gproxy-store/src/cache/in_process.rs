@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,12 +14,54 @@ fn cache_error(message: &str) -> Error {
 
 #[derive(Clone, Default)]
 pub struct InProcessCache {
-    entries: Arc<Mutex<HashMap<String, Entry>>>,
+    entries: Arc<Mutex<Entries>>,
+}
+
+#[derive(Default)]
+struct Entries {
+    values: HashMap<String, Entry>,
+    expirations: BTreeSet<(Instant, String)>,
 }
 
 struct Entry {
     value: Vec<u8>,
     expires_at: Option<Instant>,
+}
+
+impl Entries {
+    fn get(&self, key: &str) -> Option<&Entry> {
+        self.values.get(key)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.values.contains_key(key)
+    }
+
+    fn insert(&mut self, key: String, entry: Entry) {
+        use std::collections::hash_map::Entry;
+        let slot = self.values.entry(key);
+        let previous = match &slot {
+            Entry::Occupied(slot) => slot.get().expires_at,
+            Entry::Vacant(_) => None,
+        };
+        if previous != entry.expires_at {
+            if let Some(at) = previous {
+                self.expirations.remove(&(at, slot.key().clone()));
+            }
+            if let Some(at) = entry.expires_at {
+                self.expirations.insert((at, slot.key().clone()));
+            }
+        }
+        slot.insert_entry(entry);
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(entry) = self.values.remove(key)
+            && let Some(at) = entry.expires_at
+        {
+            self.expirations.remove(&(at, key.to_owned()));
+        }
+    }
 }
 
 impl CacheBackend for InProcessCache {
@@ -96,6 +138,7 @@ impl CacheBackend for InProcessCache {
             if entries.get(state_key).map(|entry| &entry.value) != Some(&expected) {
                 return Ok(None);
             }
+            expire(entries, counter_key);
             let current = entries
                 .get(counter_key)
                 .map_or(Ok(0), |entry| decode_counter(&entry.value))?;
@@ -104,7 +147,7 @@ impl CacheBackend for InProcessCache {
                 counter_key.into(),
                 Entry {
                     value: next.to_be_bytes().to_vec(),
-                    expires_at: None,
+                    expires_at: expiry((next == 0).then_some(Duration::from_secs(3600)))?,
                 },
             );
             entries.insert(
@@ -149,28 +192,187 @@ impl CacheBackend for InProcessCache {
         });
         Box::pin(async move { result })
     }
+
+    fn seed_counter<'a>(
+        &'a self,
+        key: &'a str,
+        value: i64,
+        ttl: Option<Duration>,
+    ) -> BoxFuture<'a, Result<bool, Error>> {
+        let result = self.with_entries(|entries| {
+            expire(entries, key);
+            if entries.contains_key(key) {
+                return Ok(false);
+            }
+            entries.insert(
+                key.into(),
+                Entry {
+                    value: value.to_be_bytes().to_vec(),
+                    expires_at: expiry(ttl)?,
+                },
+            );
+            Ok(true)
+        });
+        Box::pin(async move { result })
+    }
+
+    fn reserve_spend<'a>(
+        &'a self,
+        used_key: &'a str,
+        pending_key: &'a str,
+        estimate: i64,
+        limit: i64,
+        pending_ttl: Option<Duration>,
+    ) -> BoxFuture<'a, Result<gproxy_core::SpendReserve, Error>> {
+        let result = self.with_entries(|entries| {
+            expire(entries, used_key);
+            expire(entries, pending_key);
+            let Some(used) = entries
+                .get(used_key)
+                .map(|entry| decode_counter(&entry.value))
+                .transpose()?
+            else {
+                return Ok(gproxy_core::SpendReserve::MissingUsed);
+            };
+            let pending = entries
+                .get(pending_key)
+                .map_or(Ok(0), |entry| decode_counter(&entry.value))?
+                .checked_add(estimate)
+                .ok_or_else(overflow)?;
+            if !gproxy_core::spend_fits(used, pending, estimate, limit) {
+                return Ok(gproxy_core::SpendReserve::Denied);
+            }
+            let expires_at = expiry(pending_ttl)?;
+            entries.insert(
+                pending_key.into(),
+                Entry {
+                    value: pending.to_be_bytes().to_vec(),
+                    expires_at,
+                },
+            );
+            Ok(gproxy_core::SpendReserve::Allowed)
+        });
+        Box::pin(async move { result })
+    }
+
+    fn reserve_spend_and_set<'a>(
+        &'a self,
+        used_key: &'a str,
+        pending_key: &'a str,
+        estimate: i64,
+        limit: i64,
+        state_key: &'a str,
+        expected_state: Vec<u8>,
+        state: Vec<u8>,
+    ) -> BoxFuture<'a, Result<Option<gproxy_core::SpendReserve>, Error>> {
+        let result = self.with_entries(|entries| {
+            expire(entries, state_key);
+            let current = entries.get(state_key).map(|entry| &entry.value);
+            if current == Some(&state) {
+                return Ok(Some(gproxy_core::SpendReserve::Allowed));
+            }
+            if current != Some(&expected_state) {
+                return Ok(None);
+            }
+            expire(entries, used_key);
+            expire(entries, pending_key);
+            let Some(used) = entries
+                .get(used_key)
+                .map(|entry| decode_counter(&entry.value))
+                .transpose()?
+            else {
+                return Ok(Some(gproxy_core::SpendReserve::MissingUsed));
+            };
+            let pending = entries
+                .get(pending_key)
+                .map_or(Ok(0), |entry| decode_counter(&entry.value))?
+                .checked_add(estimate)
+                .ok_or_else(overflow)?;
+            if !gproxy_core::spend_fits(used, pending, estimate, limit) {
+                return Ok(Some(gproxy_core::SpendReserve::Denied));
+            }
+            entries.insert(
+                pending_key.into(),
+                Entry {
+                    value: pending.to_be_bytes().to_vec(),
+                    expires_at: None,
+                },
+            );
+            entries.insert(
+                state_key.into(),
+                Entry {
+                    value: state,
+                    expires_at: None,
+                },
+            );
+            Ok(Some(gproxy_core::SpendReserve::Allowed))
+        });
+        Box::pin(async move { result })
+    }
+
+    fn raise_counter<'a>(
+        &'a self,
+        key: &'a str,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> BoxFuture<'a, Result<(), Error>> {
+        let result = self.with_entries(|entries| {
+            expire(entries, key);
+            let value = entries
+                .get(key)
+                .map(|entry| decode_counter(&entry.value))
+                .transpose()?
+                .map_or(floor, |current| current.max(floor));
+            entries.insert(
+                key.into(),
+                Entry {
+                    value: value.to_be_bytes().to_vec(),
+                    expires_at: expiry(ttl)?,
+                },
+            );
+            Ok(())
+        });
+        Box::pin(async move { result })
+    }
 }
 
 impl InProcessCache {
     fn with_entries<T>(
         &self,
-        operation: impl FnOnce(&mut HashMap<String, Entry>) -> Result<T, Error>,
+        operation: impl FnOnce(&mut Entries) -> Result<T, Error>,
     ) -> Result<T, Error> {
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| cache_error("cache lock poisoned"))?;
+        sweep(&mut entries);
         operation(&mut entries)
     }
 }
 
-fn expire(entries: &mut HashMap<String, Entry>, key: &str) {
+fn expire(entries: &mut Entries, key: &str) {
     if entries
         .get(key)
         .and_then(|entry| entry.expires_at)
         .is_some_and(|expiry| expiry <= Instant::now())
     {
         entries.remove(key);
+    }
+}
+
+const SWEEP_BATCH: usize = 32;
+
+fn sweep(entries: &mut Entries) {
+    if entries.expirations.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    for _ in 0..SWEEP_BATCH {
+        if entries.expirations.first().is_none_or(|(at, _)| *at > now) {
+            break;
+        }
+        let (_, key) = entries.expirations.pop_first().expect("due expiration");
+        entries.values.remove(&key);
     }
 }
 
@@ -192,4 +394,118 @@ fn decode_counter(value: &[u8]) -> Result<i64, Error> {
 
 fn overflow() -> Error {
     cache_error("cache counter overflow")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn expiry_cleanup_is_bounded_and_visits_untouched_keys() {
+        let cache = InProcessCache::default();
+        {
+            let mut entries = cache.entries.lock().unwrap();
+            for i in 0..512 {
+                entries.insert(
+                    format!("expired-{i:04}"),
+                    Entry {
+                        value: vec![1],
+                        expires_at: Some(Instant::now()),
+                    },
+                );
+            }
+        }
+        cache.get("absent").await.unwrap();
+        assert_eq!(
+            cache.entries.lock().unwrap().values.len(),
+            512 - SWEEP_BATCH
+        );
+        for _ in 0..16 {
+            cache.get("absent").await.unwrap();
+        }
+        assert!(cache.entries.lock().unwrap().values.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacing_and_deleting_ttls_keeps_one_expiration_per_key() {
+        let cache = InProcessCache::default();
+        for _ in 0..512 {
+            cache
+                .set("refresh", vec![1], Some(Duration::from_secs(60)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(cache.entries.lock().unwrap().expirations.len(), 1);
+        cache.set("refresh", vec![2], None).await.unwrap();
+        assert!(cache.entries.lock().unwrap().expirations.is_empty());
+        assert_eq!(cache.get("refresh").await.unwrap(), Some(vec![2]));
+        cache
+            .set("refresh", vec![3], Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        cache.delete("refresh").await.unwrap();
+        assert!(cache.entries.lock().unwrap().expirations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renewing_a_counter_removes_its_old_expiration() {
+        let cache = InProcessCache::default();
+        cache
+            .set("used", 0_i64.to_be_bytes().to_vec(), None)
+            .await
+            .unwrap();
+        cache
+            .incr("pending", 1, Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        let previous = cache
+            .entries
+            .lock()
+            .unwrap()
+            .expirations
+            .first()
+            .cloned()
+            .unwrap();
+        cache
+            .reserve_spend("used", "pending", 1, 10, None)
+            .await
+            .unwrap();
+        let entries = cache.entries.lock().unwrap();
+        assert!(!entries.expirations.contains(&previous));
+        assert_eq!(entries.get("pending").unwrap().expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn atomic_reservation_retains_pending_and_state_until_release() {
+        let cache = InProcessCache::default();
+        cache.seed_counter("used", 0, None).await.unwrap();
+        cache
+            .incr("pending", 0, Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        cache
+            .set("state", b"ready".to_vec(), Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        assert_eq!(cache.entries.lock().unwrap().expirations.len(), 2);
+        assert_eq!(
+            cache
+                .reserve_spend_and_set(
+                    "used",
+                    "pending",
+                    1,
+                    10,
+                    "state",
+                    b"ready".to_vec(),
+                    b"reserved".to_vec(),
+                )
+                .await
+                .unwrap(),
+            Some(gproxy_core::SpendReserve::Allowed),
+        );
+        let entries = cache.entries.lock().unwrap();
+        assert!(entries.expirations.is_empty());
+        assert_eq!(entries.get("pending").unwrap().expires_at, None);
+        assert_eq!(entries.get("state").unwrap().expires_at, None);
+    }
 }
